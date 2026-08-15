@@ -3,6 +3,7 @@
 //!
 //! Usage: fmm-bench [max_n] [p] [eps]
 
+use fmm::bodies::Bodies;
 use fmm::direct::{direct, scaled_error};
 use fmm::fmm::Fmm;
 use fmm::models::plummer;
@@ -73,6 +74,154 @@ fn sampled_error(
     (worst, (sumsq / samp as f64).sqrt())
 }
 
+/// P2P throughput microbench: run p2p_self over all leaf cells (N bodies,
+/// n_leaf=16), threaded across `nthreads` via disjoint slot ranges.
+/// Reports GFLOPS at 16 flops/pair (roofline.rs accounting).
+fn p2p_bench(n: usize, nthreads: usize, n_leaf: usize) {
+    use fmm::bodies::Bodies;
+
+    let parts = plummer(n, [0.0; 3], 42);
+    let tree = fmm::tree::Octree::build(&parts, n_leaf);
+    let mut bodies = Bodies::from_parts(&parts, &tree.order);
+
+    let mut leaves: Vec<(usize, usize)> = Vec::new();
+    for c in 0..tree.cells.len() {
+        if tree.is_leaf(c) {
+            leaves.push((tree.cells[c].first, tree.cells[c].count));
+        }
+    }
+    leaves.sort_by_key(|&(f, _)| f);
+    let pairs: usize = leaves.iter().map(|&(_, cnt)| cnt * (cnt - 1) / 2).sum();
+    let flops = pairs as f64 * fmm::roofline::p2p_flops_per_pair();
+    let avg = leaves.iter().map(|&(_, c)| c).sum::<usize>() as f64 / leaves.len() as f64;
+    println!("p2p bench: N={n} n_leaf={n_leaf} leaves={} avg={avg:.2}/leaf pairs={pairs} flops/pass={:.2e}", leaves.len(), flops);
+
+    // Partition leaves into `nthreads` contiguous slot ranges.
+    let mut bounds = vec![0usize; nthreads + 1];
+    let target = n / nthreads;
+    let mut t = 1usize;
+    for (idx, &(first, count)) in leaves.iter().enumerate() {
+        if t < nthreads && idx > 0 && first + count >= target * t {
+            bounds[t] = idx;
+            t += 1;
+        }
+    }
+    bounds[nthreads] = leaves.len();
+    let mut leaf_ranges = Vec::new();
+    for t in 0..nthreads {
+        let slice = &leaves[bounds[t]..bounds[t + 1]];
+        let lo = slice.first().map(|&(f, _)| f).unwrap_or(0);
+        let hi = slice.last().map(|&(f, c)| f + c).unwrap_or(lo);
+        leaf_ranges.push((slice.to_vec(), lo, hi));
+    }
+
+    // Synthetic large-block measurement: one kernel call on `big` bodies,
+    // isolates pure kernel throughput from per-cell call overhead.
+    let big = 2048usize;
+    let big_pairs = big * (big - 1) / 2;
+    let big_flops = big_pairs as f64 * fmm::roofline::p2p_flops_per_pair();
+    let mut best_b = f64::INFINITY;
+    for _ in 0..5 {
+        let t0 = std::time::Instant::now();
+        for _ in 0..20 {
+            fmm::p2p::p2p_self(&mut bodies, 0, big);
+        }
+        best_b = best_b.min(t0.elapsed().as_secs_f64() / 20.0);
+    }
+    println!(
+        "  synthetic block=2048: {:.4}s/call = {:>7.1} GFLOPS",
+        best_b,
+        big_flops / best_b / 1e9
+    );
+
+    // Threaded synthetic: each thread runs its own 2048-body block, disjoint views.
+    let mut best_bt = f64::INFINITY;
+    for _ in 0..5 {
+        let t0 = std::time::Instant::now();
+        std::thread::scope(|s| {
+            let raw: *mut Bodies = &mut bodies;
+            let nthreads = nthreads;
+            for t in 0..nthreads {
+                let mut v = unsafe { body_view(&mut *raw, (t * big) % (bodies.x.len() - big), (t * big) % (bodies.x.len() - big) + big) };
+                s.spawn(move || {
+                    for _ in 0..20 {
+                        fmm::p2p::p2p_self(&mut v, 0, big);
+                    }
+                    std::mem::forget(v);
+                });
+            }
+        });
+        best_bt = best_bt.min(t0.elapsed().as_secs_f64() / 20.0);
+    }
+    println!(
+        "  synthetic threaded x{}: {:.4}s/call = {:>7.1} GFLOPS",
+        nthreads,
+        best_bt,
+        big_flops * nthreads as f64 / best_bt / 1e9
+    );
+
+    // Single-thread baseline.
+    let passes = 50;
+    let mut best = f64::INFINITY;
+    for _ in 0..3 {
+        let t0 = std::time::Instant::now();
+        for _ in 0..passes {
+            for &(f, cnt) in &leaves {
+                fmm::p2p::p2p_self(&mut bodies, f, cnt);
+            }
+        }
+        best = best.min(t0.elapsed().as_secs_f64() / passes as f64);
+    }
+    println!("  single-thread: {:.4}s/pass = {:>7.1} GFLOPS", best, flops / best / 1e9);
+
+    // Threaded across disjoint ranges (views share the same backing arrays).
+    let mut best_t = f64::INFINITY;
+    for _ in 0..3 {
+        let t0 = std::time::Instant::now();
+        std::thread::scope(|s| {
+            let raw: *mut Bodies = &mut bodies;
+            for (ls, lo, hi) in &leaf_ranges {
+                let ls = ls.clone();
+                let mut v = unsafe { body_view(&mut *raw, *lo, *hi) };
+                s.spawn(move || {
+                    for _ in 0..passes {
+                        for &(f, cnt) in &ls {
+                            fmm::p2p::p2p_self(&mut v, f - *lo, cnt);
+                        }
+                    }
+                    std::mem::forget(v);
+                });
+            }
+        });
+        best_t = best_t.min(t0.elapsed().as_secs_f64() / passes as f64);
+    }
+    println!(
+        "  threaded x{}: {:.4}s/pass = {:>7.1} GFLOPS ({:.2}x)",
+        nthreads,
+        best_t,
+        flops / best_t / 1e9,
+        best / best_t
+    );
+}
+
+/// Mutable non-owning view over a contiguous slot range of `b`.
+/// Caller must `std::mem::forget` the result (it aliases `b`).
+unsafe fn body_view(b: &mut Bodies, lo: usize, hi: usize) -> Bodies {
+    fn seg(v: &mut Vec<f64>, lo: usize, hi: usize) -> Vec<f64> {
+        unsafe { Vec::from_raw_parts(v.as_mut_ptr().add(lo), hi - lo, hi - lo) }
+    }
+    Bodies {
+        x: seg(&mut b.x, lo, hi),
+        y: seg(&mut b.y, lo, hi),
+        z: seg(&mut b.z, lo, hi),
+        m: seg(&mut b.m, lo, hi),
+        ax: seg(&mut b.ax, lo, hi),
+        ay: seg(&mut b.ay, lo, hi),
+        az: seg(&mut b.az, lo, hi),
+        pot: seg(&mut b.pot, lo, hi),
+    }
+}
+
 fn net_force(parts: &[fmm::models::Particle], accel: &[[f64; 3]]) -> f64 {
     let mut fsum = [0.0; 3];
     let mut ftot = 0.0;
@@ -93,6 +242,15 @@ fn main() {
     let p: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(8);
     let eps: f64 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(1e-5);
     let avx = std::is_x86_feature_detected!("avx512f");
+
+    // P2P throughput mode: fmm-bench p2p [N] [nthreads]
+    if args.get(4).map(|s| s.as_str()) == Some("p2p") {
+        let n: usize = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(1_000_000);
+        let nt: usize = args.get(6).and_then(|s| s.parse().ok()).unwrap_or(8);
+        let nleaf: usize = args.get(7).and_then(|s| s.parse().ok()).unwrap_or(16);
+        p2p_bench(n, nt, nleaf);
+        return;
+    }
 
     // Profile mode: time each phase for a single N.
     if let Some(np) = args.get(4) {

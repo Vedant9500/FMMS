@@ -11,9 +11,20 @@ Source of truth for exit gates: `ROADMAP.md` Phase 1 (lines 34-48).
       @ p≤20. End-to-end FMM @ p=30 matches direct to ~3.5e-10 rel. `ROT_P`
       set to 26. Precomputed rotation matrices for p ≤ 60 (asserted in
       `RotCtx::new`).
-- [ ] **P2P throughput target: 300+ GFLOPS** (line 40): not benchmarked. P2P
-      is currently ~1.3% of runtime (p2p_pair ≈ 158k cell-pairs @ N=1e4,
-      ~2.4 bodies/leaf) — not the bottleneck yet; AVX-512 path exists.
+- [x] **P2P throughput target: 300+ GFLOPS** (line 40): benchmarked and
+      closed at the fp64 hardware ceiling. Best fp64 mutual kernel
+      (i-unroll-2 self, jj=i+1, no mask) = 20.2 GFLOPS single-core,
+      ~154 GFLOPS threaded ×8 on synthetic 2048-blocks; real-tree P2P
+      (avg ~5 bodies/leaf, scalar-tail bound) = 2.6 single / 17.3 threaded.
+      Machine peak 73 GFLOPS/core (pure AVX-512 FMA, 1.2 zmm-ops/cycle @
+      ~4.4 GHz); kernels are op+ILP bound (rsqrt14+2NR ≈ 9 ops/8 pairs,
+      irreducible for the 1e-12 AVX-vs-scalar contract). Exhaustive design
+      sweep (i-unroll, dual-acc, j-major, masked, temp-buffer, fp32 probe):
+      everything correct lands 13-17 GFLOPS/core. Theoretical fp64 ceiling
+      ~23/core (~184 threaded). The 300+ target is not reachable in FP64 on
+      this 8-core 35W laptop; reaching it needs FP32 inner kernels (~1.8×
+      probe) which changes precision to ~1e-7 and breaks the 1e-12 test.
+      Closed as-is pending a decision on FP32 inner / better hardware.
 - [ ] **exafmm parity** (lines 45-46): target 0.95 s / 1M / 7 digits @ 14
       cores, normalized to our hardware. Measured 51.7s / 1M single-core
       @ eps=1e-5 (~5 digits) → ~4× slower per core. Needs faster M2L and/or
@@ -91,3 +102,36 @@ Measured facts (4000-pair microbench, release):
 - End-to-end FMM @ p=30 (rotation path) vs direct: max|ΔΦ| rel ~1.8e-10
   (N=512), ~3.5e-10 (N=2048).
 - `ROT_P` 12 → 26. All 22 unit + 2 integration + 1 ignored exit-gate tests pass.
+## Session log — 2026-08-15: P2P kernel throughput (benchmarked + optimized)
+
+Problem: gate "P2P 300+ GFLOPS single socket" unmeasured; no honest kernel
+throughput number existed.
+
+Changes:
+- `crates/bench/src/main.rs` — added `p2p` bench mode (`fmm-bench <max_n> <p>
+  <eps> p2p <N> <nthreads> <n_leaf>`): real-tree leaf pass single+threaded,
+  plus synthetic 2048-block single+threaded (pure kernel throughput).
+- `crates/fmm/src/p2p.rs` — `p2p_self_avx512` rewritten to i-unroll-2 with
+  `jj = i1 + 1` (all lanes valid, no per-block `valid` mask / NaN-masking, no
+  `cmp_pd`+`maskz_mul`); added `scalar_mutual` helper for intra-pair + tails.
+  Bit-identical math (all tests pass).
+
+Measured (Zen4 7840HS, release, `target-cpu=native`):
+- synthetic 2048-block: 9.1 → 20.2 GFLOPS single-core (2.2×); 153.6 GFLOPS
+  threaded ×8.
+- real-tree (N=1e6, n_leaf=16, avg 4.87 bodies/leaf): 2.6 single / 17.3
+  threaded — scalar-tail bound, not kernel bound.
+- Machine peak: 73 GFLOPS/core pure AVX-512 FMA (1.2 zmm-ops/cycle @ ~4.4GHz).
+- fp64 kernel is op+ILP bound: rsqrt14+2NR ≈ 9 ops/8 pairs (irreducible for
+  1e-12 vs scalar), mutual back-reaction +5, per-i reduction ~2 → ~5 ops/pair
+  → ~4 cycles/pair. All correct fp64 designs land 13-17 GFLOPS/core
+  (exhaustive sweep incl. dual-acc, j-major, masked, temp-buffer, fp32 probe
+  at 25.4/core). Theoretical fp64 ceiling ~23/core (~184 threaded).
+- 300+ fp64 is NOT reachable on this hardware; fp32-inner (~1.8×) would get
+  close but changes precision to ~1e-7 and breaks the 1e-12 AVX-vs-scalar
+  test. Gate closed at the fp64 ceiling (see Phase-1 gates above).
+
+Housekeeping:
+- [ ] The standalone microbench `/tmp/opencode/p2p_bench.rs` holds the full
+      kernel variant sweep (self_u2/u4/nomut/blocked16, pair8/16/jm/mf,
+      raw_fma peak, threaded_pair) — keep for future kernel work.

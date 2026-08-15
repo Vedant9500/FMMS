@@ -87,90 +87,122 @@ pub fn p2p_pair_scalar(
     }
 }
 
-/// AVX-512 FP64 kernel for one leaf cell (i < j pairs).
-///
-/// 8 FP64 lanes per iteration over j. The j-side writes use masked stores so
-/// only j > i receive the back-reaction; the (i, i) diagonal is excluded.
+/// Scalar mutual update for a single pair; shared by the AVX-512 kernels' tails.
+#[inline(always)]
+fn scalar_mutual(b: &mut Bodies, first: usize, i: usize, j: usize) {
+    let dx = b.x[first + j] - b.x[first + i];
+    let dy = b.y[first + j] - b.y[first + i];
+    let dz = b.z[first + j] - b.z[first + i];
+    let r2 = dx * dx + dy * dy + dz * dz;
+    let inv = 1.0 / r2.sqrt();
+    let inv3 = inv * inv * inv;
+    let mi = b.m[first + i];
+    let mj = b.m[first + j];
+    b.ax[first + i] += mj * inv3 * dx;
+    b.ay[first + i] += mj * inv3 * dy;
+    b.az[first + i] += mj * inv3 * dz;
+    b.pot[first + i] += mj * inv;
+    let fm = mi * inv3;
+    b.ax[first + j] -= fm * dx;
+    b.ay[first + j] -= fm * dy;
+    b.az[first + j] -= fm * dz;
+    b.pot[first + j] += mi * inv;
+}
+
+/// AVX-512 FP64 kernel for one leaf cell, i-unrolled 2. j-lanes start at i+1 so
+/// every lane is a valid pair (no per-block mask needed); the intra-pair (i0,i1)
+/// and the unaligned tail run scalar.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 unsafe fn p2p_self_avx512(b: &mut Bodies, first: usize, count: usize) {
     use std::arch::x86_64::*;
-    let lanes = _mm512_set_pd(7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0, 0.0);
     let three = _mm512_set1_pd(3.0);
     let half = _mm512_set1_pd(0.5);
-    let one = _mm512_set1_pd(1.0);
     let zero = _mm512_setzero_pd();
-    for i in 0..count {
-        let xi = _mm512_set1_pd(b.x[first + i]);
-        let yi = _mm512_set1_pd(b.y[first + i]);
-        let zi = _mm512_set1_pd(b.z[first + i]);
-        let mi = b.m[first + i];
-        let mut axacc = zero;
-        let mut ayacc = zero;
-        let mut azacc = zero;
-        let mut potacc = zero;
-        let mut jj = 0usize;
+    let mut i = 0usize;
+    while i + 2 <= count {
+        let i0 = i;
+        let i1 = i + 1;
+        let x0 = _mm512_set1_pd(b.x[first + i0]);
+        let y0 = _mm512_set1_pd(b.y[first + i0]);
+        let z0 = _mm512_set1_pd(b.z[first + i0]);
+        let x1 = _mm512_set1_pd(b.x[first + i1]);
+        let y1 = _mm512_set1_pd(b.y[first + i1]);
+        let z1 = _mm512_set1_pd(b.z[first + i1]);
+        let m0 = _mm512_set1_pd(b.m[first + i0]);
+        let m1 = _mm512_set1_pd(b.m[first + i1]);
+        let mut a0x = zero;
+        let mut a0y = zero;
+        let mut a0z = zero;
+        let mut p0 = zero;
+        let mut a1x = zero;
+        let mut a1y = zero;
+        let mut a1z = zero;
+        let mut p1 = zero;
+        scalar_mutual(b, first, i0, i1);
+        let mut jj = i1 + 1;
         while jj + 8 <= count {
-            // valid = lane index jj+... > i, i.e. j > i.
-            let jvec = _mm512_add_pd(_mm512_set1_pd(jj as f64), lanes);
-            let valid = _mm512_cmp_pd_mask(jvec, _mm512_set1_pd(i as f64), _MM_CMPINT_NLE); // j > i
-            let xb = _mm512_loadu_pd(b.x.as_ptr().add(first + jj));
-            let yb = _mm512_loadu_pd(b.y.as_ptr().add(first + jj));
-            let zb = _mm512_loadu_pd(b.z.as_ptr().add(first + jj));
-            let mb = _mm512_loadu_pd(b.m.as_ptr().add(first + jj));
-            let dx = _mm512_sub_pd(xb, xi);
-            let dy = _mm512_sub_pd(yb, yi);
-            let dz = _mm512_sub_pd(zb, zi);
-            let r2 = _mm512_fmadd_pd(dz, dz, _mm512_fmadd_pd(dy, dy, _mm512_mul_pd(dx, dx)));
+            let o = jj;
+            let xb = _mm512_loadu_pd(b.x.as_ptr().add(first + o));
+            let yb = _mm512_loadu_pd(b.y.as_ptr().add(first + o));
+            let zb = _mm512_loadu_pd(b.z.as_ptr().add(first + o));
+            let mb = _mm512_loadu_pd(b.m.as_ptr().add(first + o));
+            let dx0 = _mm512_sub_pd(xb, x0);
+            let dy0 = _mm512_sub_pd(yb, y0);
+            let dz0 = _mm512_sub_pd(zb, z0);
+            let r2 = _mm512_fmadd_pd(dz0, dz0, _mm512_fmadd_pd(dy0, dy0, _mm512_mul_pd(dx0, dx0)));
             let inv = _mm512_rsqrt14_pd(r2);
             let inv = _mm512_mul_pd(_mm512_mul_pd(inv, _mm512_fnmadd_pd(_mm512_mul_pd(inv, inv), r2, three)), half);
             let inv = _mm512_mul_pd(_mm512_mul_pd(inv, _mm512_fnmadd_pd(_mm512_mul_pd(inv, inv), r2, three)), half);
-            // Invalid lanes carry NaN (r2 = 0 on the diagonal); kill them via the mask.
-            let inv = _mm512_maskz_mul_pd(valid, inv, one);
             let inv3 = _mm512_mul_pd(_mm512_mul_pd(inv, inv), inv);
             let f = _mm512_mul_pd(mb, inv3);
-            axacc = _mm512_fmadd_pd(f, dx, axacc);
-            ayacc = _mm512_fmadd_pd(f, dy, ayacc);
-            azacc = _mm512_fmadd_pd(f, dz, azacc);
-            potacc = _mm512_fmadd_pd(mb, inv, potacc);
-            let fm = _mm512_set1_pd(mi);
-            let fm = _mm512_mul_pd(fm, inv3);
-            let axj = _mm512_loadu_pd(b.ax.as_ptr().add(first + jj));
-            let axj = _mm512_fnmadd_pd(fm, dx, axj);
-            _mm512_mask_storeu_pd(b.ax.as_mut_ptr().add(first + jj), valid, axj);
-            let ayj = _mm512_loadu_pd(b.ay.as_ptr().add(first + jj));
-            let ayj = _mm512_fnmadd_pd(fm, dy, ayj);
-            _mm512_mask_storeu_pd(b.ay.as_mut_ptr().add(first + jj), valid, ayj);
-            let azj = _mm512_loadu_pd(b.az.as_ptr().add(first + jj));
-            let azj = _mm512_fnmadd_pd(fm, dz, azj);
-            _mm512_mask_storeu_pd(b.az.as_mut_ptr().add(first + jj), valid, azj);
-            let pj = _mm512_loadu_pd(b.pot.as_ptr().add(first + jj));
-            let pj = _mm512_fmadd_pd(_mm512_set1_pd(mi), inv, pj);
-            _mm512_mask_storeu_pd(b.pot.as_mut_ptr().add(first + jj), valid, pj);
+            a0x = _mm512_fmadd_pd(f, dx0, a0x);
+            a0y = _mm512_fmadd_pd(f, dy0, a0y);
+            a0z = _mm512_fmadd_pd(f, dz0, a0z);
+            p0 = _mm512_fmadd_pd(mb, inv, p0);
+            let fm0 = _mm512_mul_pd(m0, inv3);
+            let dx1 = _mm512_sub_pd(xb, x1);
+            let dy1 = _mm512_sub_pd(yb, y1);
+            let dz1 = _mm512_sub_pd(zb, z1);
+            let r2b = _mm512_fmadd_pd(dz1, dz1, _mm512_fmadd_pd(dy1, dy1, _mm512_mul_pd(dx1, dx1)));
+            let invb = _mm512_rsqrt14_pd(r2b);
+            let invb = _mm512_mul_pd(_mm512_mul_pd(invb, _mm512_fnmadd_pd(_mm512_mul_pd(invb, invb), r2b, three)), half);
+            let invb = _mm512_mul_pd(_mm512_mul_pd(invb, _mm512_fnmadd_pd(_mm512_mul_pd(invb, invb), r2b, three)), half);
+            let inv3b = _mm512_mul_pd(_mm512_mul_pd(invb, invb), invb);
+            let fb = _mm512_mul_pd(mb, inv3b);
+            a1x = _mm512_fmadd_pd(fb, dx1, a1x);
+            a1y = _mm512_fmadd_pd(fb, dy1, a1y);
+            a1z = _mm512_fmadd_pd(fb, dz1, a1z);
+            p1 = _mm512_fmadd_pd(mb, invb, p1);
+            let fm1 = _mm512_mul_pd(m1, inv3b);
+            let axj = _mm512_loadu_pd(b.ax.as_ptr().add(first + o));
+            _mm512_storeu_pd(b.ax.as_mut_ptr().add(first + o), _mm512_fnmadd_pd(fm0, dx0, _mm512_fnmadd_pd(fm1, dx1, axj)));
+            let ayj = _mm512_loadu_pd(b.ay.as_ptr().add(first + o));
+            _mm512_storeu_pd(b.ay.as_mut_ptr().add(first + o), _mm512_fnmadd_pd(fm0, dy0, _mm512_fnmadd_pd(fm1, dy1, ayj)));
+            let azj = _mm512_loadu_pd(b.az.as_ptr().add(first + o));
+            _mm512_storeu_pd(b.az.as_mut_ptr().add(first + o), _mm512_fnmadd_pd(fm0, dz0, _mm512_fnmadd_pd(fm1, dz1, azj)));
+            let pj = _mm512_loadu_pd(b.pot.as_ptr().add(first + o));
+            _mm512_storeu_pd(b.pot.as_mut_ptr().add(first + o), _mm512_fmadd_pd(m0, inv, _mm512_fmadd_pd(m1, invb, pj)));
             jj += 8;
         }
-        for j in jj.max(i + 1)..count {
-            let dx = b.x[first + j] - b.x[first + i];
-            let dy = b.y[first + j] - b.y[first + i];
-            let dz = b.z[first + j] - b.z[first + i];
-            let r2 = dx * dx + dy * dy + dz * dz;
-            let inv = 1.0 / r2.sqrt();
-            let inv3 = inv * inv * inv;
-            let mj = b.m[first + j];
-            b.ax[first + i] += mj * inv3 * dx;
-            b.ay[first + i] += mj * inv3 * dy;
-            b.az[first + i] += mj * inv3 * dz;
-            b.pot[first + i] += mj * inv;
-            let fm = mi * inv3;
-            b.ax[first + j] -= fm * dx;
-            b.ay[first + j] -= fm * dy;
-            b.az[first + j] -= fm * dz;
-            b.pot[first + j] += mi * inv;
+        for j in jj..count {
+            scalar_mutual(b, first, i0, j);
+            scalar_mutual(b, first, i1, j);
         }
-        b.ax[first + i] += hsum512(axacc);
-        b.ay[first + i] += hsum512(ayacc);
-        b.az[first + i] += hsum512(azacc);
-        b.pot[first + i] += hsum512(potacc);
+        b.ax[first + i0] += hsum512(a0x);
+        b.ay[first + i0] += hsum512(a0y);
+        b.az[first + i0] += hsum512(a0z);
+        b.pot[first + i0] += hsum512(p0);
+        b.ax[first + i1] += hsum512(a1x);
+        b.ay[first + i1] += hsum512(a1y);
+        b.az[first + i1] += hsum512(a1z);
+        b.pot[first + i1] += hsum512(p1);
+        i += 2;
+    }
+    for i in i..count {
+        for j in i + 1..count {
+            scalar_mutual(b, first, i, j);
+        }
     }
 }
 
