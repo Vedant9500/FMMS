@@ -6,8 +6,30 @@
 //!
 //! Acceleration (Dehnen 2014, §2.1): a = ∇Ψ_0^0 = -(Re{Ψ_1^1}, Im{Ψ_1^1}, Ψ_1^0).
 
-use crate::harmonic::{idx, theta_table, upsilon_table, C, dim};
+use crate::harmonic::{idx, theta_table, theta_table_into, upsilon_table, C, dim};
 use crate::tree::Octree;
+
+/// Reusable per-worker scratch for `m2l_mutual_scratch` (avoids the 4 heap
+/// allocations per call the wrapper makes). Arithmetic is identical to the
+/// `m2l_mutual` baseline.
+pub struct M2lScratch {
+    pub th: Vec<C>,
+    pub ths: Vec<C>,
+    pub cma: Vec<C>,
+    pub cmb: Vec<C>,
+}
+
+impl M2lScratch {
+    pub fn new(p: usize) -> Self {
+        let d = dim(p);
+        M2lScratch {
+            th: vec![C::ZERO; d],
+            ths: vec![C::ZERO; d],
+            cma: vec![C::ZERO; d],
+            cmb: vec![C::ZERO; d],
+        }
+    }
+}
 
 /// Compute the mutual M2L for a pair of well-separated cells a (source of b)
 /// and b (source of a). The Θ table at r = s_B - z_A is reused for the
@@ -23,6 +45,21 @@ pub fn m2l_mutual(
     locals: &mut [C],
     p: usize,
 ) {
+    let mut scratch = M2lScratch::new(p);
+    m2l_mutual_scratch(tree, a, b, moments, locals, p, &mut scratch);
+}
+
+/// Allocation-free variant of `m2l_mutual`; `scratch` must be sized for `p`.
+/// Bit-compatible with `m2l_mutual` (identical operation order).
+pub fn m2l_mutual_scratch(
+    tree: &Octree,
+    a: usize,
+    b: usize,
+    moments: &[C],
+    locals: &mut [C],
+    p: usize,
+    scratch: &mut M2lScratch,
+) {
     let d = dim(p);
     let ca = tree.cells[a];
     let cb = tree.cells[b];
@@ -32,19 +69,20 @@ pub fn m2l_mutual(
         cb.cen[1] - ca.cen[1],
         cb.cen[2] - ca.cen[2],
     ];
-    let th = theta_table(r, p);
+    theta_table_into(r, p, &mut scratch.th);
     let offa = a * d;
     let offb = b * d;
     // Precompute conjugated moments once (they are constant across (n, m)),
     // and a copy of the Θ table pre-scaled by the parity (-1)^{order} so the
     // reverse direction needs no per-iteration sign.
-    let mut cma = Vec::with_capacity(d);
-    let mut cmb = Vec::with_capacity(d);
+    let cma = &mut scratch.cma;
+    let cmb = &mut scratch.cmb;
     for i in 0..d {
-        cma.push(moments[offa + i].conj());
-        cmb.push(moments[offb + i].conj());
+        cma[i] = moments[offa + i].conj();
+        cmb[i] = moments[offb + i].conj();
     }
-    let mut ths = th.clone();
+    let ths = &mut scratch.ths;
+    let th = &scratch.th;
     {
         let mut o = 0usize;
         for n in 0..=p {

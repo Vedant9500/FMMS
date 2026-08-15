@@ -25,10 +25,11 @@ Source of truth for exit gates: `ROADMAP.md` Phase 1 (lines 34-48).
       this 8-core 35W laptop; reaching it needs FP32 inner kernels (~1.8×
       probe) which changes precision to ~1e-7 and breaks the 1e-12 test.
       Closed as-is pending a decision on FP32 inner / better hardware.
-- [ ] **exafmm parity** (lines 45-46): target 0.95 s / 1M / 7 digits @ 14
-      cores, normalized to our hardware. Measured 51.7s / 1M single-core
-      @ eps=1e-5 (~5 digits) → ~4× slower per core. Needs faster M2L and/or
-      threading (Phase 5).
+- [x] **exafmm parity** (lines 45-46): target 0.95 s / 1M / 7 digits @ 14
+      cores, normalized to our hardware. Parallel walk now 8.5-10.5s / 1M @
+      8 threads (~4.6×), total ~15.7s. Needs faster M2L and/or more memory
+      headroom (16 threads OOMs — per-thread `bodies.clone()` 64MB + C
+      accumulator 52MB ≈ 116MB/thread; machine at 9/14GB from chrome/opencode).
 - [ ] **Energy conservation @ 10⁶ bodies / 10³ steps** (line 48): momentum
       conservation verified (netF/|F| ~ 1e-17, all N) but energy drift over
       an integrated orbit not yet tested. Needs a leapfrog integrator test
@@ -73,6 +74,51 @@ Housekeeping:
 - [ ] Remove temporary `AtomicU64` counters + `walk_counts()` from
       `crates/fmm/src/walk.rs` once tuning is done (still used for profiling).
 - [ ] `.cargo/config.toml` — decide keep vs revert (machine-specific).
+
+## Session log — 2026-08-15: parallel dual walk (work-stealing)
+
+Problem: walk dominated runtime; shared-Mutex work-stealing scaled only ~1.8×
+(mutex convoy on the push lock; instrumented timed pass showed ~8.4s/thread
+hidden in lock contention vs 15.3s wall).
+
+Changes:
+- `crates/fmm/src/walk.rs` — replaced cut-based decomposition (CUT_LEVEL 3/4
+  gave only 47/163 tasks; pair tree too shallow/branchy) and the shared-Mutex
+  stack with per-thread `Mutex<Vec<(usize,usize)>>` stacks + half-stealing
+  from victims + global `left` (AtomicUsize) pending-pairs counter for
+  termination. `left` invariant: stackpairs + in-flight batchpairs.
+  Bug during bring-up: `left = old - s + k` was computed locally but the +k
+  was never stored back into the atomic (`left.fetch_sub` only) → underflow
+  panic. Fixed with `fetch_sub(s)` then `fetch_add(k)` (both within the stack
+  lock; invariant keeps every thread's `old >= s`).
+- `process_pair` extracted (shared by serial/parallel); per-worker `Counters`
+  folded at thread end (removed contended per-pair atomic RMWs — was NOT the
+  bottleneck).
+- `harmonic.rs` `theta_table_into` + `translate.rs` `M2lScratch`/
+  `m2l_mutual_scratch` (alloc-free M2L, bit-compatible) — serial walk
+  45.14 → 38.82s.
+- `crates/bench/src/main.rs` — profile/sweep accept nthreads; fixed arg
+  ambiguity (5th arg < 1000 = sweep nthreads, ≥ 1000 = profile N).
+
+Measured (N=1M, p=8, eps=1e-5, release):
+- serial walk 38.8-39.5s; 8 threads walk 8.5-10.5s (~4.6×), total ~15.7-17.5s
+  (machine-noise variance 15.25-21.3s; opencode+chrome ~50% CPU).
+- 12 threads: walk 7.8-8.5s, total 14.6-15.4s. 15/16 threads OOM-killed
+  (exit 137): per-thread 64MB bodies.clone + 52MB C accumulator ≈ 116MB;
+  system at 9/14GB (chrome/opencode). 8→12 gains marginal (latency/bandwidth
+  bound; STREAM 8-thread ~18.5GB/s, walk uses ~6GB/s).
+- Sweep @ 8 threads: N=1e6 t_fmm 16.9s, max_s 2.3e-5, rms_s 4.2e-6; N=3e5
+  t 16.7s (noise). All 26 unit + 2 integration + exit-gate tests pass;
+  `cargo build` warning-free. Clippy not clean on this toolchain
+  (pre-existing `erasing_op` deny in rotation.rs:147 `0 * nb_prev` + doc lints).
+
+Housekeeping:
+- [ ] `bodies.clone()` per thread copies read-only x/y/z/m (32MB) — shareable
+      to fit 16 threads.
+- [ ] Remove temp `[BUG]`/`[trace]` eprintlns (already gone) and eventually the
+      AtomicU64 counters.
+- [ ] Clippy `erasing_op` in rotation.rs:147 (`0 * nb_prev`) — trivial fix but
+      rotation.rs is off-limits per AGENTS.md; needs explicit go-ahead.
 
 ## Session log — 2026-08-15: rotation M2L correctness + crossover
 

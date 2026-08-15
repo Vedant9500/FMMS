@@ -38,8 +38,18 @@ impl Fmm {
         Fmm { tree: Octree::build_with_mode(parts, n_leaf, mode), p, eps, n_leaf }
     }
 
-    /// Run the full FMM: returns accelerations and potentials (particle-id order).
+    /// Run the full FMM (serial walk): returns accelerations and potentials
+    /// (particle-id order).
     pub fn run(&self, parts: &[Particle]) -> Result {
+        self.run_impl(parts, 1)
+    }
+
+    /// Run the full FMM with `nthreads` threads in the dual tree walk.
+    pub fn run_threaded(&self, parts: &[Particle], nthreads: usize) -> Result {
+        self.run_impl(parts, nthreads.max(1))
+    }
+
+    fn run_impl(&self, parts: &[Particle], nthreads: usize) -> Result {
         let p = self.p;
         let d = dim(p);
         let ncells = self.tree.cells.len();
@@ -51,11 +61,18 @@ impl Fmm {
         let binom = crate::moments::binomials(p);
         let (_, fmin) = crate::mac::f_prepass(&bodies, &self.tree);
         let mut locals = vec![C::ZERO; ncells * d];
-        let mut rot = if p >= crate::rotation::ROT_P { Some(RotCtx::new(p)) } else { None };
-        crate::walk::dual_walk(
-            &mut bodies, &self.tree, p, self.eps, &pows, &binom, &fmin,
-            &moments, &mut locals, rot.as_mut(),
-        );
+        if nthreads <= 1 {
+            let mut rot = if p >= crate::rotation::ROT_P { Some(RotCtx::new(p)) } else { None };
+            crate::walk::dual_walk(
+                &mut bodies, &self.tree, p, self.eps, &pows, &binom, &fmin,
+                &moments, &mut locals, rot.as_mut(),
+            );
+        } else {
+            crate::walk::dual_walk_par(
+                &mut bodies, &self.tree, p, self.eps, &pows, &binom, &fmin,
+                &moments, &mut locals, nthreads,
+            );
+        }
         // L2L pass down: each cell adds its expansion to its children.
         for c in 0..ncells {
             let cell = self.tree.cells[c];

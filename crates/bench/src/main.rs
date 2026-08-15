@@ -9,15 +9,15 @@ use fmm::fmm::Fmm;
 use fmm::models::plummer;
 use std::time::Instant;
 
-fn time_fmm(parts: &[fmm::models::Particle], p: usize, eps: f64) -> f64 {
+fn time_fmm(parts: &[fmm::models::Particle], p: usize, eps: f64, nthreads: usize) -> f64 {
     // Warmup.
     let f = Fmm::new(parts, p, eps, 16);
-    f.run(parts);
+    f.run_threaded(parts, nthreads);
     // Best of 2 timed runs.
     let mut best = f64::INFINITY;
     for _ in 0..2 {
         let t0 = Instant::now();
-        f.run(parts);
+        f.run_threaded(parts, nthreads);
         best = best.min(t0.elapsed().as_secs_f64());
     }
     best
@@ -242,6 +242,7 @@ fn main() {
     let p: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(8);
     let eps: f64 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(1e-5);
     let avx = std::is_x86_feature_detected!("avx512f");
+    let default_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
 
     // P2P throughput mode: fmm-bench p2p [N] [nthreads]
     if args.get(4).map(|s| s.as_str()) == Some("p2p") {
@@ -253,8 +254,23 @@ fn main() {
     }
 
     // Profile mode: time each phase for a single N.
+    // fmm-bench [max_n] [p] [eps] <N> [nthreads]  (N >= 1000)
+    // A 5th argument < 1000 is instead the sweep's nthreads.
     if let Some(np) = args.get(4) {
-        let n: usize = np.parse().unwrap();
+        if let Ok(n) = np.parse::<usize>() {
+            if n < 1000 {
+                sweep(max_n, p, eps, n, avx);
+                return;
+            }
+            profile(n, p, eps, args.get(5).and_then(|s| s.parse().ok()).unwrap_or(default_threads));
+            return;
+        }
+    }
+    sweep(max_n, p, eps, default_threads, avx);
+    return;
+}
+
+fn profile(n: usize, p: usize, eps: f64, nthreads: usize) {
         let parts = plummer(n, [0.0; 3], 42);
         let f = Fmm::new(&parts, p, eps, 16);
         for pass in 0..2 {
@@ -272,10 +288,16 @@ fn main() {
             let (_, fmin) = fmm::mac::f_prepass(&bodies, &tree);
             let t3 = Instant::now();
             let mut locals = vec![fmm::harmonic::C::ZERO; ncells * d];
-            let mut rot = if p >= fmm::rotation::ROT_P { Some(fmm::rotation::RotCtx::new(p)) } else { None };
-            fmm::walk::dual_walk(
-                &mut bodies, &tree, p, eps, &pows, &binom, &fmin, &moments, &mut locals, rot.as_mut(),
-            );
+            if nthreads <= 1 {
+                let mut rot = if p >= fmm::rotation::ROT_P { Some(fmm::rotation::RotCtx::new(p)) } else { None };
+                fmm::walk::dual_walk(
+                    &mut bodies, &tree, p, eps, &pows, &binom, &fmin, &moments, &mut locals, rot.as_mut(),
+                );
+            } else {
+                fmm::walk::dual_walk_par(
+                    &mut bodies, &tree, p, eps, &pows, &binom, &fmin, &moments, &mut locals, nthreads,
+                );
+            }
             let t4 = Instant::now();
             for c in 0..ncells {
                 let cell = tree.cells[c];
@@ -305,17 +327,19 @@ fn main() {
             }
             let t6 = Instant::now();
             if pass == 1 {
-                println!("profile N={n} p={p} eps={eps}: tree-build+clone {:.4}s, moments {:.4}s, prepass/mac {:.4}s, walk {:.4}s, l2l {:.4}s, l2p+scatter {:.4}s, total {:.4}s",
+                println!("profile N={n} p={p} eps={eps} nthreads={nthreads}: tree-build+clone {:.4}s, moments {:.4}s, prepass/mac {:.4}s, walk {:.4}s, l2l {:.4}s, l2p+scatter {:.4}s, total {:.4}s",
                     (t1 - t0).as_secs_f64(), (t2 - t1).as_secs_f64(), (t3 - t2).as_secs_f64(),
                     (t4 - t3).as_secs_f64(), (t5 - t4).as_secs_f64(), (t6 - t5).as_secs_f64(), (t6 - t0).as_secs_f64());
                 let (pop, acc, m2l, s2, p2, m2l_ops) = fmm::walk::walk_counts();
                 println!("  walk stats: pops={pop}, accept/M2L={m2l}, m2l-pair-ops={m2l_ops}, p2p_self={s2}, p2p_pair={p2} (accept-calls={acc})");
             }
         }
-        return;
-    }
+}
 
-    println!("FMM O(N) scaling sweep  (p={p}, eps={eps}, n_leaf=16, avx512={avx}, best-of-2)");
+// Sweep mode: fmm-bench [max_n] [p] [eps] [nthreads]
+fn sweep(max_n: usize, p: usize, eps: f64, nthreads: usize, avx: bool) {
+
+    println!("FMM O(N) scaling sweep  (p={p}, eps={eps}, n_leaf=16, avx512={avx}, nthreads={nthreads}, best-of-2)");
 
     let ns: Vec<usize> = vec![1_000, 3_000, 10_000, 30_000, 100_000, 300_000, 1_000_000]
         .into_iter()
@@ -325,7 +349,7 @@ fn main() {
     println!("\n{:>10} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12}", "N", "t_fmm(s)", "t_dir(s)", "speedup", "max_s", "rms_s", "netF/|F|");
     for &n in &ns {
         let parts = plummer(n, [0.0; 3], 42);
-        let t = time_fmm(&parts, p, eps);
+        let t = time_fmm(&parts, p, eps, nthreads);
         let f = Fmm::new(&parts, p, eps, 16);
         let res = f.run(&parts);
         let (max_s, rms_s) = if n <= 10_000 {
@@ -354,7 +378,7 @@ fn main() {
         for &n in &[1_000usize, 3_000, 10_000] {
             let parts = plummer(n, [0.0; 3], 42);
             let td = time_direct(&parts);
-            let tf = time_fmm(&parts, p, eps);
+            let tf = time_fmm(&parts, p, eps, nthreads);
             println!("  N={n:>7}: direct {td:8.4}s  FMM {tf:8.4}s  speedup {:.1}x", td / tf);
         }
     }

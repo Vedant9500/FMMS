@@ -76,9 +76,7 @@ pub const fn idx(n: usize, m: i32) -> usize {
 /// Evaluate Θ_n^m(r), all 0 ≤ n ≤ p, into a table of size dim(p).
 ///
 /// Θ_0^0 = 1/|r|; Θ is singular at r = 0. Caller must ensure |r| > 0.
-pub fn theta_table(r: [f64; 3], p: usize) -> Vec<C> {
-    let d = dim(p);
-    let mut t = vec![C::ZERO; d];
+pub fn theta_table_into(r: [f64; 3], p: usize, t: &mut [C]) {
     let (x, y, z) = (r[0], r[1], r[2]);
     let r2 = x * x + y * y + z * z;
     let ir = 1.0 / r2.sqrt();
@@ -114,6 +112,12 @@ pub fn theta_table(r: [f64; 3], p: usize) -> Vec<C> {
             t[idx(n, -(m as i32))] = t[idx(n, m as i32)].conj().scale(sgn);
         }
     }
+}
+
+pub fn theta_table(r: [f64; 3], p: usize) -> Vec<C> {
+    let d = dim(p);
+    let mut t = vec![C::ZERO; d];
+    theta_table_into(r, p, &mut t);
     t
 }
 
