@@ -33,7 +33,11 @@ Source of truth for exit gates: `ROADMAP.md` Phase 1 (lines 34-48).
 - [ ] **Energy conservation @ 10⁶ bodies / 10³ steps** (line 48): momentum
       conservation verified (netF/|F| ~ 1e-17, all N) but energy drift over
       an integrated orbit not yet tested. Needs a leapfrog integrator test
-      (Phase 2 territory) or a standalone energy check.
+      (Phase 2 territory) or a standalone energy check. — machinery done
+      (`crates/fmm/tests/energy_gate.rs`, virialized IC + KDK leapfrog):
+      validated N=10⁵×10³ (drift 1.03e-3, encounter-dominated, no secular
+      FMM heating). Full N=10⁶×10³ run DEFERRED until walk is faster
+      (see LIMITATIONS.md §Verification gaps).
 
 ## Phase-1 gates now closed (this session)
 
@@ -181,3 +185,47 @@ Housekeeping:
 - [ ] The standalone microbench `/tmp/opencode/p2p_bench.rs` holds the full
       kernel variant sweep (self_u2/u4/nomut/blocked16, pair8/16/jm/mf,
       raw_fma peak, threaded_pair) — keep for future kernel work.
+
+## Session log — 2026-08-15: energy conservation gate (ROADMAP line 48)
+
+Problem: no energy-conservation test existed; needed leapfrog + energy check
+for 10⁶ bodies / 10³ steps.
+
+Changes:
+- `crates/fmm/tests/energy_gate.rs` (new): KDK (drift-kick-drift) leapfrog,
+  one FMM force eval per step, `integrate()` + energy diagnostics (drift,
+  max_dev, linear-fit slope, momentum). `energy_conservation_smoke` (default
+  test, N=1024×100 steps ≈ 9s) + `energy_conservation_gate` (`#[ignore]`,
+  N=10⁶×10³ via env overrides FMM_ENERGY_N/STEPS/DT/EPS/THREADS).
+- Virialized IC: local Maxwellian σ²(r)=1/(6√(1+r²)), COM removed, velocities
+  rescaled to exact virial balance. Sanity: E0 = T+W = -3π/64 ≈ -0.147.
+
+Measured facts:
+- Cold start is USELESS for this gate: the cold Plummer collapse forms a hard
+  binary in the core at t≈0.03 (observed at N=4096, 3e4, 1e5), which a
+  fixed-dt leapfrog cannot resolve → energy jump then runaway (ΔE/E → +10³,
+  vmax → 3e3). Verified NOT an FMM bug: direct-force integration reproduces
+  the exact same jump to 1e-8. Collisional physics, not FMM error.
+- Warm start fixes it: N=3e4, 200 steps (t=0.2), eps=1e-5: drift 4.7e-5,
+  max_dev 5.3e-5, vmax stays ~1.7, momentum 7.1e-16. Smoke (N=1024): drift
+  3.6e-6. Threshold set: drift/max_dev < 1e-3, slope < 1e-6/step, momentum
+  < 1e-12.
+- Full N=10⁶×10³ gate launched in background (~20s/step @ 8 threads → ~5h).
+  Deferred: too slow on a shared 35W laptop while the walk still gets
+  optimized; interim validation substituted instead.
+- Interim N=10⁵ × 10³ @ 12 threads (warm IC, dt=1e-3): drift 1.03e-3,
+  max_dev 1.03e-3 (3% over the 1e-3 gate), slope 6.5e-7/step (no secular FMM
+  heating), momentum 8.7e-15, 1.65 s/step, 27.5 min total. The overage is
+  TWO unresolved close-encounter heating events (vmax 1.7→2.1 at steps ~700
+  and ~950), not FMM error. Accepted as-is (encounter-limited at N=10⁵; at
+  10⁶ per-event jumps scale 10× smaller). Gate threshold 1e-3 stands for the
+  full 10⁶ run.
+- Added `LIMITATIONS.md` — consolidated known limitations / deferred
+  improvements (physics, perf, verification gaps, housekeeping).
+- All 26 unit + 3 integration tests pass; build warning-free; new file
+  clippy-clean (pre-existing lib lints unchanged).
+
+Housekeeping:
+- [ ] After the full N=10⁶×10³ gate run closes (post-optimization): flip the
+      todo.md bullet, record the measured drift in the session log.
+

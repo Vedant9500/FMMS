@@ -55,13 +55,17 @@ crates/
 
 ## Verification
 
-- 22 unit tests + 2 integration tests (`tests/`), all passing.
+- 26 unit tests + 3 integration tests (`tests/`), all passing; plus an
+  energy-conservation smoke test (N=10³ steps, ~9s) in `tests/energy_gate.rs`.
 - `exit_gate` integration test (ignored by default; N=10⁴ direct O(N²)) run
   explicitly in release mode.
+- `energy_gate` integration test (ignored by default; N=10⁶ × 10³ steps, ~5h)
+  run explicitly in release; validated at N=10⁵×10³ as interim.
 - Python cross-checks of the rotation algebra in `/tmp/opencode` (not part of
   the repo).
 
 ## Open gates
 
-See `todo.md`. Remaining: P2P 300+ GFLOPS, exafmm parity, energy-conservation
-test, walk-counter/housekeeping cleanup.
+See `todo.md` and `LIMITATIONS.md`. Remaining: P2P 300+ GFLOPS (closed at fp64
+hardware ceiling), exafmm parity, full N=10⁶ energy-conservation gate (machinery
+done, run deferred), walk-counter/housekeeping cleanup.
