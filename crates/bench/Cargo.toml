@@ -1,0 +1,14 @@
+[package]
+name = "fmm-bench"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+fmm = { path = "../fmm" }
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "phase0"
+harness = false

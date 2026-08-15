@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = ["crates/fmm", "crates/bench"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3
+
+[profile.bench]
+lto = "thin"
+codegen-units = 1
+opt-level = 3
