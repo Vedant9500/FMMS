@@ -59,7 +59,11 @@ impl Fmm {
         crate::moments::compute_moments(&bodies, &self.tree, p, &mut moments);
         let pows = crate::moments::multipole_power(&moments, ncells, p);
         let binom = crate::moments::binomials(p);
-        let (_, fmin) = crate::mac::f_prepass(&bodies, &self.tree);
+        let (_, fmin) = if nthreads > 1 {
+            crate::mac::f_prepass_par(&bodies, &self.tree, nthreads)
+        } else {
+            crate::mac::f_prepass(&bodies, &self.tree)
+        };
         let mut locals = vec![C::ZERO; ncells * d];
         if nthreads <= 1 {
             let mut rot = if p >= crate::rotation::ROT_P { Some(RotCtx::new(p)) } else { None };

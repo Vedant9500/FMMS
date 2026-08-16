@@ -285,7 +285,11 @@ fn profile(n: usize, p: usize, eps: f64, nthreads: usize) {
             let t2 = Instant::now();
             let pows = fmm::moments::multipole_power(&moments, ncells, p);
             let binom = fmm::moments::binomials(p);
-            let (_, fmin) = fmm::mac::f_prepass(&bodies, &tree);
+            let (_, fmin) = if nthreads > 1 {
+                fmm::mac::f_prepass_par(&bodies, &tree, nthreads)
+            } else {
+                fmm::mac::f_prepass(&bodies, &tree)
+            };
             let t3 = Instant::now();
             let mut locals = vec![fmm::harmonic::C::ZERO; ncells * d];
             if nthreads <= 1 {

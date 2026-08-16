@@ -33,7 +33,14 @@ pub fn error_estimate(
     if r == 0.0 {
         return None;
     }
-    let rp = r.powf(p as f64);
+    let r2 = r * r;
+    let mut rp = 1.0f64;
+    for _ in 0..p / 2 {
+        rp *= r2;
+    }
+    if p % 2 == 1 {
+        rp *= r;
+    }
     // rho_B^j for j = 0..=p (stack array; p is bounded by ROT_P usage <= ~30).
     let mut rpows = [1.0f64; 64];
     for j in 1..=p {
@@ -85,48 +92,55 @@ pub fn accept(
     }
 }
 
-/// Estimate f_b = Σ_{a≠b} m_a/|x_a-x_b|² for every particle with a p=0
-/// treecode (monopole, θ<1). Returns (per-particle f_b, per-cell min).
-pub fn f_prepass(bodies: &crate::bodies::Bodies, tree: &Octree) -> (Vec<f64>, Vec<f64>) {
-    let n = bodies.x.len();
-    let mut f = vec![0.0; n];
-    let mut stack: Vec<usize> = Vec::with_capacity(64);
-    for i in 0..n {
-        let pb = [bodies.x[i], bodies.y[i], bodies.z[i]];
-        stack.clear();
-        stack.push(0);
-        while let Some(c) = stack.pop() {
-            let cell = tree.cells[c];
-            if tree.is_leaf(c) {
-                for k in cell.first..cell.first + cell.count {
-                    if k == i {
-                        continue;
-                    }
-                    let dx = pb[0] - bodies.x[k];
-                    let dy = pb[1] - bodies.y[k];
-                    let dz = pb[2] - bodies.z[k];
-                    let r2 = dx * dx + dy * dy + dz * dz;
-                    if r2 > 0.0 {
-                        f[i] += bodies.m[k] / r2;
-                    }
+/// Monopole (p=0, θ<1) tree-walk estimate of f_b for one particle.
+/// `stack` is caller-owned scratch, cleared per call.
+fn f_walk(
+    bodies: &crate::bodies::Bodies,
+    tree: &Octree,
+    i: usize,
+    stack: &mut Vec<usize>,
+) -> f64 {
+    let pb = [bodies.x[i], bodies.y[i], bodies.z[i]];
+    stack.clear();
+    stack.push(0);
+    let mut fi = 0.0;
+    while let Some(c) = stack.pop() {
+        let cell = tree.cells[c];
+        if tree.is_leaf(c) {
+            for k in cell.first..cell.first + cell.count {
+                if k == i {
+                    continue;
                 }
+                let dx = pb[0] - bodies.x[k];
+                let dy = pb[1] - bodies.y[k];
+                let dz = pb[2] - bodies.z[k];
+                let r2 = dx * dx + dy * dy + dz * dz;
+                if r2 > 0.0 {
+                    fi += bodies.m[k] / r2;
+                }
+            }
+        } else {
+            let dx = pb[0] - cell.cen[0];
+            let dy = pb[1] - cell.cen[1];
+            let dz = pb[2] - cell.cen[2];
+            let d2 = dx * dx + dy * dy + dz * dz;
+            if d2 > cell.rho * cell.rho {
+                fi += cell.mass / d2;
             } else {
-                let dx = pb[0] - cell.cen[0];
-                let dy = pb[1] - cell.cen[1];
-                let dz = pb[2] - cell.cen[2];
-                let d2 = dx * dx + dy * dy + dz * dz;
-                if d2 > cell.rho * cell.rho {
-                    f[i] += cell.mass / d2;
-                } else {
-                    for &ch in &cell.children {
-                        if ch >= 0 {
-                            stack.push(ch as usize);
-                        }
+                for &ch in &cell.children {
+                    if ch >= 0 {
+                        stack.push(ch as usize);
                     }
                 }
             }
         }
     }
+    fi
+}
+
+/// Per-cell fmin from per-particle f (children appear after parents in the
+/// cell array, so the reverse sweep sees leaves first).
+fn fmin_of(f: &[f64], tree: &Octree) -> Vec<f64> {
     let ncells = tree.cells.len();
     let mut fmin = vec![f64::INFINITY; ncells];
     for c in (0..ncells).rev() {
@@ -147,13 +161,53 @@ pub fn f_prepass(bodies: &crate::bodies::Bodies, tree: &Octree) -> (Vec<f64>, Ve
             fmin[c] = m;
         }
     }
+    fmin
+}
+
+/// Estimate f_b = Σ_{a≠b} m_a/|x_a-x_b|² for every particle with a p=0
+/// treecode (monopole, θ<1). Returns (per-particle f_b, per-cell min).
+pub fn f_prepass(bodies: &crate::bodies::Bodies, tree: &Octree) -> (Vec<f64>, Vec<f64>) {
+    let n = bodies.x.len();
+    let mut f = vec![0.0; n];
+    let mut stack: Vec<usize> = Vec::with_capacity(64);
+    for i in 0..n {
+        f[i] = f_walk(bodies, tree, i, &mut stack);
+    }
+    let fmin = fmin_of(&f, tree);
+    (f, fmin)
+}
+
+/// Parallel `f_prepass`: disjoint contiguous particle ranges per thread.
+/// Bit-identical to `f_prepass` — each f_b is an independent serial sum, and
+/// the fmin sweep is unchanged. Bodies are in Morton order, so contiguous
+/// chunks each span many octants, which balances the walk cost.
+pub fn f_prepass_par(
+    bodies: &crate::bodies::Bodies,
+    tree: &Octree,
+    nthreads: usize,
+) -> (Vec<f64>, Vec<f64>) {
+    let n = bodies.x.len();
+    let mut f = vec![0.0; n];
+    let chunk = n.div_ceil(nthreads.max(1));
+    std::thread::scope(|s| {
+        for (t, piece) in f.chunks_mut(chunk).enumerate() {
+            let base = t * chunk;
+            s.spawn(move || {
+                let mut stack: Vec<usize> = Vec::with_capacity(64);
+                for (off, v) in piece.iter_mut().enumerate() {
+                    *v = f_walk(bodies, tree, base + off, &mut stack);
+                }
+            });
+        }
+    });
+    let fmin = fmin_of(&f, tree);
     (f, fmin)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::Particle;
+    use crate::models::{plummer, Particle};
 
     #[test]
     fn f_prepass_small() {
@@ -167,5 +221,16 @@ mod tests {
         let (f, _) = f_prepass(&bodies, &tree);
         assert!((f[0] - 2.0 / 9.0).abs() < 1e-12);
         assert!((f[1] - 1.0 / 9.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn f_prepass_par_matches_serial() {
+        let parts = plummer(2048, [0.0; 3], 11);
+        let tree = Octree::build(&parts, 16);
+        let bodies = crate::bodies::Bodies::from_parts(&parts, &tree.order);
+        let (f1, m1) = f_prepass(&bodies, &tree);
+        let (f2, m2) = f_prepass_par(&bodies, &tree, 8);
+        assert_eq!(f1, f2);
+        assert_eq!(m1, m2);
     }
 }
