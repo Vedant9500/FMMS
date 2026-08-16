@@ -124,6 +124,64 @@ Housekeeping:
 - [ ] Clippy `erasing_op` in rotation.rs:147 (`0 * nb_prev`) — trivial fix but
       rotation.rs is off-limits per AGENTS.md; needs explicit go-ahead.
 
+## Session log — 2026-08-16: two-phase parallel walk (bucketed M2L replay)
+
+Problem: `PERF-ANALYSIS.md` §4.1 — parallel walk DRAM-bandwidth-bound: random
+moments/locals accumulation across a ~1.3GB working set (~5.2KB/pair random
+traffic → 214GB/step ≈ 11.6s floor at the 18.5GB/s STREAM rate; measured walk
+11.9s).
+
+Changes:
+- `crates/fmm/src/walk.rs` — `dual_walk_par` split into two phases: (1) the
+  work-stealing walk *records* accepted M2L pairs (near-field P2P inline into
+  per-thread bodies copies, unchanged), (2) recorded pairs are partitioned
+  in place (American-flag MSD, one level) into `min(a,b)` subtree buckets
+  (≤1024) and replayed into per-thread `locals` in contiguous bucket ranges,
+  reduced as before. `process_pair` grew a `record` hook; the serial walk and
+  the M2L kernels are untouched (bit-compatibility contract preserved — only
+  accumulation order changes, which the parallel-vs-serial tests already
+  sanction). New `partition_pairs` unit test (bucket membership + multiset).
+- `crates/fmm/src/mac.rs` — `error_estimate`: `r.powf(p)` → repeated squaring
+  of r² (was a libm call per accept evaluation, ~2 per pop).
+- `crates/fmm/src/mac.rs` — `f_prepass` parallelized: per-particle walk
+  extracted into `f_walk`, fmin sweep into `fmin_of`; new `f_prepass_par`
+  splits particles into `nthreads` disjoint contiguous chunks (Morton order
+  balances walk cost across chunks). **Bit-identical** to serial (each f_b is
+  an independent serial sum); `f_prepass_par_matches_serial` asserts exact
+  equality. Dispatched from `fmm.rs run_impl` and bench profile when
+  nthreads > 1.
+
+Measured (same loaded-machine session, before → after; release, p=8,
+eps=1e-5, n_leaf=16):
+- N=1e5 @8: walk 2.93 → 0.99s (**2.95×**), total 3.51 → 1.56s; 8-thread
+  scaling of the walk 1.8× → 5.3×.
+- N=1e6 @8: walk 11.89 → 7.69s (**1.55×**), total 18.47 → 14.32s; peak RSS
+  3.6 → 4.1GB (recorded-pairs array ≈ 8B × 41.2M ≈ 330MB).
+- M2L pair count identical before/after (N=1e6: 41,224,026; N=1e5: 5,721,286)
+  — same pair set, same accuracy.
+- f_prepass @8: N=1e6 4.45 → 0.56s (**7.9×**), N=1e5 0.36 → 0.041s. Static
+  chunks balanced well (Morton order mixes spatial regions per chunk).
+- Cumulative this session @8, N=1e6 total: 18.47 → 14.32 → **10.05s** (walk
+  7.31 + prepass 0.56 + moments 1.24 + l2l 0.45 + l2p 0.49).
+- Serial walk 5.33 → 5.23s @N=1e5 (powf removal ≈ 2%).
+- Energy gate estimate: ~11.5s/step (10.05 + ~1.5 tree) → **~3.2h** for the
+  10⁶×10³ run (was ~5.5h).
+- Residual: at N=1e6 the replay is still bound by the scattered *other-side*
+  cell traffic (~107GB ≈ 5.8s floor). Next walk lever: one-directional
+  Morton-slab ownership (PERF-ANALYSIS.md §4.3/§5 stage 2b) — shared locals
+  slabs instead of per-thread full copies (kills the 3.6GB + reduce pass and
+  makes source moments reads shared read-only). Next pipeline lever:
+  parallelize moments (1.24s; P2M over leaves, M2M by level).
+
+Tests: all 28 unit + 4 integration tests pass; release exit gate
+max_s 1.83e-3, rms_s 4.87e-5 (gate rms<1e-4; the shift from 3.76e-5 is powi
+ULPs flipping a few borderline accepts); `cargo build` warning-free; clippy
+error is the pre-existing rotation.rs:147 `erasing_op` (file off-limits).
+
+Housekeeping:
+- [ ] 12-thread N=1e6 untestable on this machine state (needs ~6.5GB
+      transient; 8 threads peak 4.1GB vs ~4GB free).
+
 ## Session log — 2026-08-15: rotation M2L correctness + crossover
 
 Problem: `m2l_rot_matches_naive` failing with huge errors; rotation was also
