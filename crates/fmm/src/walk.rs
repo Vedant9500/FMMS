@@ -9,12 +9,13 @@
 //! M2L dispatches to the rotation kernel for p >= ROT_P when a `RotCtx`
 //! is supplied, else the naive O(p⁴) kernel.
 //!
-//! `dual_walk_par` parallelizes over the pair tree with a shared work stack:
-//! each thread pops a batch of pairs, processes them (splitting pairs push
-//! their children back onto the stack), and drains into private
-//! `locals`/`Bodies` accumulators, reduced into the shared ones at the end.
-//! The set of (A, B) pairs processed is identical to the serial walk; only
-//! accumulation order differs, so results agree to fp reassociation rounding.
+//! `dual_walk_par` runs in two phases with the same pair decomposition: a
+//! work-stealing walk that records accepted M2L pairs (near-field P2P is done
+//! inline into per-thread `Bodies` accumulators), then a bucketed replay of
+//! the recorded pairs into per-thread `locals` accumulators, reduced into the
+//! shared ones at the end. The set of (A, B) pairs processed is identical to
+//! the serial walk; only accumulation order differs, so results agree to fp
+//! reassociation rounding.
 
 use crate::harmonic::C;
 use crate::mac::accept;
@@ -66,6 +67,9 @@ impl Counters {
 
 /// Handle one cell pair in the mutual walk, pushing any split daughters onto
 /// `pending`. Shared by the serial `process_stack` and the parallel workers.
+/// With `record = Some`, accepted M2L pairs are appended to the recorder
+/// instead of being evaluated (used by `dual_walk_par` phase 1; phase 2
+/// replays them). The evaluated pair set is identical either way.
 #[inline]
 fn process_pair(
     bodies: &mut crate::bodies::Bodies,
@@ -78,6 +82,7 @@ fn process_pair(
     moments: &[C],
     locals: &mut [C],
     rot: Option<&mut RotCtx>,
+    record: Option<&mut Vec<(u32, u32)>>,
     a: usize,
     b: usize,
     pending: &mut Vec<(usize, usize)>,
@@ -112,7 +117,9 @@ fn process_pair(
         cnt.accept += 1;
         cnt.m2l += 1;
         cnt.m2l_ops += 1;
-        if p >= crate::rotation::ROT_P {
+        if let Some(rec) = record {
+            rec.push((a as u32, b as u32));
+        } else if p >= crate::rotation::ROT_P {
             if let Some(r) = rot.as_deref_mut() {
                 r.m2l_pair(tree, a, b, moments, locals);
             } else {
@@ -176,8 +183,8 @@ fn process_stack(
     let mut scratch = M2lScratch::new(p);
     while let Some((a, b)) = stack.pop() {
         process_pair(
-            bodies, tree, p, eps, pows, binom, fmin, moments, locals, rot.as_deref_mut(), a, b,
-            stack, &mut cnt, &mut scratch,
+            bodies, tree, p, eps, pows, binom, fmin, moments, locals, rot.as_deref_mut(), None,
+            a, b, stack, &mut cnt, &mut scratch,
         );
     }
     cnt.fold();
@@ -208,21 +215,54 @@ pub fn dual_walk(
 /// subtree (sibling pairs share cells), avoiding L2/DRAM write misses.
 const BATCH: usize = 64;
 
+/// In-place partition of recorded pairs into contiguous buckets by
+/// `min(a, b)` (American-flag MSD sort, one level). DFS cell ids make each
+/// bucket a subtree range, so replaying bucket-by-bucket keeps the min-side
+/// cell's moments/locals cache-resident. Returns bucket end offsets
+/// (length `nbuckets + 1`; bucket i is `pairs[..ends[i+1]][ends[i]..]`).
+fn partition_pairs(pairs: &mut [(u32, u32)], ncells: usize, nbuckets: usize) -> Vec<usize> {
+    let bucket =
+        |id: u32| -> usize { (id as usize * nbuckets / ncells.max(1)).min(nbuckets - 1) };
+    let mut ends = vec![0usize; nbuckets + 1];
+    for &(a, b) in pairs.iter() {
+        ends[bucket(a.min(b)) + 1] += 1;
+    }
+    for i in 0..nbuckets {
+        ends[i + 1] += ends[i];
+    }
+    let mut next = ends.clone();
+    for i in 0..nbuckets {
+        while next[i] < ends[i + 1] {
+            let (a, b) = pairs[next[i]];
+            let j = bucket(a.min(b));
+            if j == i {
+                next[i] += 1;
+            } else {
+                let d = next[j];
+                next[j] += 1;
+                pairs.swap(next[i], d);
+            }
+        }
+    }
+    ends
+}
+
 /// Parallel dual tree walk with the same pair decomposition as `dual_walk`.
 ///
-/// Workers share a work stack seeded with `(root, root)` and steal batches of
-/// pairs; each splitting pair pushes its daughters back onto the stack, so
-/// dynamic load balancing falls out of the decomposition itself (no task list
-/// or serial collect phase). Each thread owns a private copy of `locals` and a
-/// private `Bodies` accumulator (positions/masses cloned, accelerations
-/// zeroed); results are reduced into `locals` and `bodies` afterwards.
-/// Requires `nthreads * (ncells·dim + N)·16` bytes of transient memory for the
-/// accumulators.
+/// Two phases, to keep M2L accumulation cache-local:
 ///
-/// Termination: each thread owns a private stack (uncontended pop/push); a
-/// thread whose stack empties steals half of a random victim's stack. `left`
-/// counts pairs still in some stack or in a thread's in-flight batch, so
-/// `left == 0` (observed after a batch completes) means all work is done.
+/// 1. Work-stealing dual walk (per-thread stacks, half-stealing, `left`
+///    counter for termination — see below) that only *records* accepted M2L
+///    pairs; near-field P2P accumulates directly into per-thread `Bodies`
+///    copies as before.
+/// 2. The recorded pairs are partitioned in place into `min(a,b)` buckets
+///    (subtree ranges) and replayed into per-thread `locals` accumulators,
+///    contiguous bucket ranges per thread, then reduced.
+///
+/// The set of (A, B) M2L pairs is identical to the serial walk; only
+/// accumulation order differs, so results agree to fp reassociation rounding.
+/// Requires `nthreads * (ncells·dim + N)·16` bytes of transient memory for the
+/// accumulators plus `8` bytes per recorded M2L pair.
 pub fn dual_walk_par(
     bodies: &mut crate::bodies::Bodies,
     tree: &Octree,
@@ -240,14 +280,15 @@ pub fn dual_walk_par(
     let n = bodies.x.len();
     let use_rot = p >= crate::rotation::ROT_P;
 
-    let mut per_thread: Vec<(Vec<C>, crate::bodies::Bodies)> = (0..nthreads)
+    // Phase 1: walk + record; P2P into private bodies copies.
+    let mut workers: Vec<(Vec<(u32, u32)>, crate::bodies::Bodies)> = (0..nthreads)
         .map(|_| {
             let mut tb = bodies.clone();
             tb.ax.iter_mut().for_each(|v| *v = 0.0);
             tb.ay.iter_mut().for_each(|v| *v = 0.0);
             tb.az.iter_mut().for_each(|v| *v = 0.0);
             tb.pot.iter_mut().for_each(|v| *v = 0.0);
-            (vec![C::ZERO; ncells * d], tb)
+            (Vec::new(), tb)
         })
         .collect();
 
@@ -263,14 +304,14 @@ pub fn dual_walk_par(
         let left = &left;
         let park = &park;
         let cv = &cv;
-        for (i, slot) in per_thread.iter_mut().enumerate() {
-            let (tl, tb) = (&mut slot.0, &mut slot.1);
+        for (i, slot) in workers.iter_mut().enumerate() {
+            let (rec, tb) = (&mut slot.0, &mut slot.1);
             s.spawn(move || {
-                let mut rot = if use_rot { Some(RotCtx::new(p)) } else { None };
                 let mut batch: Vec<(usize, usize)> = Vec::with_capacity(BATCH);
                 let mut pending: Vec<(usize, usize)> = Vec::with_capacity(BATCH * 8);
                 let mut cnt = Counters::default();
                 let mut scratch = M2lScratch::new(p);
+                let mut nolocals: [C; 0] = [];
                 loop {
                     batch.clear();
                     {
@@ -314,8 +355,8 @@ pub fn dual_walk_par(
                     pending.clear();
                     for &(a, b) in batch.iter() {
                         process_pair(
-                            tb, tree, p, eps, pows, binom, fmin, moments, tl, rot.as_mut(), a, b,
-                            &mut pending, &mut cnt, &mut scratch,
+                            tb, tree, p, eps, pows, binom, fmin, moments, &mut nolocals, None,
+                            Some(rec), a, b, &mut pending, &mut cnt, &mut scratch,
                         );
                     }
 
@@ -337,8 +378,55 @@ pub fn dual_walk_par(
         }
     });
 
+    // Merge recorded pairs and partition by min-cell subtree bucket.
+    let npairs: usize = workers.iter().map(|(r, _)| r.len()).sum();
+    let mut pairs: Vec<(u32, u32)> = Vec::with_capacity(npairs);
+    for (r, _) in &mut workers {
+        pairs.append(r);
+    }
+    let nbuckets = 1024.min(ncells).max(1);
+    let ends = partition_pairs(&mut pairs, ncells, nbuckets);
+
+    // Phase 2: replay into per-thread locals, contiguous bucket ranges.
+    let mut tls: Vec<Vec<C>> = (0..nthreads).map(|_| vec![C::ZERO; ncells * d]).collect();
+    let target = npairs.div_ceil(nthreads);
+    let mut bounds: Vec<usize> = vec![0];
+    let mut acc = 0usize;
+    for i in 0..nbuckets {
+        acc += ends[i + 1] - ends[i];
+        if acc >= target && bounds.len() < nthreads {
+            acc = 0;
+            bounds.push(ends[i + 1]);
+        }
+    }
+    std::thread::scope(|s| {
+        let mut it = tls.iter_mut();
+        let pairs = &pairs;
+        let nb = bounds.len();
+        for j in 0..nb {
+            let lo = bounds[j];
+            let hi = if j + 1 < nb { bounds[j + 1] } else { npairs };
+            let tl = it.next().unwrap();
+            if hi <= lo {
+                continue;
+            }
+            let mut rot = if use_rot { Some(RotCtx::new(p)) } else { None };
+            let mut scratch = M2lScratch::new(p);
+            s.spawn(move || {
+                for &(a, b) in &pairs[lo..hi] {
+                    match rot.as_mut() {
+                        Some(r) => r.m2l_pair(tree, a as usize, b as usize, moments, tl),
+                        None => m2l_mutual_scratch(
+                            tree, a as usize, b as usize, moments, tl, p, &mut scratch,
+                        ),
+                    }
+                }
+            });
+        }
+    });
+
     // Reduce private accumulators into the shared ones.
-    for (tl, tb) in &per_thread {
+    for (tl, (_, tb)) in tls.iter().zip(&workers) {
         for i in 0..ncells * d {
             locals[i] = locals[i].add(tl[i]);
         }
@@ -357,6 +445,35 @@ mod tests {
     use crate::bodies::Bodies;
     use crate::harmonic::dim;
     use crate::models::{plummer, Particle};
+
+    #[test]
+    fn partition_pairs_buckets_and_preserves_multiset() {
+        let ncells = 1000;
+        let nbuckets = 16;
+        let mut pairs: Vec<(u32, u32)> = Vec::new();
+        let mut rng = 12345u64;
+        let mut next = move || {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (rng >> 33) as u32 % ncells as u32
+        };
+        for _ in 0..5000 {
+            pairs.push((next(), next()));
+        }
+        let mut sorted = pairs.clone();
+        sorted.sort_unstable();
+        let ends = partition_pairs(&mut pairs, ncells, nbuckets);
+        assert_eq!(ends.len(), nbuckets + 1);
+        assert_eq!(*ends.last().unwrap(), pairs.len());
+        for i in 0..nbuckets {
+            assert!(ends[i] <= ends[i + 1]);
+            for &(a, b) in &pairs[ends[i]..ends[i + 1]] {
+                let expect = (a.min(b) as usize * nbuckets / ncells).min(nbuckets - 1);
+                assert_eq!(expect, i, "pair ({a},{b}) in bucket {i}");
+            }
+        }
+        pairs.sort_unstable();
+        assert_eq!(pairs, sorted);
+    }
 
     /// Run the walk both serial and threaded and check the M2L locals and the
     /// near-field accelerations agree to fp reassociation tolerance.
