@@ -215,17 +215,21 @@ pub fn dual_walk(
 /// subtree (sibling pairs share cells), avoiding L2/DRAM write misses.
 const BATCH: usize = 64;
 
-/// In-place partition of recorded pairs into contiguous buckets by
-/// `min(a, b)` (American-flag MSD sort, one level). DFS cell ids make each
-/// bucket a subtree range, so replaying bucket-by-bucket keeps the min-side
-/// cell's moments/locals cache-resident. Returns bucket end offsets
-/// (length `nbuckets + 1`; bucket i is `pairs[..ends[i+1]][ends[i]..]`).
-fn partition_pairs(pairs: &mut [(u32, u32)], ncells: usize, nbuckets: usize) -> Vec<usize> {
-    let bucket =
-        |id: u32| -> usize { (id as usize * nbuckets / ncells.max(1)).min(nbuckets - 1) };
+/// In-place partition of recorded pairs into contiguous buckets (American-
+/// flag MSD sort, one level) keyed by `key`. DFS cell ids make each bucket a
+/// subtree range, so replaying bucket-by-bucket keeps the keyed cell's
+/// moments/locals cache-resident. Returns bucket end offsets (length
+/// `nbuckets + 1`).
+fn partition_pairs_by(
+    pairs: &mut [(u32, u32)],
+    ncells: usize,
+    nbuckets: usize,
+    key: impl Fn((u32, u32)) -> u32,
+) -> Vec<usize> {
+    let bucket = |id: u32| -> usize { (id as usize * nbuckets / ncells.max(1)).min(nbuckets - 1) };
     let mut ends = vec![0usize; nbuckets + 1];
-    for &(a, b) in pairs.iter() {
-        ends[bucket(a.min(b)) + 1] += 1;
+    for &pr in pairs.iter() {
+        ends[bucket(key(pr)) + 1] += 1;
     }
     for i in 0..nbuckets {
         ends[i + 1] += ends[i];
@@ -233,8 +237,8 @@ fn partition_pairs(pairs: &mut [(u32, u32)], ncells: usize, nbuckets: usize) -> 
     let mut next = ends.clone();
     for i in 0..nbuckets {
         while next[i] < ends[i + 1] {
-            let (a, b) = pairs[next[i]];
-            let j = bucket(a.min(b));
+            let pr = pairs[next[i]];
+            let j = bucket(key(pr));
             if j == i {
                 next[i] += 1;
             } else {
@@ -247,22 +251,36 @@ fn partition_pairs(pairs: &mut [(u32, u32)], ncells: usize, nbuckets: usize) -> 
     ends
 }
 
+/// Partition by `min(a, b)` — each mutual pair sits in its earlier cell's
+/// subtree bucket.
+fn partition_pairs(pairs: &mut [(u32, u32)], ncells: usize, nbuckets: usize) -> Vec<usize> {
+    partition_pairs_by(pairs, ncells, nbuckets, |(a, b)| a.min(b))
+}
+
 /// Parallel dual tree walk with the same pair decomposition as `dual_walk`.
 ///
 /// Two phases, to keep M2L accumulation cache-local:
 ///
 /// 1. Work-stealing dual walk (per-thread stacks, half-stealing, `left`
-///    counter for termination — see below) that only *records* accepted M2L
-///    pairs; near-field P2P accumulates directly into per-thread `Bodies`
-///    copies as before.
+///    counter for termination) that only *records* accepted M2L pairs;
+///    near-field P2P accumulates directly into per-thread `Bodies` copies.
 /// 2. The recorded pairs are partitioned in place into `min(a,b)` buckets
-///    (subtree ranges) and replayed into per-thread `locals` accumulators,
-///    contiguous bucket ranges per thread, then reduced.
+///    (subtree ranges) and replayed — mutual kernel (or the rotation kernel
+///    for p ≥ ROT_P) — into per-thread `locals` accumulators, contiguous
+///    bucket ranges per thread, then reduced.
+///
+/// A one-directional "dst-slab" replay (shared locals, no per-thread copies,
+/// see `m2l_one_sided_scratch`) was prototyped and measured 2026-08-16: it
+/// lost ~1.9× on kernel cost — the mutual kernel computes both directions
+/// per inner-loop iteration sharing loads and one Θ table, while two
+/// one-sided ops pay table build + loop overhead twice — and the memory
+/// saving did not compensate at p=8. Revisit only with a cheaper one-sided
+/// kernel (stage 3).
 ///
 /// The set of (A, B) M2L pairs is identical to the serial walk; only
 /// accumulation order differs, so results agree to fp reassociation rounding.
-/// Requires `nthreads * (ncells·dim + N)·16` bytes of transient memory for the
-/// accumulators plus `8` bytes per recorded M2L pair.
+/// Requires `nthreads * (ncells·dim + N)·16` bytes of transient memory for
+/// the accumulators plus `8` bytes per recorded M2L pair.
 pub fn dual_walk_par(
     bodies: &mut crate::bodies::Bodies,
     tree: &Octree,

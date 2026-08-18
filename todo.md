@@ -124,6 +124,54 @@ Housekeeping:
 - [ ] Clippy `erasing_op` in rotation.rs:147 (`0 * nb_prev`) — trivial fix but
       rotation.rs is off-limits per AGENTS.md; needs explicit go-ahead.
 
+## Session log — 2026-08-16 (evening 2): stage-2b attempt, counter bug, revert
+
+Problem: stage-2b from PERF-ANALYSIS.md §5 — one-directional Morton-slab
+replay to kill the walk's remaining scattered traffic + the 3.6GB per-thread
+locals ceiling.
+
+Changes:
+- `crates/fmm/src/translate.rs` — new `m2l_one_sided_scratch` (allocation-
+  free one-sided M2L, bit-compatible with `m2l_one_sided`; exact-equality
+  test). KEPT: future stage-3 building block for a directed/interaction-list
+  replay.
+- `crates/fmm/src/walk.rs` — prototyped directed dst-slab replay (record
+  src→dst ops, in-place 16k-bucket partition by dst, shared locals with
+  per-thread cell slabs, no reduce). MEASURED WORSE, REVERTED to the
+  stage-2a mutual bucketed replay. Negative result documented in
+  `dual_walk_par`'s doc comment.
+- `crates/bench/src/main.rs` — **bug fix**: profile() read `walk_counts()`
+  after two passes without resetting — ALL previously printed walk stats
+  (pops/M2L/leaves/p2p) were 2× the per-evaluation truth, including the
+  numbers in the 2026-08-14/15 logs and the original PERF-ANALYSIS.md.
+  Counters now reset per pass.
+
+Measured (N=1e6, p=8, eps=1e-5, @8 threads):
+- Directed slab replay: walk 7.16 → 9.75s (**36% regression**) → reverted;
+  restored walk 7.16s, total 8.18s. Root cause: the mutual kernel computes
+  both directions per inner-loop iteration (one Θ build — 81-entry recursion
+  with ~60 divisions — plus shared loads); two one-sided ops pay all of it
+  twice: 1.68µs/pair mutual vs 3.16µs/pair directed at N=1e5 (cache-resident
+  kernel-only comparison). Better dst write locality recovered only ~2.6s of
+  the ~4.5s extra kernel cost. SMT caps the 12-16-thread memory argument.
+- Corrected per-pass walk stats @N=1e6: pops 26.7M, M2L 20.6M (20.6/body —
+  not 41), leaves 205,395 (4.87 bodies/leaf — matches the independent
+  P2P-bench count, which is what exposed the bug), p2p_pair 2.6M. The
+  N=1e5 "5,721,286 M2L" in the entries above is really 2,860,643 (28.6/
+  body). Timings in all tables were never affected.
+- Implication for §4.1: walk traffic ≈ 107GB/step (not 214GB); the original
+  11.9s walk was ~2× the 5.8s streaming floor (random RMW latency, not clean
+  saturation); stage-2a bucketing brought it near the floor (7.2s), so the
+  remaining lever is the kernel itself (stage 3: hoist the Θ divisions,
+  SIMD the convolution — needs relaxing the bit-compat contract).
+
+Tests: 31 unit + 4 integration pass; release exit gate unchanged
+(max 1.83e-3, rms 4.87e-5); build warning-free.
+
+Next: stage-3 kernel work (Θ-build reciprocal hoist + FMA/SIMD convolution
+behind a relative-error contract), n_leaf sweep, tree-rebuild reuse across
+steps in the gate loop.
+
 ## Session log — 2026-08-16: two-phase parallel walk (bucketed M2L replay)
 
 Problem: `PERF-ANALYSIS.md` §4.1 — parallel walk DRAM-bandwidth-bound: random
@@ -150,6 +198,20 @@ Changes:
   an independent serial sum); `f_prepass_par_matches_serial` asserts exact
   equality. Dispatched from `fmm.rs run_impl` and bench profile when
   nthreads > 1.
+- `crates/fmm/src/{harmonic,tree,moments,translate,fmm}.rs` + bench — the
+  remaining serial passes parallelized (level-sweep, bit-identical):
+  `upsilon_table_into` (scratch Υ; kills ~2.4M heap allocs/step in
+  P2M/M2M/L2L/L2P), `Octree::levels_csr` (cells grouped by level),
+  `compute_moments_par` (deepest level first), `l2l_down_par` /
+  `l2p_scatter_par` (ascending level / disjoint leaves), dispatched from
+  `run_impl` + bench when nthreads>1. Small `SendPtr` helper (lib.rs) for the
+  cross-thread disjoint slices (2021 disjoint-capture gotcha: closures must
+  capture the wrapper via method, not the raw field). 4× chunks/thread for
+  load balance within sparse levels.
+  Bug caught by the new exact-equality test: first `l2l_down_par` skipped
+  parents with `children[0] < 0`, but the tree is sparse — a parent can have
+  children only in later octants, so whole subtrees silently missed their L2L
+  (also tripped the end-to-end force test). Fixed via `is_leaf`.
 
 Measured (same loaded-machine session, before → after; release, p=8,
 eps=1e-5, n_leaf=16):
@@ -161,19 +223,21 @@ eps=1e-5, n_leaf=16):
   — same pair set, same accuracy.
 - f_prepass @8: N=1e6 4.45 → 0.56s (**7.9×**), N=1e5 0.36 → 0.041s. Static
   chunks balanced well (Morton order mixes spatial regions per chunk).
-- Cumulative this session @8, N=1e6 total: 18.47 → 14.32 → **10.05s** (walk
-  7.31 + prepass 0.56 + moments 1.24 + l2l 0.45 + l2p 0.49).
+- Level-parallel passes @8, N=1e6: moments 1.24 → **0.26s** (scratch Υ +
+  level sweep + 4× chunks/thread), l2l 0.45 → 0.11s, l2p+scatter
+  0.46 → 0.06s.
+- Cumulative this session @8, N=1e6 total: 18.47 → 14.32 → 10.05 →
+  **8.12s** (walk 7.11 + prepass 0.54 + moments 0.26 + l2l 0.11 + l2p 0.06).
 - Serial walk 5.33 → 5.23s @N=1e5 (powf removal ≈ 2%).
-- Energy gate estimate: ~11.5s/step (10.05 + ~1.5 tree) → **~3.2h** for the
+- Energy gate estimate: ~9.6s/step (8.12 + ~1.5 tree) → **~2.7h** for the
   10⁶×10³ run (was ~5.5h).
-- Residual: at N=1e6 the replay is still bound by the scattered *other-side*
-  cell traffic (~107GB ≈ 5.8s floor). Next walk lever: one-directional
-  Morton-slab ownership (PERF-ANALYSIS.md §4.3/§5 stage 2b) — shared locals
-  slabs instead of per-thread full copies (kills the 3.6GB + reduce pass and
-  makes source moments reads shared read-only). Next pipeline lever:
-  parallelize moments (1.24s; P2M over leaves, M2M by level).
+- Residual: the walk is now 87% of a force eval; only the stage-2b
+  one-directional Morton-slab replay (PERF-ANALYSIS.md §4.3/§5) moves it —
+  kills the remaining other-side scattered traffic (~107GB ≈ 5.8s floor) AND
+  the 3.6GB per-thread locals (12-16 threads become viable). Everything else
+  (tree rebuild ~1.5s serial in the gate) is <15% of a step.
 
-Tests: all 28 unit + 4 integration tests pass; release exit gate
+Tests: all 30 unit + 4 integration tests pass; release exit gate
 max_s 1.83e-3, rms_s 4.87e-5 (gate rms<1e-4; the shift from 3.76e-5 is powi
 ULPs flipping a few borderline accepts); `cargo build` warning-free; clippy
 error is the pre-existing rotation.rs:147 `erasing_op` (file off-limits).

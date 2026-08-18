@@ -41,17 +41,23 @@ variance bands; the structural conclusions are load-independent.
 
 ## 2. Where the constant comes from (flops accounting)
 
-Measured walk stats at N=10⁶ (this review): pops = 53.5M, accepted M2L pairs =
-41.2M (**41 per body**), P2P leaf-pair calls = 5.19M, leaves = 411k
-(**2.43 bodies/leaf average** — `p2p_self` count).
+> **Correction (2026-08-16, stage 2b session):** the bench profile printed
+> walk counters accumulated over *both* of its passes — every pair/pop/leaf
+> count in this document's original text (and in the earlier todo.md logs)
+> was **2× too high**. Fixed in bench (`walk_counts()` reset per pass).
+> Corrected numbers below; timing tables were never affected.
+
+Corrected walk stats at N=10⁶ (per force evaluation): pops = 26.7M, accepted
+M2L pairs = 20.6M (**20.6 per body**), P2P leaf-pair calls = 2.60M, leaves =
+205,395 (**4.87 bodies/leaf** — matches the independent P2P-bench count).
 
 - Naive `m2l_mutual_scratch` (p=8): the O(p⁴) convolution has
   Σₙ (2n+1)·(p−n+1)² = 1,365 inner iterations × ~8 flops (mutual, both
   directions), plus a fresh 81-coefficient Θ-table build per pair
   (`translate.rs:72`) → **~11k flops per M2L pair**.
-- M2L alone: 41.2M × 11k ≈ **4.5×10¹¹ flops ≈ 450k flops/body**.
-- Plus P2P (~31 body-pairs/body), P2M/M2M, L2L/L2P, f_prepass, tree build
-  → **~0.5M flops per body per step ≈ 5×10¹¹ flops/step** at N=10⁶.
+- M2L alone: 20.6M × 11k ≈ **2.3×10¹¹ flops ≈ 230k flops/body**.
+- Plus P2P, P2M/M2M, L2L/L2P, f_prepass, tree build → **~3×10¹¹ flops/step**
+  at N=10⁶ (≈0.3M flops per body per step).
 
 At a realistic sustained ~100 GFLOPS on 8 Zen4 cores that is ≥5 s/step — the
 honest floor for this algorithm/hardware before kernel heroics. exafmm-t
@@ -85,7 +91,7 @@ N=10⁵: walk 5.33 s serial → 2.93 s at 8 threads (1.8× on the loaded machine
 
 ## 4. Root causes, ranked by recoverable time
 
-### 4.1 Walk is DRAM-bandwidth-bound (~7 s recoverable) — the big one
+### 4.1 Walk is DRAM-random-access-bound (~7 s recoverable) — the big one
 
 Every accepted M2L pair randomly touches `moments[a]`, `moments[b]`
 (read) and `locals[a]`, `locals[b]` (read-modify-write) — 81 complex = 1.3 KB
@@ -93,15 +99,21 @@ per cell per array, i.e. **~5.2 KB of random-access traffic per pair** across a
 ~1.3 GB working set (moments + locals ≈ 2 × 500k cells × 81 × 16 B) that
 swamps the 16 MB L3.
 
-Arithmetic: 41.2M pairs × 5.2 KB ≈ **214 GB per force evaluation**. At the
-measured 8-thread STREAM rate (~18.5 GB/s) the floor is 214 / 18.5 ≈
-**11.6 s** — measured walk: **11.9 s**. The walk time *is* DRAM traffic ÷
-bandwidth. (Serially the same traffic runs at ~5.5 GB/s, which is why the
-serial walk is compute-bound instead — 38.8 s at 942 ns/pair.)
+Arithmetic (corrected counts): 20.6M pairs × 5.2 KB ≈ **107 GB per force
+evaluation**. At the measured 8-thread STREAM rate (~18.5 GB/s) the pure
+streaming floor is ≈ 5.8 s; the original walk measured 11.9 s — ~2× the
+floor, i.e. random-access RMW latency/inefficiency on top of raw bytes, not
+clean saturation. (An earlier revision of this doc claimed an "exact match"
+of 214 GB → 11.6 s; that used the 2×-inflated pair count and was an
+artifact.) The serial walk — 38.8 s / 20.6M pairs ≈ 1.9 µs per pair ≈
+8,300 cycles for ~11k flops ≈ 1.3 flops/cycle — also shows the scalar kernel
+is dependency-chain limited, well under the ~2.7 flops/cycle originally
+estimated here.
 
-Consequences already visible in todo.md: 12 threads gains almost nothing
-(bandwidth already saturated at 8); the "faster M2L kernel" lever is worthless
-until traffic per pair drops (the kernel would just wait on memory harder).
+Consequences already visible in todo.md: 12 threads gains almost nothing;
+the "faster M2L kernel" lever pays little until traffic per pair drops (the
+kernel would just wait on memory harder) — though after stage 2a the walk
+sits near the streaming floor, so kernel work (stage 3) is now the lever.
 
 Fix directions:
 - Batch M2L by target cell / interaction-list (level-wise) so each target
@@ -228,18 +240,69 @@ independent serial sum; asserted by test). N=10⁶ @8: prepass
 4.45 → **0.56 s (7.9×)** — static chunking balanced well because Morton
 chunks each span many octants. N=10⁵: 0.36 → 0.041 s.
 
-Cumulative after stage 2a + prepass (N=10⁶ @8, 8 threads):
+Cumulative after stage 2a + prepass + level-parallel passes (N=10⁶ @8):
 
 | Phase | original | now | |
 |---|---|---|---|
-| walk | 11.89 s | 7.31 s | 1.63× |
-| prepass/mac | 4.45 s | 0.56 s | 7.9× |
-| moments | 1.22 s | 1.24 s | — |
-| l2l + l2p | 0.91 s | 0.95 s | — |
-| **total** | **18.47 s** | **10.05 s** | 1.84× |
+| walk | 11.89 s | 7.13 s | 1.67× |
+| prepass/mac | 4.45 s | 0.54 s | 8.2× |
+| moments | 1.22 s | 0.26 s | 4.7× |
+| l2l + l2p | 0.91 s | 0.17 s | 5.4× |
+| **total** | **18.47 s** | **8.12 s** | 2.28× |
 
-Gate estimate: ~11.5 s/step (incl. ~1.5 s tree) → **~3.2 h** for 10⁶×10³.
+Stage-1 completion (same day): `upsilon_table_into` scratch Υ (kills ~2.4M
+heap allocs/step), `Octree::levels_csr`, `compute_moments_par` (level
+sweep, deepest first), `l2l_down_par`/`l2p_scatter_par`, 4× chunks per
+thread for within-level load balance. All bit-identical to serial (exact
+equality tests). One real bug caught by the exactness test on the way in:
+`sparse-octant parents skipped in l2l_down_par` — whole subtrees silently
+missed their local expansion.
+
+Gate estimate: ~9.6 s/step (incl. ~1.5 s tree) → **~2.7 h** for 10⁶×10³.
 Accuracy unchanged: M2L pair set identical; exit gate rms_s 4.87e-5 (<1e-4).
+
+Remaining structure: the walk is 87% of a force eval — everything else is
+done. Only stage 2b (one-directional Morton-slab replay) moves the needle
+now, and it is also what removes the 3.6 GB per-thread locals ceiling.
+
+### 7.1 Stage 2b attempted: directed dst-slab replay — measured loss, reverted
+
+Implemented as designed: pairs recorded as two directed ops (src→dst),
+in-place partition into dst subtree buckets (16k buckets), each thread owning
+an equal-op-count contiguous cell slab of the **shared** locals (no
+per-thread copies, no reduce, peak RSS 4.1 GB → ~2.5 GB projected),
+replaying with a new `m2l_one_sided_scratch` kernel bit-compatible with
+`m2l_one_sided`. All tests passed (the kernel's exact-equality test plus the
+walk tolerance tests).
+
+**Result at N=10⁶ @8: walk 7.16 → 9.75 s — a 36% regression. Reverted.**
+
+Why: the mutual kernel computes *both* directions per inner-loop iteration —
+one Θ-table build, shared `t`/`ths`/`ma`/`mb` loads, one loop dispatch —
+while two one-sided ops pay the Θ build (~81-entry recursion with ~60
+divisions), the conj copy, and the loop overhead *twice*. Measured per-pair
+kernel cost: mutual ≈ 1.68 µs vs directed ≈ 3.16 µs (1.9×) at N=10⁵
+(cache-resident, isolating kernel cost). The better write locality of
+dst-slabs recovered ~2.6 s of the predicted +4.5 s kernel overhead at
+N=10⁶ — not enough. The memory-headroom argument (12–16 threads) also
+weakens on SMT (8 real cores).
+
+Lesson recorded in `dual_walk_par`'s doc comment: revisit directed replay
+only together with a cheaper one-sided kernel (hoisted-reciprocal Θ build,
+SIMD convolution — stage 3 territory). The kernel and its exactness test
+stay in `translate.rs`.
+
+### 7.2 Counter bug found during stage 2b: profile stats were 2× inflated
+
+`profile()` ran two passes but read `walk_counts()` only after the second —
+counters accumulate across passes, so every printed pops/M2L/leaf/p2p stat
+(in this doc's original tables, the appendix, and earlier todo.md logs) was
+double the per-evaluation truth. Fixed: reset counters at the start of each
+pass. Corrected N=10⁶ stats: pops 26.7M, M2L 20.6M (**20.6/body**, not 41),
+leaves 205k (**4.87 bodies/leaf** — now matching the independent P2P-bench
+count, which was the tell), p2p_pair 2.6M. Timings and phase tables were
+never affected. §2/§4.1 above are corrected; §7's stage-2a "41,224,026
+identical pairs" line should read 20,612,013.
 Accuracy: exit gate rms_s 4.87e-5 (gate <1e-4, ~2× margin; small shift from
 powi ULPs flipping borderline accepts).
 
@@ -278,8 +341,7 @@ profile: moments 0.1219s, prepass/mac 0.3555s, walk 5.3347s, l2l 0.0453s,
   l2p+scatter 0.0454s, total 5.9028s
 ```
 
-Bandwidth attribution arithmetic (§4.1): 41,224,026 pairs × 5.2 KB
-(2×1.3 KB locals RMW + 2×1.3 KB moments read) ≈ 214 GB; 214 GB ÷ 18.5 GB/s
-(8-thread STREAM, todo.md) = 11.6 s vs 11.9 s measured. Residual uncertainty:
-fraction of moments reads served by shared L3 (would reduce predicted traffic;
-the near-exact match suggests it is small at this working-set size).
+Bandwidth attribution arithmetic (§4.1, **superseded — see §7.2**): the raw
+output below predates the counter fix; halve pops/M2L/leaf/p2p counts to get
+per-evaluation values (41,224,026 → 20,612,013 M2L pairs). The 214 GB →
+11.6 s "match" was an artifact of the doubled count.
