@@ -25,3 +25,17 @@ pub mod tree;
 pub mod walk;
 
 pub use fmm::Fmm;
+
+/// Raw pointer that may cross thread boundaries; callers guarantee the
+/// pointed-to accesses are disjoint per thread (level-parallel passes).
+#[derive(Clone, Copy)]
+pub(crate) struct SendPtr<T>(pub *mut T);
+unsafe impl<T> Send for SendPtr<T> {}
+unsafe impl<T> Sync for SendPtr<T> {}
+impl<T> SendPtr<T> {
+    /// Accessor: closures must capture the whole wrapper (2021 disjoint
+    /// capture would otherwise grab the raw pointer field directly).
+    pub(crate) fn ptr(self) -> *mut T {
+        self.0
+    }
+}

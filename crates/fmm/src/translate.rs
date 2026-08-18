@@ -6,7 +6,7 @@
 //!
 //! Acceleration (Dehnen 2014, §2.1): a = ∇Ψ_0^0 = -(Re{Ψ_1^1}, Im{Ψ_1^1}, Ψ_1^0).
 
-use crate::harmonic::{idx, theta_table, theta_table_into, upsilon_table, C, dim};
+use crate::harmonic::{idx, theta_table, theta_table_into, upsilon_table_into, C, dim};
 use crate::tree::Octree;
 
 /// Reusable per-worker scratch for `m2l_mutual_scratch` (avoids the 4 heap
@@ -174,6 +174,19 @@ pub fn m2l_one_sided(tree: &Octree, a: usize, b: usize, moments: &[C], locals: &
 /// `s` = parent centre, `s'` = child centre; r = s - s'.
 pub fn l2l(tree: &Octree, parent: usize, child: usize, locals: &mut [C], p: usize) {
     let d = dim(p);
+    let mut u = vec![C::ZERO; d];
+    l2l_into(tree, parent, child, locals, p, &mut u);
+}
+
+/// Allocation-free `l2l` (`u` sized dim(p), overwritten per call).
+pub fn l2l_into(
+    tree: &Octree,
+    parent: usize,
+    child: usize,
+    locals: &mut [C],
+    p: usize,
+    u: &mut [C],
+) {
     let cp = tree.cells[parent];
     let cc = tree.cells[child];
     let r = [
@@ -181,9 +194,9 @@ pub fn l2l(tree: &Octree, parent: usize, child: usize, locals: &mut [C], p: usiz
         cp.cen[1] - cc.cen[1],
         cp.cen[2] - cc.cen[2],
     ];
-    let u = upsilon_table(r, p);
-    let offp = parent * d;
-    let offc = child * d;
+    upsilon_table_into(r, p, u);
+    let offp = parent * dim(p);
+    let offc = child * dim(p);
     for n in 0..=p {
         for m in -(n as i32)..=n as i32 {
             let nidx = idx(n, m);
@@ -199,18 +212,79 @@ pub fn l2l(tree: &Octree, parent: usize, child: usize, locals: &mut [C], p: usiz
     }
 }
 
+/// Full L2L downward sweep (parents before children in cell order).
+pub fn l2l_down(tree: &Octree, locals: &mut [C], p: usize) {
+    for c in 0..tree.cells.len() {
+        let cell = tree.cells[c];
+        for &ch in &cell.children {
+            if ch >= 0 {
+                l2l(tree, c, ch as usize, locals, p);
+            }
+        }
+    }
+}
+
+/// Level-sweep parallel `l2l_down` (ascending level; parents at level l read
+/// locals finalized at level l-1, children writes disjoint). Bit-identical to
+/// the serial sweep.
+pub fn l2l_down_par(tree: &Octree, locals: &mut [C], p: usize, nthreads: usize) {
+    let (off, idx) = tree.levels_csr();
+    let total = locals.len();
+    for l in 0..off.len() - 1 {
+        let cells = &idx[off[l]..off[l + 1]];
+        let chunk = cells.len().div_ceil(nthreads.max(1) * 4).max(1);
+        let base = crate::SendPtr(locals.as_mut_ptr());
+        std::thread::scope(|s| {
+            for piece in cells.chunks(chunk.max(1)) {
+                let base = crate::SendPtr(base.ptr());
+                let mut u = vec![C::ZERO; dim(p)];
+                s.spawn(move || {
+                    let locals: &mut [C] =
+                        unsafe { std::slice::from_raw_parts_mut(base.ptr(), total) };
+                    for &c in piece {
+                        if tree.is_leaf(c) {
+                            continue;
+                        }
+                        let cell = tree.cells[c];
+                        for &ch in &cell.children {
+                            if ch >= 0 {
+                                l2l_into(tree, c, ch as usize, locals, p, &mut u);
+                            }
+                        }
+                    }
+                });
+            }
+        });
+    }
+}
+
 /// Potential (Ψ_0^0) and acceleration at a position from a cell's local
 /// expansion (eq 3f + §2.1). Adds into `pot` and `accel`.
 pub fn l2p(tree: &Octree, cell: usize, pos: [f64; 3], locals: &[C], p: usize, pot: &mut f64, accel: &mut [f64; 3]) {
     let d = dim(p);
+    let mut u = vec![C::ZERO; d];
+    l2p_into(tree, cell, pos, locals, p, pot, accel, &mut u);
+}
+
+/// Allocation-free `l2p` (`u` sized dim(p), overwritten per call).
+pub fn l2p_into(
+    tree: &Octree,
+    cell: usize,
+    pos: [f64; 3],
+    locals: &[C],
+    p: usize,
+    pot: &mut f64,
+    accel: &mut [f64; 3],
+    u: &mut [C],
+) {
     let c = tree.cells[cell];
     let r = [
         c.cen[0] - pos[0],
         c.cen[1] - pos[1],
         c.cen[2] - pos[2],
     ];
-    let u = upsilon_table(r, p);
-    let off = cell * d;
+    upsilon_table_into(r, p, u);
+    let off = cell * dim(p);
     // Ψ_0^0
     let mut psi00 = C::ZERO;
     for k in 0..=p {
@@ -235,4 +309,131 @@ pub fn l2p(tree: &Octree, cell: usize, pos: [f64; 3], locals: &[C], p: usize, po
     accel[0] -= psi11.re;
     accel[1] -= psi11.im;
     accel[2] -= psi10.re;
+}
+
+/// L2P over all leaf particles + scatter slot results to particle-id order.
+pub fn l2p_scatter(
+    tree: &Octree,
+    bodies: &crate::bodies::Bodies,
+    locals: &[C],
+    p: usize,
+    pot: &mut [f64],
+    accel: &mut [[f64; 3]],
+) {
+    let d = dim(p);
+    let mut u = vec![C::ZERO; d];
+    for c in 0..tree.cells.len() {
+        if tree.is_leaf(c) {
+            let cell = tree.cells[c];
+            for k in cell.first..cell.first + cell.count {
+                let id = tree.order[k] as usize;
+                let mut p0 = 0.0;
+                let mut a = [0.0; 3];
+                l2p_into(
+                    tree, c, [bodies.x[k], bodies.y[k], bodies.z[k]], locals, p, &mut p0,
+                    &mut a, &mut u,
+                );
+                pot[id] += bodies.pot[k] + p0;
+                accel[id][0] += bodies.ax[k] + a[0];
+                accel[id][1] += bodies.ay[k] + a[1];
+                accel[id][2] += bodies.az[k] + a[2];
+            }
+        }
+    }
+}
+
+/// Parallel `l2p_scatter` over disjoint cell ranges. Each particle id lives
+/// in exactly one leaf and each leaf in exactly one chunk, so the id-order
+/// writes never collide across threads (raw pointers only carry that
+/// invariant). Bit-identical to the serial pass.
+pub fn l2p_scatter_par(
+    tree: &Octree,
+    bodies: &crate::bodies::Bodies,
+    locals: &[C],
+    p: usize,
+    pot: &mut [f64],
+    accel: &mut [[f64; 3]],
+    nthreads: usize,
+) {
+    let ncells = tree.cells.len();
+    let chunk = ncells.div_ceil(nthreads.max(1));
+    let pot_ptr = crate::SendPtr(pot.as_mut_ptr());
+    let accel_ptr = crate::SendPtr(accel.as_mut_ptr());
+    std::thread::scope(|s| {
+        for t in 0..nthreads {
+            let lo = t * chunk;
+            let hi = ((t + 1) * chunk).min(ncells);
+            if hi <= lo {
+                continue;
+            }
+            let pot_ptr = crate::SendPtr(pot_ptr.ptr());
+            let accel_ptr = crate::SendPtr(accel_ptr.ptr());
+            let mut u = vec![C::ZERO; dim(p)];
+            s.spawn(move || {
+                for c in lo..hi {
+                    if !tree.is_leaf(c) {
+                        continue;
+                    }
+                    let cell = tree.cells[c];
+                    for k in cell.first..cell.first + cell.count {
+                        let id = tree.order[k] as usize;
+                        let mut p0 = 0.0;
+                        let mut a = [0.0; 3];
+                        l2p_into(
+                            tree, c, [bodies.x[k], bodies.y[k], bodies.z[k]], locals, p,
+                            &mut p0, &mut a, &mut u,
+                        );
+                        unsafe {
+                            *pot_ptr.ptr().add(id) += bodies.pot[k] + p0;
+                            let ac = accel_ptr.ptr().add(id);
+                            (*ac)[0] += bodies.ax[k] + a[0];
+                            (*ac)[1] += bodies.ay[k] + a[1];
+                            (*ac)[2] += bodies.az[k] + a[2];
+                        }
+                    }
+                }
+            });
+        }
+    });
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bodies::Bodies;
+    use crate::models::plummer;
+
+    #[test]
+    fn l2l_l2p_par_match_serial() {
+        let parts = plummer(2048, [0.0; 3], 17);
+        let p = 8;
+        let eps = 1e-5;
+        let tree = crate::tree::Octree::build(&parts, 16);
+        let d = dim(p);
+        let ncells = tree.cells.len();
+        let n = parts.len();
+        let bodies = Bodies::from_parts(&parts, &tree.order);
+        let mut moments = vec![C::ZERO; ncells * d];
+        crate::moments::compute_moments(&bodies, &tree, p, &mut moments);
+        let pows = crate::moments::multipole_power(&moments, ncells, p);
+        let binom = crate::moments::binomials(p);
+        let (_, fmin) = crate::mac::f_prepass(&bodies, &tree);
+        let mut bw = bodies.clone();
+        let mut l0 = vec![C::ZERO; ncells * d];
+        crate::walk::dual_walk(
+            &mut bw, &tree, p, eps, &pows, &binom, &fmin, &moments, &mut l0, None,
+        );
+
+        let mut l1 = l0.clone();
+        l2l_down(&tree, &mut l1, p);
+        let mut l2 = l0.clone();
+        l2l_down_par(&tree, &mut l2, p, 8);
+        assert_eq!(l1, l2);
+
+        let (mut pot1, mut acc1) = (vec![0.0; n], vec![[0.0; 3]; n]);
+        let (mut pot2, mut acc2) = (vec![0.0; n], vec![[0.0; 3]; n]);
+        l2p_scatter(&tree, &bw, &l1, p, &mut pot1, &mut acc1);
+        l2p_scatter_par(&tree, &bw, &l1, p, &mut pot2, &mut acc2, 8);
+        assert_eq!(pot1, pot2);
+        assert_eq!(acc1, acc2);
+    }
 }

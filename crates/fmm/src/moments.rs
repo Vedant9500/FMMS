@@ -4,7 +4,7 @@
 //! M2M  (eq 3d):  M_n^m(z') = Σ_{k=0}^n Σ_{l=-k}^k Υ_k^l(z-z') M_{n-k}^{m-l}(z)
 //! Multipole power (eq 12): P_n² = Σ_{m=-n}^n (n-m)!(n+m)! |M_n^m|².
 
-use crate::harmonic::{idx, upsilon_table, C};
+use crate::harmonic::{idx, upsilon_table_into, C};
 use crate::tree::Octree;
 
 /// Factorials 0!..=2p.
@@ -26,6 +26,66 @@ pub fn binomials(p: usize) -> Vec<f64> {
     b
 }
 
+/// P2M for one leaf cell into `moments` (scratch Υ table, no allocation).
+fn p2m_cell(
+    bodies: &crate::bodies::Bodies,
+    tree: &Octree,
+    c: usize,
+    p: usize,
+    moments: &mut [C],
+    u: &mut [C],
+) {
+    let dim = crate::harmonic::dim(p);
+    let cell = tree.cells[c];
+    let off = c * dim;
+    let z = cell.cen;
+    for k in cell.first..cell.first + cell.count {
+        upsilon_table_into(
+            [bodies.x[k] - z[0], bodies.y[k] - z[1], bodies.z[k] - z[2]],
+            p,
+            u,
+        );
+        let m = bodies.m[k];
+        for i in 0..dim {
+            moments[off + i] = moments[off + i].add(u[i].scale(m));
+        }
+    }
+}
+
+/// M2M for one internal cell from its children (scratch Υ table).
+fn m2m_cell(tree: &Octree, c: usize, p: usize, moments: &mut [C], u: &mut [C]) {
+    let dim = crate::harmonic::dim(p);
+    let cell = tree.cells[c];
+    let off = c * dim;
+    let z = cell.cen;
+    for &ch in &cell.children {
+        if ch < 0 {
+            continue;
+        }
+        let child = tree.cells[ch as usize];
+        let d = [child.cen[0] - z[0], child.cen[1] - z[1], child.cen[2] - z[2]];
+        upsilon_table_into(d, p, u);
+        let coff = ch as usize * dim;
+        for n in 0..=p {
+            for m in -(n as i32)..=n as i32 {
+                // M_n^m(z') += Σ_k Σ_l Υ_k^l(z-z') M_{n-k}^{m-l}(z)
+                let mut s = C::ZERO;
+                for k in 0..=n {
+                    let nk = n - k;
+                    for l in -(k as i32)..=k as i32 {
+                        let ml = m - l;
+                        if ml.abs() > nk as i32 {
+                            continue;
+                        }
+                        s = s.add(u[idx(k, l)].mul(moments[coff + idx(nk, ml)]));
+                    }
+                }
+                moments[off + idx(n, m)] = moments[off + idx(n, m)].add(s);
+            }
+        }
+    }
+}
+
 /// Compute multipole moments for every cell.
 ///
 /// `moments` is a flat array of `cells.len() * dim` complex coefficients.
@@ -34,53 +94,51 @@ pub fn compute_moments(bodies: &crate::bodies::Bodies, tree: &Octree, p: usize, 
     let dim = crate::harmonic::dim(p);
     let ncells = tree.cells.len();
     assert_eq!(moments.len(), ncells * dim);
+    let mut u = vec![C::ZERO; dim];
     for c in (0..ncells).rev() {
-        let cell = tree.cells[c];
         if tree.is_leaf(c) {
-            // P2M from SoA slots (contiguous).
-            let off = c * dim;
-            let z = cell.cen;
-            for k in cell.first..cell.first + cell.count {
-                let u = upsilon_table(
-                    [bodies.x[k] - z[0], bodies.y[k] - z[1], bodies.z[k] - z[2]],
-                    p,
-                );
-                let m = bodies.m[k];
-                for i in 0..dim {
-                    moments[off + i] = moments[off + i].add(u[i].scale(m));
-                }
-            }
+            p2m_cell(bodies, tree, c, p, moments, &mut u);
         } else {
-            // M2M: combine children.
-            let off = c * dim;
-            let z = cell.cen;
-            for &ch in &cell.children {
-                if ch < 0 {
-                    continue;
-                }
-                let child = tree.cells[ch as usize];
-                let d = [child.cen[0] - z[0], child.cen[1] - z[1], child.cen[2] - z[2]];
-                let u = upsilon_table(d, p);
-                let coff = ch as usize * dim;
-                for n in 0..=p {
-                    for m in -(n as i32)..=n as i32 {
-                        // M_n^m(z') += Σ_k Σ_l Υ_k^l(z-z') M_{n-k}^{m-l}(z)
-                        let mut s = C::ZERO;
-                        for k in 0..=n {
-                            let nk = n - k;
-                            for l in -(k as i32)..=k as i32 {
-                                let ml = m - l;
-                                if ml.abs() > nk as i32 {
-                                    continue;
-                                }
-                                s = s.add(u[idx(k, l)].mul(moments[coff + idx(nk, ml)]));
-                            }
-                        }
-                        moments[off + idx(n, m)] = moments[off + idx(n, m)].add(s);
-                    }
-                }
-            }
+            m2m_cell(tree, c, p, moments, &mut u);
         }
+    }
+}
+
+/// Level-sweep parallel `compute_moments` (deepest level first; cells within a
+/// level touch disjoint `moments` ranges and read only deeper-level children).
+/// Bit-identical to the serial pass — per-cell arithmetic and child order are
+/// unchanged; parallelism only reorders cells within a level.
+pub fn compute_moments_par(
+    bodies: &crate::bodies::Bodies,
+    tree: &Octree,
+    p: usize,
+    moments: &mut [C],
+    nthreads: usize,
+) {
+    let dim = crate::harmonic::dim(p);
+    let total = moments.len();
+    let (off, idx) = tree.levels_csr();
+    for l in (0..off.len() - 1).rev() {
+        let cells = &idx[off[l]..off[l + 1]];
+        let chunk = cells.len().div_ceil(nthreads.max(1) * 4).max(1);
+        let base = crate::SendPtr(moments.as_mut_ptr());
+        std::thread::scope(|s| {
+            for piece in cells.chunks(chunk.max(1)) {
+                let base = crate::SendPtr(base.ptr());
+                let mut u = vec![C::ZERO; dim];
+                s.spawn(move || {
+                    let moments: &mut [C] =
+                        unsafe { std::slice::from_raw_parts_mut(base.ptr(), total) };
+                    for &c in piece {
+                        if tree.is_leaf(c) {
+                            p2m_cell(bodies, tree, c, p, moments, &mut u);
+                        } else {
+                            m2m_cell(tree, c, p, moments, &mut u);
+                        }
+                    }
+                });
+            }
+        });
     }
 }
 
@@ -109,7 +167,21 @@ pub fn multipole_power(moments: &[C], ncells: usize, p: usize) -> Vec<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::Particle;
+    use crate::models::{plummer, Particle};
+
+    #[test]
+    fn compute_moments_par_matches_serial() {
+        let parts = plummer(2048, [0.0; 3], 13);
+        let tree = crate::tree::Octree::build(&parts, 16);
+        let p = 6;
+        let dim = crate::harmonic::dim(p);
+        let bodies = crate::bodies::Bodies::from_parts(&parts, &tree.order);
+        let mut m1 = vec![C::ZERO; tree.cells.len() * dim];
+        compute_moments(&bodies, &tree, p, &mut m1);
+        let mut m2 = vec![C::ZERO; tree.cells.len() * dim];
+        compute_moments_par(&bodies, &tree, p, &mut m2, 8);
+        assert_eq!(m1, m2);
+    }
 
     #[test]
     fn monopole_is_mass() {

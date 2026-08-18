@@ -124,9 +124,7 @@ pub fn theta_table(r: [f64; 3], p: usize) -> Vec<C> {
 /// Evaluate Υ_n^m(r), all 0 ≤ n ≤ p, into a table of size dim(p).
 ///
 /// Υ is a homogeneous polynomial of degree n, regular everywhere.
-pub fn upsilon_table(r: [f64; 3], p: usize) -> Vec<C> {
-    let d = dim(p);
-    let mut u = vec![C::ZERO; d];
+pub fn upsilon_table_into(r: [f64; 3], p: usize, u: &mut [C]) {
     let (x, y, z) = (r[0], r[1], r[2]);
     let r2 = x * x + y * y + z * z;
     u[idx(0, 0)] = C::new(1.0, 0.0);
@@ -152,6 +150,12 @@ pub fn upsilon_table(r: [f64; 3], p: usize) -> Vec<C> {
             u[idx(n, -(m as i32))] = u[idx(n, m as i32)].conj().scale(sgn);
         }
     }
+}
+
+pub fn upsilon_table(r: [f64; 3], p: usize) -> Vec<C> {
+    let d = dim(p);
+    let mut u = vec![C::ZERO; d];
+    upsilon_table_into(r, p, &mut u);
     u
 }
 

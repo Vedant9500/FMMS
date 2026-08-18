@@ -56,7 +56,11 @@ impl Fmm {
         let n = parts.len();
         let mut bodies = Bodies::from_parts(parts, &self.tree.order);
         let mut moments = vec![C::ZERO; ncells * d];
-        crate::moments::compute_moments(&bodies, &self.tree, p, &mut moments);
+        if nthreads > 1 {
+            crate::moments::compute_moments_par(&bodies, &self.tree, p, &mut moments, nthreads);
+        } else {
+            crate::moments::compute_moments(&bodies, &self.tree, p, &mut moments);
+        }
         let pows = crate::moments::multipole_power(&moments, ncells, p);
         let binom = crate::moments::binomials(p);
         let (_, fmin) = if nthreads > 1 {
@@ -78,34 +82,20 @@ impl Fmm {
             );
         }
         // L2L pass down: each cell adds its expansion to its children.
-        for c in 0..ncells {
-            let cell = self.tree.cells[c];
-            for &ch in &cell.children {
-                if ch >= 0 {
-                    crate::translate::l2l(&self.tree, c, ch as usize, &mut locals, p);
-                }
-            }
+        if nthreads > 1 {
+            crate::translate::l2l_down_par(&self.tree, &mut locals, p, nthreads);
+        } else {
+            crate::translate::l2l_down(&self.tree, &mut locals, p);
         }
         // L2P at particles + scatter slot -> particle id.
         let mut pot = vec![0.0; n];
         let mut accel = vec![[0.0; 3]; n];
-        for c in 0..ncells {
-            if self.tree.is_leaf(c) {
-                let cell = self.tree.cells[c];
-                for k in cell.first..cell.first + cell.count {
-                    let id = self.tree.order[k] as usize;
-                    let mut p0 = 0.0;
-                    let mut a = [0.0; 3];
-                    crate::translate::l2p(
-                        &self.tree, c, [bodies.x[k], bodies.y[k], bodies.z[k]],
-                        &locals, p, &mut p0, &mut a,
-                    );
-                    pot[id] += bodies.pot[k] + p0;
-                    accel[id][0] += bodies.ax[k] + a[0];
-                    accel[id][1] += bodies.ay[k] + a[1];
-                    accel[id][2] += bodies.az[k] + a[2];
-                }
-            }
+        if nthreads > 1 {
+            crate::translate::l2p_scatter_par(
+                &self.tree, &bodies, &locals, p, &mut pot, &mut accel, nthreads,
+            );
+        } else {
+            crate::translate::l2p_scatter(&self.tree, &bodies, &locals, p, &mut pot, &mut accel);
         }
         Result { accel, pot, n_cells: ncells }
     }

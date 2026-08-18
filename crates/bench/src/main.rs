@@ -281,7 +281,11 @@ fn profile(n: usize, p: usize, eps: f64, nthreads: usize) {
             let ncells = tree.cells.len();
             let d = fmm::harmonic::dim(p);
             let mut moments = vec![fmm::harmonic::C::ZERO; ncells * d];
-            fmm::moments::compute_moments(&bodies, &tree, p, &mut moments);
+            if nthreads > 1 {
+                fmm::moments::compute_moments_par(&bodies, &tree, p, &mut moments, nthreads);
+            } else {
+                fmm::moments::compute_moments(&bodies, &tree, p, &mut moments);
+            }
             let t2 = Instant::now();
             let pows = fmm::moments::multipole_power(&moments, ncells, p);
             let binom = fmm::moments::binomials(p);
@@ -303,31 +307,20 @@ fn profile(n: usize, p: usize, eps: f64, nthreads: usize) {
                 );
             }
             let t4 = Instant::now();
-            for c in 0..ncells {
-                let cell = tree.cells[c];
-                for &ch in &cell.children {
-                    if ch >= 0 {
-                        fmm::translate::l2l(&tree, c, ch as usize, &mut locals, p);
-                    }
-                }
+            if nthreads > 1 {
+                fmm::translate::l2l_down_par(&tree, &mut locals, p, nthreads);
+            } else {
+                fmm::translate::l2l_down(&tree, &mut locals, p);
             }
             let t5 = Instant::now();
             let mut pot = vec![0.0; n];
             let mut accel = vec![[0.0; 3]; n];
-            for c in 0..ncells {
-                if tree.is_leaf(c) {
-                    let cell = tree.cells[c];
-                    for k in cell.first..cell.first + cell.count {
-                        let id = tree.order[k] as usize;
-                        let mut p0 = 0.0;
-                        let mut a = [0.0; 3];
-                        fmm::translate::l2p(&tree, c, [bodies.x[k], bodies.y[k], bodies.z[k]], &locals, p, &mut p0, &mut a);
-                        pot[id] += bodies.pot[k] + p0;
-                        accel[id][0] += bodies.ax[k] + a[0];
-                        accel[id][1] += bodies.ay[k] + a[1];
-                        accel[id][2] += bodies.az[k] + a[2];
-                    }
-                }
+            if nthreads > 1 {
+                fmm::translate::l2p_scatter_par(
+                    &tree, &bodies, &locals, p, &mut pot, &mut accel, nthreads,
+                );
+            } else {
+                fmm::translate::l2p_scatter(&tree, &bodies, &locals, p, &mut pot, &mut accel);
             }
             let t6 = Instant::now();
             if pass == 1 {

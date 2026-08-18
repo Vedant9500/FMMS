@@ -184,6 +184,29 @@ ritter(&items).0
     pub fn is_leaf(&self, c: usize) -> bool {
         self.cells[c].children[0] < 0 && self.cells[c].children[1..].iter().all(|&x| x < 0)
     }
+
+    /// Cell indices grouped by level (CSR: offsets into `idx`). Level-sweep
+    /// passes (moments bottom-up, L2L top-down) can then run level by level;
+    /// cells within a level are mutually independent.
+    pub fn levels_csr(&self) -> (Vec<usize>, Vec<usize>) {
+        let n = self.cells.len();
+        let maxl = self.cells.iter().map(|c| c.level).max().unwrap_or(0) as usize;
+        let mut off = vec![0usize; maxl + 2];
+        for c in &self.cells {
+            off[c.level as usize + 1] += 1;
+        }
+        for i in 1..off.len() {
+            off[i] += off[i - 1];
+        }
+        let mut idx = vec![0usize; n];
+        let mut pos = off[..maxl + 1].to_vec();
+        for (i, c) in self.cells.iter().enumerate() {
+            let l = c.level as usize;
+            idx[pos[l]] = i;
+            pos[l] += 1;
+        }
+        (off, idx)
+    }
 }
 
 fn com_of_slots(parts: &[Particle], tree: &Octree, first: usize, count: usize, mass: f64) -> [f64; 3] {
