@@ -222,6 +222,178 @@ unsafe fn body_view(b: &mut Bodies, lo: usize, hi: usize) -> Bodies {
     }
 }
 
+/// TEMP Unit-2: M2L kernel cost split. Cache-resident pairs (i, j from a
+/// small pool), so we measure the kernel + table build, not DRAM.
+fn m2l_bench(n: usize, p: usize) {
+    use fmm::harmonic::{dim, C};
+    let parts = plummer(n, [0.0; 3], 42);
+    let tree = fmm::tree::Octree::build(&parts, 16);
+    let d = dim(p);
+    let ncells = tree.cells.len();
+    let mut moments = vec![C::ZERO; ncells * d];
+    let bodies = fmm::bodies::Bodies::from_parts(&parts, &tree.order);
+    fmm::moments::compute_moments(&bodies, &tree, p, &mut moments);
+    // Collect well-separated leaf pairs via the MAC (same accept as the walk).
+    let pows = fmm::moments::multipole_power(&moments, ncells, p);
+    let binom = fmm::moments::binomials(p);
+    let (_, fmin) = fmm::mac::f_prepass(&bodies, &tree);
+    let mut pairs = Vec::new();
+    'outer: for a in 0..ncells {
+        if !tree.is_leaf(a) {
+            continue;
+        }
+        for b in 0..ncells {
+            if b <= a || !tree.is_leaf(b) {
+                continue;
+            }
+            if fmm::mac::accept(a, b, &tree.cells, &pows, &binom, p, 1e-5, &fmin)
+                && fmm::mac::accept(b, a, &tree.cells, &pows, &binom, p, 1e-5, &fmin)
+            {
+                pairs.push((a, b));
+                if pairs.len() >= 4096 {
+                    break 'outer;
+                }
+            }
+        }
+    }
+    println!("m2l bench: N={n} p={p} pairs={} cells={}", pairs.len(), ncells);
+
+    // Full kernel (table build + conj + parity copy + convolution).
+    let mut locals = vec![C::ZERO; ncells * d];
+    let mut scratch = fmm::translate::M2lScratch::new(p);
+    let reps = 20usize;
+    let mut best_full = f64::INFINITY;
+    for _ in 0..3 {
+        let t0 = std::time::Instant::now();
+        for _ in 0..reps {
+            for &(a, b) in &pairs {
+                fmm::translate::m2l_mutual_scratch(&tree, a, b, &moments, &mut locals, p, &mut scratch);
+            }
+        }
+        best_full = best_full.min(t0.elapsed().as_secs_f64() / (reps * pairs.len()) as f64);
+    }
+
+    // Theta-table build only.
+    let mut th = vec![C::ZERO; d];
+    let mut best_th = f64::INFINITY;
+    for _ in 0..3 {
+        let t0 = std::time::Instant::now();
+        for _ in 0..(reps * pairs.len()) {
+            let ca = tree.cells[pairs[0].0];
+            let cb = tree.cells[pairs[0].1];
+            let r = [cb.cen[0] - ca.cen[0], cb.cen[1] - ca.cen[1], cb.cen[2] - ca.cen[2]];
+            fmm::harmonic::theta_table_into(r, p, &mut th);
+        }
+        best_th = best_th.min(t0.elapsed().as_secs_f64() / (reps * pairs.len()) as f64);
+    }
+
+    // Convolution only (reuse one prebuilt scratch state by re-running the
+    // same pair; subtract nothing — report raw). Approximation: full - theta.
+    println!(
+        "  full kernel: {:.0}ns/pair   theta build: {:.0}ns/pair   approx conv+setup: {:.0}ns/pair",
+        best_full * 1e9,
+        best_th * 1e9,
+        (best_full - best_th) * 1e9
+    );
+}
+
+/// TEMP Unit-3: rotation-vs-naive M2L across p (crossover re-measure).
+/// Uses many accepted leaf pairs (like the original 4000-pair microbench)
+/// so the threshold reflects real pair geometry, not one pair.
+fn rot_sweep(n: usize) {
+    use fmm::harmonic::{dim, C};
+    let parts = plummer(n, [0.0; 3], 42);
+    let tree = fmm::tree::Octree::build(&parts, 16);
+    let bodies = fmm::bodies::Bodies::from_parts(&parts, &tree.order);
+    println!("rot sweep: N={n} (multi-pair microbench, cache-resident)");
+    println!(
+        "{:>4} {:>10} {:>10} {:>10} {:>8}",
+        "p", "naive_ns", "rot_ns", "ratio", "err_max"
+    );
+    for p in (16..=34).step_by(2) {
+        let d = dim(p);
+        let ncells = tree.cells.len();
+        let mut moments = vec![C::ZERO; ncells * d];
+        fmm::moments::compute_moments(&bodies, &tree, p, &mut moments);
+        // Accepted leaf pairs via the MAC.
+        let pows = fmm::moments::multipole_power(&moments, ncells, p);
+        let binom = fmm::moments::binomials(p);
+        let (_, fmin) = fmm::mac::f_prepass(&bodies, &tree);
+        let mut pairs = Vec::new();
+        'outer: for a in 0..ncells {
+            if !tree.is_leaf(a) {
+                continue;
+            }
+            for b in a + 1..ncells {
+                if !tree.is_leaf(b) {
+                    continue;
+                }
+                if fmm::mac::accept(a, b, &tree.cells, &pows, &binom, p, 1e-5, &fmin)
+                    && fmm::mac::accept(b, a, &tree.cells, &pows, &binom, p, 1e-5, &fmin)
+                {
+                    pairs.push((a, b));
+                    if pairs.len() >= 4096 {
+                        break 'outer;
+                    }
+                }
+            }
+        }
+        if pairs.is_empty() {
+            continue;
+        }
+        let reps = if p <= 24 { 8 } else { 12 };
+        // Naive.
+        let mut loc = vec![C::ZERO; ncells * d];
+        let mut scratch = fmm::translate::M2lScratch::new(p);
+        let mut best_n = f64::INFINITY;
+        for _ in 0..2 {
+            let t0 = std::time::Instant::now();
+            for _ in 0..reps {
+                for &(a, b) in &pairs {
+                    fmm::translate::m2l_mutual_scratch(&tree, a, b, &moments, &mut loc, p, &mut scratch);
+                }
+            }
+            best_n = best_n.min(t0.elapsed().as_secs_f64() / (reps * pairs.len()) as f64);
+        }
+        // Rotation.
+        let mut ctx = fmm::rotation::RotCtx::new(p);
+        let mut best_r = f64::INFINITY;
+        for _ in 0..2 {
+            let t0 = std::time::Instant::now();
+            for _ in 0..reps {
+                for &(a, b) in &pairs {
+                    ctx.m2l_pair(&tree, a, b, &moments, &mut loc);
+                }
+            }
+            best_r = best_r.min(t0.elapsed().as_secs_f64() / (reps * pairs.len()) as f64);
+        }
+        // Error vs naive on the first pair, both kernels on FRESH buffers.
+        let (a, b) = pairs[0];
+        let mut l1 = vec![C::ZERO; ncells * d];
+        let mut l2 = vec![C::ZERO; ncells * d];
+        fmm::translate::m2l_mutual_scratch(&tree, a, b, &moments, &mut l1, p, &mut scratch);
+        ctx.m2l_pair(&tree, a, b, &moments, &mut l2);
+        let mut err = 0.0f64;
+        for c in [a, b] {
+            for i in 0..d {
+                let nv = l1[c * d + i];
+                let r = l2[c * d + i];
+                let mag = nv.re.abs() + nv.im.abs() + 1e-30;
+                err = err.max(((r.re - nv.re).abs() + (r.im - nv.im).abs()) / mag);
+            }
+        }
+        println!(
+            "{:>4} {:>10.0} {:>10.0} {:>10.3} {:>8.1e}  ({} pairs)",
+            p,
+            best_n * 1e9,
+            best_r * 1e9,
+            best_r / best_n,
+            err,
+            pairs.len()
+        );
+    }
+}
+
 fn net_force(parts: &[fmm::models::Particle], accel: &[[f64; 3]]) -> f64 {
     let mut fsum = [0.0; 3];
     let mut ftot = 0.0;
@@ -246,10 +418,25 @@ fn main() {
 
     // P2P throughput mode: fmm-bench p2p [N] [nthreads]
     if args.get(4).map(|s| s.as_str()) == Some("p2p") {
-        let n: usize = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(1_000_000);
+        let n: usize = args.get(5).and_then(|s| s.parse::<usize>().ok()).unwrap_or(1_000_000);
         let nt: usize = args.get(6).and_then(|s| s.parse().ok()).unwrap_or(8);
         let nleaf: usize = args.get(7).and_then(|s| s.parse().ok()).unwrap_or(16);
         p2p_bench(n, nt, nleaf);
+        return;
+    }
+
+    // TEMP Unit-2 mode: fmm-bench m2l [N] [p] — split kernel cost.
+    if args.get(4).map(|s| s.as_str()) == Some("m2l") {
+        let n: usize = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(100_000);
+        let p: usize = args.get(6).and_then(|s| s.parse().ok()).unwrap_or(8);
+        m2l_bench(n, p);
+        return;
+    }
+
+    // TEMP Unit-3 mode: fmm-bench rot <N> — rotation vs naive across p.
+    if args.get(4).map(|s| s.as_str()) == Some("rot") {
+        let n: usize = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(100_000);
+        rot_sweep(n);
         return;
     }
 
@@ -296,6 +483,8 @@ fn profile(n: usize, p: usize, eps: f64, nthreads: usize) {
             };
             let t3 = Instant::now();
             let mut locals = vec![fmm::harmonic::C::ZERO; ncells * d];
+            // Reset per-pass so printed stats are per-evaluation, not 2x.
+            let _ = fmm::walk::walk_counts();
             if nthreads <= 1 {
                 let mut rot = if p >= fmm::rotation::ROT_P { Some(fmm::rotation::RotCtx::new(p)) } else { None };
                 fmm::walk::dual_walk(
@@ -329,6 +518,8 @@ fn profile(n: usize, p: usize, eps: f64, nthreads: usize) {
                     (t4 - t3).as_secs_f64(), (t5 - t4).as_secs_f64(), (t6 - t5).as_secs_f64(), (t6 - t0).as_secs_f64());
                 let (pop, acc, m2l, s2, p2, m2l_ops) = fmm::walk::walk_counts();
                 println!("  walk stats: pops={pop}, accept/M2L={m2l}, m2l-pair-ops={m2l_ops}, p2p_self={s2}, p2p_pair={p2} (accept-calls={acc})");
+                let (rec, merge, part, alloc, replay, reduce) = fmm::walk::walk_phase_ms();
+                println!("  walk phases (ms): record={rec} merge={merge} partition={part} alloc={alloc} replay={replay} reduce={reduce}");
             }
         }
 }

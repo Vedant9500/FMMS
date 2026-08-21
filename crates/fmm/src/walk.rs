@@ -54,6 +54,26 @@ struct Counters {
     m2l_ops: u64,
 }
 
+// TEMPORARY phase instrumentation for Unit-1 optimization work.
+static T_RECORD_MS: AtomicU64 = AtomicU64::new(0);
+static T_MERGE_MS: AtomicU64 = AtomicU64::new(0);
+static T_PART_MS: AtomicU64 = AtomicU64::new(0);
+static T_ALLOC_MS: AtomicU64 = AtomicU64::new(0);
+static T_REPLAY_MS: AtomicU64 = AtomicU64::new(0);
+static T_REDUCE_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Reset + return the parallel-walk phase timings (ms).
+pub fn walk_phase_ms() -> (u64, u64, u64, u64, u64, u64) {
+    (
+        T_RECORD_MS.swap(0, Ordering::Relaxed),
+        T_MERGE_MS.swap(0, Ordering::Relaxed),
+        T_PART_MS.swap(0, Ordering::Relaxed),
+        T_ALLOC_MS.swap(0, Ordering::Relaxed),
+        T_REPLAY_MS.swap(0, Ordering::Relaxed),
+        T_REDUCE_MS.swap(0, Ordering::Relaxed),
+    )
+}
+
 impl Counters {
     fn fold(&self) {
         N_POP.fetch_add(self.pop, Ordering::Relaxed);
@@ -297,6 +317,7 @@ pub fn dual_walk_par(
     let ncells = tree.cells.len();
     let n = bodies.x.len();
     let use_rot = p >= crate::rotation::ROT_P;
+    let t_start = std::time::Instant::now();
 
     // Phase 1: walk + record; P2P into private bodies copies.
     let mut workers: Vec<(Vec<(u32, u32)>, crate::bodies::Bodies)> = (0..nthreads)
@@ -397,15 +418,19 @@ pub fn dual_walk_par(
     });
 
     // Merge recorded pairs and partition by min-cell subtree bucket.
+    let t_record = t_start.elapsed().as_millis() as u64;
     let npairs: usize = workers.iter().map(|(r, _)| r.len()).sum();
     let mut pairs: Vec<(u32, u32)> = Vec::with_capacity(npairs);
     for (r, _) in &mut workers {
         pairs.append(r);
     }
+    let t_merge = t_start.elapsed().as_millis() as u64 - t_record;
     let nbuckets = 1024.min(ncells).max(1);
     let ends = partition_pairs(&mut pairs, ncells, nbuckets);
+    let t_part = t_start.elapsed().as_millis() as u64 - t_record - t_merge;
 
     // Phase 2: replay into per-thread locals, contiguous bucket ranges.
+    let t_alloc0 = t_start.elapsed().as_millis() as u64;
     let mut tls: Vec<Vec<C>> = (0..nthreads).map(|_| vec![C::ZERO; ncells * d]).collect();
     let target = npairs.div_ceil(nthreads);
     let mut bounds: Vec<usize> = vec![0];
@@ -443,18 +468,63 @@ pub fn dual_walk_par(
         }
     });
 
-    // Reduce private accumulators into the shared ones.
-    for (tl, (_, tb)) in tls.iter().zip(&workers) {
-        for i in 0..ncells * d {
-            locals[i] = locals[i].add(tl[i]);
-        }
-        for k in 0..n {
-            bodies.ax[k] += tb.ax[k];
-            bodies.ay[k] += tb.ay[k];
-            bodies.az[k] += tb.az[k];
-            bodies.pot[k] += tb.pot[k];
-        }
+    // Reduce private accumulators into the shared ones. Split by element
+    // range across threads; each element still sums its accumulators in
+    // thread order, so the result is bit-identical to a serial reduce.
+    let t_replay_done = t_start.elapsed().as_millis() as u64;
+    {
+        let total = ncells * d;
+        let chunk = total.div_ceil(nthreads.max(1));
+        let base = crate::SendPtr(locals.as_mut_ptr());
+        let tls = &tls;
+        std::thread::scope(|s| {
+            for piece in locals.chunks_mut(chunk.max(1)) {
+                let lo = unsafe { piece.as_ptr().offset_from(base.ptr()) } as usize;
+                let base = crate::SendPtr(base.ptr());
+                s.spawn(move || {
+                    let locals: &mut [C] =
+                        unsafe { std::slice::from_raw_parts_mut(base.ptr().add(lo), piece.len()) };
+                    for (i, l) in locals.iter_mut().enumerate() {
+                        let mut acc = *l;
+                        for tl in tls.iter() {
+                            acc = acc.add(tl[lo + i]);
+                        }
+                        *l = acc;
+                    }
+                });
+            }
+        });
     }
+    {
+        let chunk = n.div_ceil(nthreads.max(1));
+        let bax = crate::SendPtr(bodies.ax.as_mut_ptr());
+        let bay = crate::SendPtr(bodies.ay.as_mut_ptr());
+        let baz = crate::SendPtr(bodies.az.as_mut_ptr());
+        let bpot = crate::SendPtr(bodies.pot.as_mut_ptr());
+        let workers = &workers;
+        std::thread::scope(|s| {
+            for k0 in (0..n).step_by(chunk.max(1)) {
+                let k1 = (k0 + chunk).min(n);
+                let (bax, bay, baz, bpot) =
+                    (crate::SendPtr(bax.ptr()), crate::SendPtr(bay.ptr()), crate::SendPtr(baz.ptr()), crate::SendPtr(bpot.ptr()));
+                s.spawn(move || unsafe {
+                    for k in k0..k1 {
+                        *bax.ptr().add(k) += workers.iter().map(|(_, tb)| tb.ax[k]).sum::<f64>();
+                        *bay.ptr().add(k) += workers.iter().map(|(_, tb)| tb.ay[k]).sum::<f64>();
+                        *baz.ptr().add(k) += workers.iter().map(|(_, tb)| tb.az[k]).sum::<f64>();
+                        *bpot.ptr().add(k) += workers.iter().map(|(_, tb)| tb.pot[k]).sum::<f64>();
+                    }
+                });
+            }
+        });
+    }
+    let t_end = t_start.elapsed().as_millis() as u64;
+    T_RECORD_MS.store(t_record, Ordering::Relaxed);
+    T_MERGE_MS.store(t_merge, Ordering::Relaxed);
+    T_PART_MS.store(t_part, Ordering::Relaxed);
+    T_ALLOC_MS.store(t_alloc0 - t_record - t_merge - t_part, Ordering::Relaxed);
+    T_REPLAY_MS.store(t_replay_done - t_alloc0, Ordering::Relaxed);
+    T_REDUCE_MS.store(t_end - t_replay_done, Ordering::Relaxed);
 }
 
 #[cfg(test)]

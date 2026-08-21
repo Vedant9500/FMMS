@@ -10,6 +10,7 @@
 .idea/
 *.swp
 *.swo
+.commandcode/
 
 # OS
 .DS_Store

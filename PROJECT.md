@@ -35,10 +35,10 @@ crates/
 
 - **Θ (theta) basis** for multipoles/locals (Dehnen Υ coefficients), real
   `theta_table` per pair reused across the M2L convolution.
-- **Two M2L paths**, switched by `rotation::ROT_P` (currently 26):
+- **Two M2L paths**, switched by `rotation::ROT_P` (currently 20):
   - naive `m2l_mutual` — O(p⁴), used for p < ROT_P;
   - `RotCtx::m2l_pair` — O(p³) axis-swap rotation (Dehnen 2014 A.6.1),
-    precomputed swap matrices, wins from p ≥ 26.
+    precomputed swap matrices, wins from p ≥ 20.
 - **`m2l_mutual`** operates both directions per pair (shares the Θ table),
   folds the Θ(-r) parity into a pre-scaled table, uses raw-pointer fused
   re/im accumulation.
@@ -51,7 +51,8 @@ crates/
 - O(N) scaling verified N=10³…10⁶, fit ~N^0.91-1.0 (0.73s @ 1e4 → 51.7s @ 1e6).
 - FMM beats direct N² at N ≳ 3e4 (eps=1e-5, p=8, single-core).
 - Walk = ~95% of runtime, dominated by M2L (~62 pairs/body at eps=1e-5).
-- Rotation M2L crossover at p ≈ 26; rel err ≤ 2e-8 up to p=32.
+- Rotation M2L crossover at p ≈ 20 (re-measured 2026-08-21, dot_row matvecs;
+  was 26); rel err ≤ ~5e-13 up to p=34.
 
 ## Verification
 

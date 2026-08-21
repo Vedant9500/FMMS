@@ -2,6 +2,84 @@
 
 Source of truth for exit gates: `ROADMAP.md` Phase 1 (lines 34-48).
 
+## Session log — 2026-08-21: Unit-3 rotation M2L iteration (OPTIMIZATION-PLAN.md)
+
+Problem: re-measure the ROT_P crossover before touching rotation.rs
+(AGENTS.md rule). The old p=26 numbers did NOT reproduce: rotation lost at
+p=26 (1.06x), won only from p≈30.
+
+Root cause + fix:
+- The four swap-matvec inner loops in `apply()` are single FADD chains
+  (length nb up to 69, 4-cycle latency each). A cross-row 4-block measured
+  WORSE (+4%); the win is WITHIN-ROW accumulator splitting (`dot_row`):
+  8 register-resident partial sums per row, scalar tail. Rotation kernel
+  1.2–1.5x faster across p=16–34.
+- New multi-pair crossover (`fmm-bench … rot <N>`, kept): p=20 0.98,
+  p=22 0.90, p=24 0.83, p=26 0.76, p=30 0.68, p=34 0.60; rel err ≤ 5.4e-13
+  vs naive up to p=34 (contract ~2e-8).
+- **ROT_P 26 → 20** (re-measured per AGENTS.md). High-p M2L configs get up
+  to 1.5x faster M2L.
+
+Tests: rotation tests pass (incl. m2l_rot_matches_naive @1e-9); full suite
+30+4 green; release exit gate unchanged; N=1e6 profile unchanged at p=8
+(naive path below threshold — bit-compat preserved).
+
+Housekeeping note: the earlier single-pair rot-sweep had a broken error
+check (accumulated buffer vs fresh) and noisy timing; replaced by the
+multi-pair mode.
+
+## Session log — 2026-08-21: Unit-2 M2L kernel iteration (OPTIMIZATION-PLAN.md)
+
+Problem: is the replay kernel compute-bound (kernel work pays) or
+memory-bound (only traffic pays)? Added `m2l` bench mode: cache-resident
+accepted-pair microbench splitting Θ build vs convolution.
+
+Measured facts:
+- Full kernel 1633 ns/pair = Θ build 149 ns (9%) + conv+setup 1484 ns;
+  ~4.8 cycles/inner-iteration — latency/issue bound, ~80% of scalar FMA
+  roofline. Θ reciprocal hoisting is not a lever.
+- Reshapes tried and REVERTED: 4-lane accumulator split (0.53x, stack
+  spill), load-shed reshape dropping ths/conj copies (1.06x), product-
+  accumulator FMA reshape (1.08x cached).
+- End-to-end A/B through the parallel replay: N=1e6 5322 vs 5289 ms
+  (noise), N=1e5 740 vs 728-737 ms. Effective N=1e6 per-pair cost
+  2.07 µs vs 1.63 µs cached → only ~20% of the replay is kernel; the rest
+  is DRAM stall on scattered moments/locals traffic.
+- Conclusion: stage 3 must treat directed one-sided replay + cheaper/SIMD
+  one-sided kernel as ONE package; kernel work alone cannot pay in this
+  design at any measured N.
+
+Tests: all 30 unit + 4 integration pass after revert (bit-compat reference
+untouched); build warning-free.
+
+## Session log — 2026-08-21: Unit-1 walk iteration (OPTIMIZATION-PLAN.md)
+
+Problem: walk = 87% of a force eval; PERF-ANALYSIS said the bucketed replay
+is near the streaming floor but nothing had decomposed it. Added phase
+instrumentation (`walk_phase_ms()`, temporary): N=10⁶ @8T record 0.44 +
+merge 0.02 + partition 0.21 + replay 5.64 + reduce 0.22 s (walk 7.07 s).
+
+Changes:
+- `crates/fmm/src/walk.rs` — reduce parallelized (locals element ranges +
+  bodies k-ranges, each output sums its accumulators in thread order →
+  bit-identical): reduce 219→86 ms. Walk 7.07→6.08–6.35 s, total
+  8.04→~7.05 s.
+- `crates/bench/src/main.rs` — profile counters reset per pass: printed
+  stats were STILL 2x inflated (53.5M pops); now 26.7M pops / 20.6M M2L.
+
+Measured negatives (reverted — do not retry blind):
+- Bucket sort by min / (min,max): replay flat 5.39→5.41 s; DFS discovery
+  order is already coherent; sort costs up to 370 ms.
+- Software prefetch in the replay loop: no gain (bandwidth-bound).
+- Replay thread scaling NEGATIVE past 8T (5.38/5.52/5.93 s @8/12/16T):
+  DRAM-saturated. THP already [always] on this box.
+Conclusion: replay sits at the design's random-access floor; the only lever
+below it is fewer bytes/pair = directed replay behind the stage-3 one-sided
+kernel (Unit 2/3), per the plan.
+
+Tests: all 30 unit + 4 integration pass; release exit gate unchanged
+(rms_s 4.87e-5); build warning-free; clippy warnings pre-existing only.
+
 ## Phase-1 exit gates still open
 
 - [x] **Rotation-accelerated M2L O(p³)** (ROADMAP line 36): axis-swap rewrite

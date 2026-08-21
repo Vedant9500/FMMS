@@ -39,10 +39,10 @@ use crate::tree::Octree;
 
 /// Minimum p at which the rotation M2L beats the naive O(p⁴) kernel.
 /// Naive ~ p⁴/6 complex MACs vs rotation ~ 4·Σ(2k+1)² real MACs ≈ 16p³/3.
-/// Measured crossover after the 2026-08-15 axis-swap rewrite (no per-pair
-/// Wigner-d plane build): p=24 1.03×, p=26 0.98×, p=30 0.89× (4000-pair
-/// microbench, release). Relative error stays ≤ ~1e-8 up to p=32.
-pub const ROT_P: usize = 26;
+/// Re-measured 2026-08-21 after the dot_row reshape (4-way accumulator
+/// split in the swap matvecs): multi-pair microbench crossover p=20
+/// (0.98×) → p=34 (0.60×); rel err ≤ 5e-13 up to p=34.
+pub const ROT_P: usize = 20;
 
 /// Total size of the block-layout plane for degrees 0..=p:
 /// Σ_{j=0}^p (2j+1)² = (p+1)(4p²+8p+3)/3.
@@ -58,6 +58,48 @@ pub fn block_off(j: usize) -> usize {
     } else {
         j * (4 * j * j - 1) / 3
     }
+}
+
+/// One weight row dotted against a complex vector, 4-way accumulator split.
+/// The plain sequential sum is a single FADD chain (nb × 4-cycle latency,
+/// nb up to 69); four independent partial sums hide that latency down to
+/// the 2-FMA/cycle port floor. Reassociates the sum (~1e-15 relative),
+/// far inside the rotation kernel's established relative-error contract
+/// vs the naive kernel (rel err ≤ 2e-8, see m2l_rot_matches_naive).
+#[inline(always)]
+unsafe fn dot_row(w: *const f64, v: *const C, nb: usize) -> (f64, f64) {
+    let (mut a0r, mut a0i, mut a1r, mut a1i) = (0.0f64, 0.0, 0.0, 0.0);
+    let (mut a2r, mut a2i, mut a3r, mut a3i) = (0.0f64, 0.0, 0.0, 0.0);
+    let mut c = 0;
+    while c + 4 <= nb {
+        let w0 = *w.add(c);
+        let u0 = *v.add(c);
+        a0r += w0 * u0.re;
+        a0i += w0 * u0.im;
+        let w1 = *w.add(c + 1);
+        let u1 = *v.add(c + 1);
+        a1r += w1 * u1.re;
+        a1i += w1 * u1.im;
+        let w2 = *w.add(c + 2);
+        let u2 = *v.add(c + 2);
+        a2r += w2 * u2.re;
+        a2i += w2 * u2.im;
+        let w3 = *w.add(c + 3);
+        let u3 = *v.add(c + 3);
+        a3r += w3 * u3.re;
+        a3i += w3 * u3.im;
+        c += 4;
+    }
+    let mut sr = (a0r + a1r) + (a2r + a3r);
+    let mut si = (a0i + a1i) + (a2i + a3i);
+    while c < nb {
+        let wv = *w.add(c);
+        let u = *v.add(c);
+        sr += wv * u.re;
+        si += wv * u.im;
+        c += 1;
+    }
+    (sr, si)
 }
 
 /// Rotation context: per-p swap matrices + folded diagonals + scratch.
@@ -314,15 +356,7 @@ impl RotCtx {
                 }
                 // s = B_k · u  (real matrix × complex vector) -> tmp2
                 for r in 0..nb {
-                    let prow = sw.as_ptr().add(off + r * nb);
-                    let mut sr = 0.0f64;
-                    let mut si = 0.0f64;
-                    for c in 0..nb {
-                        let w = *prow.add(c);
-                        let u = *self.tmp.get_unchecked(c);
-                        sr += w * u.re;
-                        si += w * u.im;
-                    }
+                    let (sr, si) = dot_row(sw.as_ptr().add(off + r * nb), self.tmp.as_ptr(), nb);
                     *self.tmp2.get_unchecked_mut(r) = C::new(sr, si);
                 }
                 // q[m] = phb[m]·s[m]  (in place on tmp2)
@@ -337,15 +371,7 @@ impl RotCtx {
                 // r = B_k · q  -> tmp;  b[m] = out_[k,m]·r[m]
                 let bptr = b.as_mut_ptr().add(k2);
                 for r in 0..nb {
-                    let prow = sw.as_ptr().add(off + r * nb);
-                    let mut sr = 0.0f64;
-                    let mut si = 0.0f64;
-                    for c in 0..nb {
-                        let w = *prow.add(c);
-                        let q = *self.tmp2.get_unchecked(c);
-                        sr += w * q.re;
-                        si += w * q.im;
-                    }
+                    let (sr, si) = dot_row(sw.as_ptr().add(off + r * nb), self.tmp2.as_ptr(), nb);
                     let ov = *out_.get_unchecked(k2 + r);
                     *bptr.add(r) = C::new(sr * ov.re - si * ov.im, sr * ov.im + si * ov.re);
                 }
@@ -393,15 +419,7 @@ impl RotCtx {
                 }
                 // s = B_n^T · g  -> tmp2
                 for r in 0..nb {
-                    let prow = swt.as_ptr().add(off + r * nb);
-                    let mut sr = 0.0f64;
-                    let mut si = 0.0f64;
-                    for c in 0..nb {
-                        let w = *prow.add(c);
-                        let g = *self.tmp.get_unchecked(c);
-                        sr += w * g.re;
-                        si += w * g.im;
-                    }
+                    let (sr, si) = dot_row(swt.as_ptr().add(off + r * nb), self.tmp.as_ptr(), nb);
                     *self.tmp2.get_unchecked_mut(r) = C::new(sr, si);
                 }
                 // q = conj(phb)·s  (in place on tmp2)
@@ -416,15 +434,7 @@ impl RotCtx {
                 }
                 // r = B_n^T · q  -> tmp;  out[l] += fout·pha·r
                 for r in 0..nb {
-                    let prow = swt.as_ptr().add(off + r * nb);
-                    let mut sr = 0.0f64;
-                    let mut si = 0.0f64;
-                    for c in 0..nb {
-                        let w = *prow.add(c);
-                        let q = *self.tmp2.get_unchecked(c);
-                        sr += w * q.re;
-                        si += w * q.im;
-                    }
+                    let (sr, si) = dot_row(swt.as_ptr().add(off + r * nb), self.tmp2.as_ptr(), nb);
                     let ov = *fout.get_unchecked(n2 + r);
                     let pv = *pha.get_unchecked(po + r);
                     let acc = C::new(sr * ov.re - si * ov.im, sr * ov.im + si * ov.re);
