@@ -76,17 +76,19 @@ pub fn accept(
     let dx = cb.cen[0] - ca.cen[0];
     let dy = cb.cen[1] - ca.cen[1];
     let dz = cb.cen[2] - ca.cen[2];
-    let r = (dx * dx + dy * dy + dz * dz).sqrt();
-    if theta(ca, cb, r) >= 1.0 {
+    let r2 = dx * dx + dy * dy + dz * dz;
+    // θ = (ρ_A+ρ_B)/r < 1 ⇔ r > ρ_A+ρ_B; compare in r² to defer the sqrt.
+    let sum_rho = ca.rho + cb.rho;
+    if r2 <= sum_rho * sum_rho {
         return false;
     }
+    let r = r2.sqrt();
     match error_estimate(ca_idx, cb, ca.mass, ca.rho, pows, binom, p, r) {
         None => false,
         Some(est) => {
             if est == 0.0 {
                 return true;
             }
-            let r2 = r * r;
             est * ca.mass / r2 < eps * fmin[cb_idx]
         }
     }
@@ -107,10 +109,21 @@ fn f_walk(
     while let Some(c) = stack.pop() {
         let cell = tree.cells[c];
         if tree.is_leaf(c) {
-            for k in cell.first..cell.first + cell.count {
-                if k == i {
-                    continue;
+            // Split the scan at slot i (when i sits in this leaf) so the
+            // self-interaction branch leaves the inner loops. Both halves
+            // clamp to the leaf's own slot range: i may lie outside it.
+            let below = i.min(cell.first + cell.count);
+            let above = cell.first.max(i + 1);
+            for k in cell.first..below {
+                let dx = pb[0] - bodies.x[k];
+                let dy = pb[1] - bodies.y[k];
+                let dz = pb[2] - bodies.z[k];
+                let r2 = dx * dx + dy * dy + dz * dz;
+                if r2 > 0.0 {
+                    fi += bodies.m[k] / r2;
                 }
+            }
+            for k in above..cell.first + cell.count {
                 let dx = pb[0] - bodies.x[k];
                 let dy = pb[1] - bodies.y[k];
                 let dz = pb[2] - bodies.z[k];

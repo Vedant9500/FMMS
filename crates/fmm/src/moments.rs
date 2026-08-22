@@ -72,12 +72,11 @@ fn m2m_cell(tree: &Octree, c: usize, p: usize, moments: &mut [C], u: &mut [C]) {
                 let mut s = C::ZERO;
                 for k in 0..=n {
                     let nk = n - k;
-                    for l in -(k as i32)..=k as i32 {
-                        let ml = m - l;
-                        if ml.abs() > nk as i32 {
-                            continue;
-                        }
-                        s = s.add(u[idx(k, l)].mul(moments[coff + idx(nk, ml)]));
+                    // |m - l| <= nk and |l| <= k, solved for l.
+                    let lo = (-(k as i32)).max(m - nk as i32);
+                    let hi = (k as i32).min(m + nk as i32);
+                    for l in lo..=hi {
+                        s = s.add(u[idx(k, l)].mul(moments[coff + idx(nk, m - l)]));
                     }
                 }
                 moments[off + idx(n, m)] = moments[off + idx(n, m)].add(s);

@@ -246,6 +246,26 @@ MAC factor 8 untouched; `theta >= 1` short-circuit order preserved.
 **Baseline:** prepass 0.54 s @ N=10⁶ · **Target:** ≤ 0.4 s from (1)+(3);
 (4) is a gate-loop win measured separately.
 
+**Session log — 2026-08-22 (Unit 4 iteration):**
+
+- **accept r² gate**: θ test now compares `r² > (ρ_A+ρ_B)²` before the sqrt
+  (~6.9M θ-rejected evaluations/step stop paying sqrt). ULP-level borderline
+  accept flips possible by construction; release exit gate unchanged in
+  practice: max_s 1.826e-3, rms_s 4.867e-5 (was 4.87e-5, gate <1e-4).
+- **f_walk leaf-scan split at slot i** — first version had a real bug the
+  unit tests missed: with `i` outside the leaf's slot range the second half
+  loop swept *other leaves'* slots (double-counted their mass into f_b →
+  inflated fmin → MAC over-accepted; hernquist smoke rms 0.038 ≫ 1e-2,
+  caught only by the integration gate). Fixed by clamping both halves to the
+  leaf range (`below = min(i, end)`, `above = max(first, i+1)`); accumulation
+  order unchanged. Lesson: exactness tests that share the changed code path
+  on both sides cannot catch this class — the N-vs-direct gates can.
+- Both kept. `f_prepass_par_matches_serial` still exact-equal.
+
+Measured (loaded-machine window): prepass/mac 0.57/0.51/0.76 s across final
+runs vs baseline 0.54–0.57 — within noise; no honest claim beyond the sqrt
+removal (~2–3% of a step ceiling).
+
 ---
 
 ### Unit 5 — `harmonic.rs` (295 lines): Θ/Υ table recursions
@@ -278,6 +298,24 @@ or the M2L contract is explicitly relaxed.**
 **Baseline:** ~60 div + 81 complex ops per Θ table (20.6M/step) ·
 **Target:** Θ build ≤ 0.5 µs/pair; L2P Υ cost ~30× down from (4).
 
+**Session log — 2026-08-22 (Unit 5 evaluated, skipped):**
+
+- **Lever 1 (Θ reciprocal hoist): dead** — Unit 2's `m2l` bench already
+  measured Θ build at 9% of kernel cost, and the kernel is ~20% of replay →
+  ceiling ≈ 2% of a step, not worth the bit-compat surface.
+- **Lever 4 (L2P p=1-only Υ path): false premise** — `l2p_into`
+  consumes `u[idx(k,l)]` for ALL k ≤ p−1 in the ψ₁¹/ψ₁⁰ sums; no n≤1-only
+  path exists. L2P is 0.06 s anyway.
+- **Negative result (new, measured)**: skipping the negative-m mirror pass
+  in P2M via a positive-m-only Υ builder breaks the moments — Σ_a μ_a Υ_n^{-k}
+  is ±conj(Σ_a μ_a Υ_n^k), i.e. *determined by* positive-m, NOT zero; the
+  `compute_moments_par_matches_serial` exact test failed on idx(2,−1)/(2,−2).
+  Exploiting the mirror redundancy means deriving negative m in every
+  consumer (M2M, power, M2L, L2L/L2P) — a global layout change, out of scope
+  for a 0.26 s pass. Reverted.
+- Unit 5 stays closed this tier; SoA re/im tables belong to the stage-3/GPU
+  package.
+
 ---
 
 ### Unit 6 — `tree.rs` (465 lines): build + geometry + queries
@@ -309,6 +347,30 @@ tests. Cell *ordering* (DFS, parents-before-children) is load-bearing for
 **Baseline:** tree rebuild ~1.5 s serial (gate loop) · **Target:** ≤ 0.8 s
 from (2)+(3); (1) is a walk-side win (Unit 1 benefits).
 
+**Session log — 2026-08-22 (Units 6.1/6.2/6.3 iteration):**
+
+- **6.1 `leaf: bool` on Cell**, set in `build_rec`; `is_leaf` returns the
+  flag. All passes benefit; 32 unit + 4 integration green.
+- **6.2 tree reuse**: `Octree::refresh_with_mode` rebuilds for new positions
+  reusing cells/order/keys/idx allocations (bbox → re-key → sort idx →
+  gather sorted keys → build_rec on cleared cells → geometry). New exact
+  tests `refresh_matches_build` (bitwise cells+order, Com AND Sphere modes,
+  double-refresh) and `refresh_degenerate_points`. `Fmm::refresh(parts)`
+  wrapper added; energy_gate now builds ONE Fmm and refreshes per step
+  (was `Fmm::new` per step). Two bugs caught during bring-up by the exact
+  test: unsorted keys passed to build_rec (wrong children), then missing
+  scratch resize (index OOB panic).
+- **6.3 measured, rejected**: new bench `tree` mode (`fmm-bench … tree <N>
+  [n_leaf]`). N=10⁶ n_leaf=16: **build 112 ms, warm refresh 96 ms,
+  std-sort(u64×10⁶) 12.7 ms = 11% of build**. The "~1.5 s tree rebuild"
+  baseline is stale (2026-08-16 loaded-machine estimate); radix sort has
+  nothing to win. The real gate-vs-profile gap (~1.3–1.7 s in a loaded
+  window at N=10⁶) is allocation churn + cache pollution from the
+  interleaved leapfrog buffers (`to_parts` Vec churn, moments/locals
+  realloc), NOT the tree — candidate for a follow-up runner-scratch item if
+  the gate ever runs again.
+- Kept: leaf flag, refresh API, tree bench mode.
+
 ---
 
 ### Unit 7 — `moments.rs` (214 lines): P2M/M2M + power
@@ -338,6 +400,19 @@ test); `monopole_is_mass` (dipole vanishes at CoM).
    it's already minimal. Skip.
 
 **Baseline:** moments 0.26 s @ N=10⁶ · **Target:** ≤ 0.2 s from (1)+(3).
+
+**Session log — 2026-08-22 (Unit 7 iteration):**
+
+- **7.3 M2M range clamp kept**: the `|m−l| > n−k` continue replaced by
+  l-range `[max(−k, m−(n−k)) ..= min(k, m+(n−k))]` — same terms, same order,
+  branch out of the inner loop. Exact-equality test green.
+- **7.1 P2M Υ-fuse REVERTED (negative result)**: the "storage elision is
+  bit-identical" premise was wrong in an unexpected way — a positive-m-only
+  table builder (to skip the mirror pass) breaks P2M because negative-m
+  moments are NOT zero (see Unit 5 log); and fusing recursion+accumulation
+  without it showed no measurable gain in the 0.26 s phase. Dropped.
+- Moments phase: 0.27/0.30 → **0.19–0.24 s** across final runs (baseline
+  window 0.26–0.30) — consistent with the M2M clamp, within today's noise.
 
 ---
 

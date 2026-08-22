@@ -435,8 +435,41 @@ fn main() {
 
     // TEMP Unit-3 mode: fmm-bench rot <N> — rotation vs naive across p.
     if args.get(4).map(|s| s.as_str()) == Some("rot") {
-        let n: usize = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(100_000);
+        let n: usize = args.get(5).and_then(|s| s.parse::<usize>().ok()).unwrap_or(100_000);
         rot_sweep(n);
+        return;
+    }
+
+    // Unit-6 mode: fmm-bench tree <N> [n_leaf] — build vs refresh + sort share.
+    if args.get(4).map(|s| s.as_str()) == Some("tree") {
+        let n: usize = args.get(5).and_then(|s| s.parse::<usize>().ok()).unwrap_or(1_000_000);
+        let nleaf: usize = args.get(6).and_then(|s| s.parse::<usize>().ok()).unwrap_or(16);
+        let mut parts = plummer(n, [0.0; 3], 42);
+        // Jiggle positions so the second build sees different input.
+        for (i, p) in parts.iter_mut().enumerate() {
+            p.pos[0] += ((i % 7) as f64 - 3.0) * 1e-6;
+            p.pos[2] += ((i % 13) as f64 - 6.0) * 1e-6;
+        }
+        let t0 = Instant::now();
+        let mut tree = fmm::tree::Octree::build(&parts, nleaf);
+        let t_build = t0.elapsed();
+        let t1 = Instant::now();
+        tree.refresh_with_mode(&parts, fmm::tree::CenterMode::Com);
+        let t_refresh_warm = t1.elapsed();
+        let t2 = Instant::now();
+        tree.refresh_with_mode(&parts, fmm::tree::CenterMode::Com);
+        let t_refresh = t2.elapsed();
+        // Sort share: same shape as the build's sort_unstable_by_key on u64.
+        let mut keys: Vec<u64> = (0..n)
+            .map(|i| (i as u64).wrapping_mul(0x9E3779B97F4A7C15))
+            .collect();
+        let t3 = Instant::now();
+        keys.sort_unstable_by_key(|&k| k);
+        let t_sort = t3.elapsed();
+        println!(
+            "tree N={n} n_leaf={nleaf}: build={t_build:?} refresh(cold)={t_refresh_warm:?} \
+             refresh(warm)={t_refresh:?} | std-sort(u64×{n})={t_sort:?}"
+        );
         return;
     }
 

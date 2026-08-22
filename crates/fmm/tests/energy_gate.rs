@@ -137,7 +137,8 @@ fn integrate(
     verbose: bool,
 ) -> EnergyStats {
     let parts = plummer(n, [0.0; 3], 42);
-    let res0 = Fmm::new(&parts, p, eps, 16).run_threaded(&parts, threads);
+    let mut fmm = Fmm::new(&parts, p, eps, 16);
+    let res0 = fmm.run_threaded(&parts, threads);
     let s0 = warm_start(&parts, &res0.pot);
     let mut s = s0;
     let e0 = kinetic(&s) + potential(&s, &res0.pot);
@@ -157,7 +158,8 @@ fn integrate(
             s.x[i][2] += 0.5 * dt * v[2];
         }
         let parts = to_parts(&s);
-        let res = Fmm::new(&parts, p, eps, 16).run_threaded(&parts, threads);
+        fmm.refresh(&parts);
+        let res = fmm.run_threaded(&parts, threads);
         for i in 0..n {
             let a = res.accel[i];
             s.v[i][0] += dt * a[0];

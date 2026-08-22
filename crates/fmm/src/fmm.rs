@@ -38,6 +38,13 @@ impl Fmm {
         Fmm { tree: Octree::build_with_mode(parts, n_leaf, mode), p, eps, n_leaf }
     }
 
+    /// Rebuild the tree in place for new positions (allocation reuse across
+    /// timesteps). Identical result to dropping this `Fmm` and calling
+    /// [`Fmm::new`] on the same parts.
+    pub fn refresh(&mut self, parts: &[Particle]) {
+        self.tree.refresh_with_mode(parts, self.tree.mode);
+    }
+
     /// Run the full FMM (serial walk): returns accelerations and potentials
     /// (particle-id order).
     pub fn run(&self, parts: &[Particle]) -> Result {

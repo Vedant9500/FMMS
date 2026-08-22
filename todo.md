@@ -2,6 +2,57 @@
 
 Source of truth for exit gates: `ROADMAP.md` Phase 1 (lines 34-48).
 
+## Session log — 2026-08-22: Tier 1 (Units 4–7) iteration (OPTIMIZATION-PLAN.md)
+
+Problem: Tier 0 left the walk at its DRAM floor (~87% of a step); the
+remaining serial pipeline was unmeasured territory with several stale
+baselines. Context: bandwidth/traffic-bound overall, not compute-bound —
+Tier 1 trims the pipeline only; the walk is stage-3/GPU work.
+
+Changes (all bit-identical or gate-verified):
+- `crates/fmm/src/tree.rs` — `leaf: bool` on `Cell` (6.1; `is_leaf` was an
+  8-children scan per call across every pass). `Octree::refresh_with_mode`
+  rebuilds in place reusing all allocations; exactness tests
+  `refresh_matches_build` (bitwise, Com+Sphere, double-refresh) +
+  `refresh_degenerate_points`. `Fmm::refresh` wrapper.
+- `crates/fmm/tests/energy_gate.rs` — one `Fmm` built per run, refreshed per
+  step (was `Fmm::new` + full rebuild per step).
+- `crates/fmm/src/mac.rs` — accept θ test in r² (`r² > (ρ_A+ρ_B)²`) before
+  the sqrt (4.1); f_walk leaf scan split at slot i so the self-interaction
+  branch leaves the inner loops (4.3).
+- `crates/fmm/src/moments.rs` — M2M inner l-loop range clamp replaces the
+  `|m−l| > n−k` continue (7.3).
+- `crates/bench/src/main.rs` — new `tree` bench mode (build vs refresh vs
+  std-sort share).
+
+Bugs found on the way (all caught by tests):
+- f_walk split v1 swept OTHER leaves' slots when i lay outside a leaf's
+  range → double-counted mass into f_b → inflated fmin → MAC over-accept.
+  Unit exactness test blind to it (same bug both sides); hernquist smoke
+  integration gate caught it (rms 0.038 ≫ 1e-2).
+- refresh v1 passed UNSORTED keys to build_rec (wrong children everywhere);
+  v2 missed a scratch resize (OOB panic). Both caught by the new exact test.
+- P2M positive-m-only Υ builder (Unit 5 lever 4 / 7.1 idea): negative-m
+  moments are ±conj of positive-m, NOT zero — exact test failed at
+  idx(2,−1)/(2,−2). Reverted; redundancy exploitation needs consumer-side
+  changes everywhere.
+
+Measured facts:
+- **The "~1.5 s tree rebuild" baseline is STALE**: N=10⁶ build 112 ms,
+  warm refresh 96 ms, std-sort(u64×10⁶) 12.7 ms = 11% of build → radix sort
+  rejected (6.3 closed by measurement).
+- Release exit gate unchanged: max_s 1.826e-3, rms_s 4.867e-5 (gate <1e-4).
+- Moments phase 0.27–0.30 → 0.19–0.24 s; prepass within noise of 0.54–0.57 s;
+  today's machine noise band is wide (total 8.2–13.7 s across runs, loaded
+  window) — no honest total-step claim beyond "≤ Tier-0's ~7.05 s profile".
+- Gate loop @N=10⁶ now ~11.1 s/step in the same noisy window (profile ~9.4);
+  residual gap is allocation churn/cache pollution around the leapfrog
+  buffers, not the tree — follow-up candidate if the full 10⁶×10³ gate runs.
+
+Tests: 32 unit + 4 integration green (2 new tree exactness tests); release
+exit gate green; build warning-free; clippy warning count unchanged (50,
+incl. pre-existing rotation.rs erasing_op error — file off-limits).
+
 ## Session log — 2026-08-21: Unit-3 rotation M2L iteration (OPTIMIZATION-PLAN.md)
 
 Problem: re-measure the ROT_P crossover before touching rotation.rs
