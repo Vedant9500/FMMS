@@ -6,7 +6,7 @@
 //!
 //! Acceleration (Dehnen 2014, §2.1): a = ∇Ψ_0^0 = -(Re{Ψ_1^1}, Im{Ψ_1^1}, Ψ_1^0).
 
-use crate::harmonic::{idx, theta_table, theta_table_into, upsilon_table_into, C, dim};
+use crate::harmonic::{dim, idx, theta_table, theta_table_into, upsilon_table_into, C};
 use crate::tree::Octree;
 
 /// Reusable per-worker scratch for `m2l_mutual_scratch` (avoids the 4 heap
@@ -37,14 +37,7 @@ impl M2lScratch {
 ///
 /// * `moments` — per-cell multipoles, flat ncells*dim.
 /// * `locals`  — per-cell local expansions, flat ncells*dim.
-pub fn m2l_mutual(
-    tree: &Octree,
-    a: usize,
-    b: usize,
-    moments: &[C],
-    locals: &mut [C],
-    p: usize,
-) {
+pub fn m2l_mutual(tree: &Octree, a: usize, b: usize, moments: &[C], locals: &mut [C], p: usize) {
     let mut scratch = M2lScratch::new(p);
     m2l_mutual_scratch(tree, a, b, moments, locals, p, &mut scratch);
 }
@@ -260,7 +253,15 @@ pub fn l2l_down_par(tree: &Octree, locals: &mut [C], p: usize, nthreads: usize) 
 
 /// Potential (Ψ_0^0) and acceleration at a position from a cell's local
 /// expansion (eq 3f + §2.1). Adds into `pot` and `accel`.
-pub fn l2p(tree: &Octree, cell: usize, pos: [f64; 3], locals: &[C], p: usize, pot: &mut f64, accel: &mut [f64; 3]) {
+pub fn l2p(
+    tree: &Octree,
+    cell: usize,
+    pos: [f64; 3],
+    locals: &[C],
+    p: usize,
+    pot: &mut f64,
+    accel: &mut [f64; 3],
+) {
     let d = dim(p);
     let mut u = vec![C::ZERO; d];
     l2p_into(tree, cell, pos, locals, p, pot, accel, &mut u);
@@ -278,11 +279,7 @@ pub fn l2p_into(
     u: &mut [C],
 ) {
     let c = tree.cells[cell];
-    let r = [
-        c.cen[0] - pos[0],
-        c.cen[1] - pos[1],
-        c.cen[2] - pos[2],
-    ];
+    let r = [c.cen[0] - pos[0], c.cen[1] - pos[1], c.cen[2] - pos[2]];
     upsilon_table_into(r, p, u);
     let off = cell * dim(p);
     // Ψ_0^0
@@ -330,8 +327,14 @@ pub fn l2p_scatter(
                 let mut p0 = 0.0;
                 let mut a = [0.0; 3];
                 l2p_into(
-                    tree, c, [bodies.x[k], bodies.y[k], bodies.z[k]], locals, p, &mut p0,
-                    &mut a, &mut u,
+                    tree,
+                    c,
+                    [bodies.x[k], bodies.y[k], bodies.z[k]],
+                    locals,
+                    p,
+                    &mut p0,
+                    &mut a,
+                    &mut u,
                 );
                 pot[id] += bodies.pot[k] + p0;
                 accel[id][0] += bodies.ax[k] + a[0];
@@ -380,8 +383,14 @@ pub fn l2p_scatter_par(
                         let mut p0 = 0.0;
                         let mut a = [0.0; 3];
                         l2p_into(
-                            tree, c, [bodies.x[k], bodies.y[k], bodies.z[k]], locals, p,
-                            &mut p0, &mut a, &mut u,
+                            tree,
+                            c,
+                            [bodies.x[k], bodies.y[k], bodies.z[k]],
+                            locals,
+                            p,
+                            &mut p0,
+                            &mut a,
+                            &mut u,
                         );
                         unsafe {
                             *pot_ptr.ptr().add(id) += bodies.pot[k] + p0;

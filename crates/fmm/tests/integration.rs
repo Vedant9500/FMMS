@@ -56,11 +56,13 @@ fn momentum_conserved() {
         for d in 0..3 {
             fsum[d] += m * res.accel[i][d];
         }
-        ftot += m * (res.accel[i][0].powi(2)
-            + res.accel[i][1].powi(2)
-            + res.accel[i][2].powi(2))
-            .sqrt();
+        ftot += m
+            * (res.accel[i][0].powi(2) + res.accel[i][1].powi(2) + res.accel[i][2].powi(2)).sqrt();
     }
     let norm = (fsum[0].powi(2) + fsum[1].powi(2) + fsum[2].powi(2)).sqrt();
-    assert!(norm / ftot < 1e-14, "net force {norm} (rel {})", norm / ftot);
+    assert!(
+        norm / ftot < 1e-14,
+        "net force {norm} (rel {})",
+        norm / ftot
+    );
 }

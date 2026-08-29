@@ -34,7 +34,7 @@
 //! validated against the code's exact Θ basis (LSQ to 1e-13) and against the
 //! naive M2L kernel (m2l_rot_matches_naive).
 
-use crate::harmonic::{idx, C, dim};
+use crate::harmonic::{dim, idx, C};
 use crate::tree::Octree;
 
 /// Minimum p at which the rotation M2L beats the naive O(p⁴) kernel.
@@ -105,20 +105,20 @@ unsafe fn dot_row(w: *const f64, v: *const C, nb: usize) -> (f64, f64) {
 /// Rotation context: per-p swap matrices + folded diagonals + scratch.
 pub struct RotCtx {
     p: usize,
-    fact: Vec<f64>,  // j! for j = 0..=p
-    sw: Vec<f64>,    // swap matrices B_n, block layout (real)
-    swt: Vec<f64>,   // B_n^T, block layout (real)
-    in_: Vec<C>,     // back input diagonal: e^{-imπ/2}·(n-|m|)!(n+|m|)!
-    out_: Vec<C>,    // back output diagonal: e^{imπ/2}/((n-|m|)!(n+|m|)!)
-    fin: Vec<C>,     // forward input diagonal: e^{-imπ/2}/((n-|m|)!(n+|m|)!)
-    fout: Vec<C>,    // forward output diagonal base: e^{imπ/2}·(n-|m|)!(n+|m|)!
-    b: Vec<C>,       // back-rotated source multipoles, dim(p)
-    f: Vec<C>,       // axial output, dim(p)
-    tmp: Vec<C>,     // per-degree scratch (max size 2p+1)
-    tmp2: Vec<C>,    // per-degree scratch 2 (max size 2p+1)
-    pha: Vec<C>,     // pair phase e^{imα} (or (-1)^m e^{imα}), size 2p+1
-    phb: Vec<C>,     // pair phase e^{imβ} (or (-1)^m e^{-imβ}), size 2p+1
-    facr: Vec<f64>,  // j!/R^{j+1}, size p+1
+    fact: Vec<f64>, // j! for j = 0..=p
+    sw: Vec<f64>,   // swap matrices B_n, block layout (real)
+    swt: Vec<f64>,  // B_n^T, block layout (real)
+    in_: Vec<C>,    // back input diagonal: e^{-imπ/2}·(n-|m|)!(n+|m|)!
+    out_: Vec<C>,   // back output diagonal: e^{imπ/2}/((n-|m|)!(n+|m|)!)
+    fin: Vec<C>,    // forward input diagonal: e^{-imπ/2}/((n-|m|)!(n+|m|)!)
+    fout: Vec<C>,   // forward output diagonal base: e^{imπ/2}·(n-|m|)!(n+|m|)!
+    b: Vec<C>,      // back-rotated source multipoles, dim(p)
+    f: Vec<C>,      // axial output, dim(p)
+    tmp: Vec<C>,    // per-degree scratch (max size 2p+1)
+    tmp2: Vec<C>,   // per-degree scratch 2 (max size 2p+1)
+    pha: Vec<C>,    // pair phase e^{imα} (or (-1)^m e^{imα}), size 2p+1
+    phb: Vec<C>,    // pair phase e^{imβ} (or (-1)^m e^{-imβ}), size 2p+1
+    facr: Vec<f64>, // j!/R^{j+1}, size p+1
 }
 
 impl RotCtx {
@@ -227,7 +227,7 @@ impl RotCtx {
                     2 => C::new(-1.0, 0.0),
                     _ => C::new(0.0, 1.0),
                 };
-                in_[i] = ei.scale(fm);      // back input
+                in_[i] = ei.scale(fm); // back input
                 out_[i] = ei.conj().scale(1.0 / fm); // back output
                 fin[i] = ei.scale(1.0 / fm); // forward input
                 fout[i] = ei.conj().scale(fm); // forward output base
@@ -259,19 +259,16 @@ impl RotCtx {
     /// swap matvecs with a diagonal β phase between; the forward-rotation is
     /// the same with B^T and conjugated β phase. No allocations on the hot
     /// path.
-    pub fn m2l_pair(
-        &mut self,
-        tree: &Octree,
-        a: usize,
-        b: usize,
-        moments: &[C],
-        locals: &mut [C],
-    ) {
+    pub fn m2l_pair(&mut self, tree: &Octree, a: usize, b: usize, moments: &[C], locals: &mut [C]) {
         let p = self.p;
         let d = dim(p);
         let ca = tree.cells[a];
         let cb = tree.cells[b];
-        let r = [cb.cen[0] - ca.cen[0], cb.cen[1] - ca.cen[1], cb.cen[2] - ca.cen[2]];
+        let r = [
+            cb.cen[0] - ca.cen[0],
+            cb.cen[1] - ca.cen[1],
+            cb.cen[2] - ca.cen[2],
+        ];
         let r2 = r[0] * r[0] + r[1] * r[1] + r[2] * r[2];
         let rinv = 1.0 / r2.sqrt();
         let alpha = r[1].atan2(r[0]);
@@ -319,13 +316,7 @@ impl RotCtx {
     ///        r    = B_n^T · q
     ///        out[l] += fout[n,l]·pha[l]·r[l]
     #[inline]
-    fn apply(
-        &mut self,
-        so: usize,
-        do_: usize,
-        moments: &[C],
-        locals: &mut [C],
-    ) {
+    fn apply(&mut self, so: usize, do_: usize, moments: &[C], locals: &mut [C]) {
         let p = self.p;
         let b = &mut self.b;
         let f = &mut self.f;
@@ -343,7 +334,7 @@ impl RotCtx {
                 let phb = &self.phb;
                 let off = block_off(k);
                 let po = p - k; // offset so pha[po + c] is azimuth (c-k)+p
-                // u[m] = in_[k,m]·pha[m]·conj(M[k,m])  -> tmp
+                                // u[m] = in_[k,m]·pha[m]·conj(M[k,m])  -> tmp
                 for c in 0..nb {
                     let m = *mptr.add(c);
                     let ph = *pha.get_unchecked(po + c);
@@ -363,10 +354,8 @@ impl RotCtx {
                 for r in 0..nb {
                     let pbb = *phb.get_unchecked(po + r);
                     let s = *self.tmp2.get_unchecked(r);
-                    *self.tmp2.get_unchecked_mut(r) = C::new(
-                        s.re * pbb.re - s.im * pbb.im,
-                        s.re * pbb.im + s.im * pbb.re,
-                    );
+                    *self.tmp2.get_unchecked_mut(r) =
+                        C::new(s.re * pbb.re - s.im * pbb.im, s.re * pbb.im + s.im * pbb.re);
                 }
                 // r = B_k · q  -> tmp;  b[m] = out_[k,m]·r[m]
                 let bptr = b.as_mut_ptr().add(k2);
@@ -412,10 +401,8 @@ impl RotCtx {
                 for c in 0..nb {
                     let fv = *fptr.add(c);
                     let iv = *fin.get_unchecked(n2 + c);
-                    *self.tmp.get_unchecked_mut(c) = C::new(
-                        fv.re * iv.re - fv.im * iv.im,
-                        fv.re * iv.im + fv.im * iv.re,
-                    );
+                    *self.tmp.get_unchecked_mut(c) =
+                        C::new(fv.re * iv.re - fv.im * iv.im, fv.re * iv.im + fv.im * iv.re);
                 }
                 // s = B_n^T · g  -> tmp2
                 for r in 0..nb {
@@ -427,10 +414,8 @@ impl RotCtx {
                     let pb = *phb.get_unchecked(po + r);
                     let s = *self.tmp2.get_unchecked(r);
                     // conj(phb)·s : (pb.re, -pb.im)·(s.re, s.im)
-                    *self.tmp2.get_unchecked_mut(r) = C::new(
-                        s.re * pb.re + s.im * pb.im,
-                        s.im * pb.re - s.re * pb.im,
-                    );
+                    *self.tmp2.get_unchecked_mut(r) =
+                        C::new(s.re * pb.re + s.im * pb.im, s.im * pb.re - s.re * pb.im);
                 }
                 // r = B_n^T · q  -> tmp;  out[l] += fout·pha·r
                 for r in 0..nb {
@@ -522,7 +507,10 @@ mod tests {
         let parts: Vec<Particle> = (0..128)
             .map(|i| {
                 let f = i as f64 * 0.1;
-                Particle { mass: 1.0, pos: [f, f, f] }
+                Particle {
+                    mass: 1.0,
+                    pos: [f, f, f],
+                }
             })
             .collect();
         let tree = crate::tree::Octree::build(&parts, 4);

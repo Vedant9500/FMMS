@@ -207,7 +207,7 @@ impl Octree {
                                 items.push((ch.cen, ch.rho));
                             }
                         }
-ritter(&items).0
+                        ritter(&items).0
                     }
                 };
                 // ρ_parent = max over children of (ρ_child + |cen_child - cen|).
@@ -254,7 +254,13 @@ ritter(&items).0
     }
 }
 
-fn com_of_slots(parts: &[Particle], tree: &Octree, first: usize, count: usize, mass: f64) -> [f64; 3] {
+fn com_of_slots(
+    parts: &[Particle],
+    tree: &Octree,
+    first: usize,
+    count: usize,
+    mass: f64,
+) -> [f64; 3] {
     let mut com = [0.0; 3];
     for k in first..first + count {
         let p = &parts[tree.order[k] as usize];
@@ -340,7 +346,11 @@ fn ritter(items: &[([f64; 3], f64)]) -> ([f64; 3], f64) {
             if d + rad > r {
                 let dd = d.max(f64::MIN_POSITIVE);
                 let dir = [(q[0] - c[0]) / dd, (q[1] - c[1]) / dd, (q[2] - c[2]) / dd];
-                let p = [q[0] + rad * dir[0], q[1] + rad * dir[1], q[2] + rad * dir[2]];
+                let p = [
+                    q[0] + rad * dir[0],
+                    q[1] + rad * dir[1],
+                    q[2] + rad * dir[2],
+                ];
                 let d_far = d + rad;
                 let t = (d_far - r) / (2.0 * d_far);
                 for k in 0..3 {
@@ -362,7 +372,11 @@ fn ritter(items: &[([f64; 3], f64)]) -> ([f64; 3], f64) {
             hi[d] = hi[d].max(q[d] + rad);
         }
     }
-    let cb = [(lo[0] + hi[0]) * 0.5, (lo[1] + hi[1]) * 0.5, (lo[2] + hi[2]) * 0.5];
+    let cb = [
+        (lo[0] + hi[0]) * 0.5,
+        (lo[1] + hi[1]) * 0.5,
+        (lo[2] + hi[2]) * 0.5,
+    ];
     let mut rb: f64 = 0.0;
     for (q, rad) in items.iter() {
         rb = rb.max(dist(*q, cb) + rad);
@@ -441,7 +455,10 @@ mod tests {
             let x = (i % 4) as f64;
             let y = ((i / 4) % 4) as f64;
             let z = (i / 16) as f64;
-            v.push(Particle { mass: 1.0, pos: [x, y, z] });
+            v.push(Particle {
+                mass: 1.0,
+                pos: [x, y, z],
+            });
         }
         v
     }
@@ -465,7 +482,13 @@ mod tests {
     #[test]
     fn degenerate_points() {
         // All points identical -> can't be split further; single leaf holds all.
-        let parts = vec![Particle { mass: 2.0, pos: [1.0, 1.0, 1.0] }; 5];
+        let parts = vec![
+            Particle {
+                mass: 2.0,
+                pos: [1.0, 1.0, 1.0]
+            };
+            5
+        ];
         let tree = Octree::build(&parts, 5);
         assert_eq!(tree.cells.len(), 1);
         assert!(tree.is_leaf(0));
@@ -480,7 +503,10 @@ mod tests {
             // A tree built on shifted positions, then refreshed back.
             let shifted: Vec<Particle> = parts
                 .iter()
-                .map(|p| Particle { mass: p.mass, pos: [p.pos[0] + 5.0, p.pos[1] - 3.0, p.pos[2] + 1.0] })
+                .map(|p| Particle {
+                    mass: p.mass,
+                    pos: [p.pos[0] + 5.0, p.pos[1] - 3.0, p.pos[2] + 1.0],
+                })
                 .collect();
             let mut rebuilt = Octree::build_with_mode(&shifted, 16, mode);
             rebuilt.refresh_with_mode(&parts, mode);
@@ -505,7 +531,13 @@ mod tests {
     #[test]
     fn refresh_degenerate_points() {
         // Identical positions: single leaf; refresh must reproduce it.
-        let parts = vec![Particle { mass: 2.0, pos: [1.0, 1.0, 1.0] }; 5];
+        let parts = vec![
+            Particle {
+                mass: 2.0,
+                pos: [1.0, 1.0, 1.0]
+            };
+            5
+        ];
         let mut tree = Octree::build_with_mode(&parts, 16, CenterMode::Com);
         tree.refresh_with_mode(&parts, CenterMode::Com);
         assert_eq!(tree.cells.len(), 1);

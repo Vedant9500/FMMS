@@ -80,7 +80,10 @@ fn warm_start(parts: &[Particle], pot: &[f64]) -> State {
 
 fn to_parts(s: &State) -> Vec<Particle> {
     (0..s.m.len())
-        .map(|i| Particle { mass: s.m[i], pos: s.x[i] })
+        .map(|i| Particle {
+            mass: s.m[i],
+            pos: s.x[i],
+        })
         .collect()
 }
 
@@ -216,11 +219,17 @@ fn integrate(
 }
 
 fn env_u64(key: &str, default: usize) -> usize {
-    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 fn env_f64(key: &str, default: f64) -> f64 {
-    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 #[test]
@@ -231,7 +240,11 @@ fn energy_conservation_smoke() {
         st.e0, st.drift, st.max_dev, st.slope, st.momentum
     );
     // Virialized Plummer: E0 = T + W = W/2 = -3π/64 ≈ -0.147.
-    assert!((st.e0 + 0.147).abs() < 0.03, "E0={} not ~-0.147 (Plummer)", st.e0);
+    assert!(
+        (st.e0 + 0.147).abs() < 0.03,
+        "E0={} not ~-0.147 (Plummer)",
+        st.e0
+    );
     assert!(st.momentum < 1e-12, "momentum rel {}", st.momentum);
     assert!(st.drift.abs() < 1e-2, "energy drift {} too large", st.drift);
     assert!(st.max_dev < 1e-2, "energy max dev {} too large", st.max_dev);
@@ -259,7 +272,19 @@ fn energy_conservation_gate() {
         t0.elapsed().as_secs_f64()
     );
     assert!(st.momentum < 1e-12, "momentum rel {}", st.momentum);
-    assert!(st.drift.abs() < 1e-3, "energy drift {} exceeds gate", st.drift);
-    assert!(st.max_dev < 1e-3, "energy max dev {} exceeds gate", st.max_dev);
-    assert!(st.slope.abs() < 1e-6, "secular slope {} too large", st.slope);
+    assert!(
+        st.drift.abs() < 1e-3,
+        "energy drift {} exceeds gate",
+        st.drift
+    );
+    assert!(
+        st.max_dev < 1e-3,
+        "energy max dev {} exceeds gate",
+        st.max_dev
+    );
+    assert!(
+        st.slope.abs() < 1e-6,
+        "secular slope {} too large",
+        st.slope
+    );
 }

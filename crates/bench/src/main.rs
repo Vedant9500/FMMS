@@ -40,7 +40,9 @@ fn sampled_error(
     let n = parts.len();
     let mut rng = seed;
     let mut next = move || {
-        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        rng = rng
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         (rng >> 33) as usize % n
     };
     let mut worst = 0.0f64;
@@ -66,7 +68,8 @@ fn sampled_error(
             az += pj.mass * inv3 * dz;
             f += pj.mass * inv2;
         }
-        let da = (accel[i][0] - ax).powi(2) + (accel[i][1] - ay).powi(2) + (accel[i][2] - az).powi(2);
+        let da =
+            (accel[i][0] - ax).powi(2) + (accel[i][1] - ay).powi(2) + (accel[i][2] - az).powi(2);
         let s = da.sqrt() / f;
         worst = worst.max(s);
         sumsq += s * s;
@@ -142,7 +145,13 @@ fn p2p_bench(n: usize, nthreads: usize, n_leaf: usize) {
             let raw: *mut Bodies = &mut bodies;
             let nthreads = nthreads;
             for t in 0..nthreads {
-                let mut v = unsafe { body_view(&mut *raw, (t * big) % (bodies.x.len() - big), (t * big) % (bodies.x.len() - big) + big) };
+                let mut v = unsafe {
+                    body_view(
+                        &mut *raw,
+                        (t * big) % (bodies.x.len() - big),
+                        (t * big) % (bodies.x.len() - big) + big,
+                    )
+                };
                 s.spawn(move || {
                     for _ in 0..20 {
                         fmm::p2p::p2p_self(&mut v, 0, big);
@@ -172,7 +181,11 @@ fn p2p_bench(n: usize, nthreads: usize, n_leaf: usize) {
         }
         best = best.min(t0.elapsed().as_secs_f64() / passes as f64);
     }
-    println!("  single-thread: {:.4}s/pass = {:>7.1} GFLOPS", best, flops / best / 1e9);
+    println!(
+        "  single-thread: {:.4}s/pass = {:>7.1} GFLOPS",
+        best,
+        flops / best / 1e9
+    );
 
     // Threaded across disjoint ranges (views share the same backing arrays).
     let mut best_t = f64::INFINITY;
@@ -256,7 +269,11 @@ fn m2l_bench(n: usize, p: usize) {
             }
         }
     }
-    println!("m2l bench: N={n} p={p} pairs={} cells={}", pairs.len(), ncells);
+    println!(
+        "m2l bench: N={n} p={p} pairs={} cells={}",
+        pairs.len(),
+        ncells
+    );
 
     // Full kernel (table build + conj + parity copy + convolution).
     let mut locals = vec![C::ZERO; ncells * d];
@@ -267,7 +284,15 @@ fn m2l_bench(n: usize, p: usize) {
         let t0 = std::time::Instant::now();
         for _ in 0..reps {
             for &(a, b) in &pairs {
-                fmm::translate::m2l_mutual_scratch(&tree, a, b, &moments, &mut locals, p, &mut scratch);
+                fmm::translate::m2l_mutual_scratch(
+                    &tree,
+                    a,
+                    b,
+                    &moments,
+                    &mut locals,
+                    p,
+                    &mut scratch,
+                );
             }
         }
         best_full = best_full.min(t0.elapsed().as_secs_f64() / (reps * pairs.len()) as f64);
@@ -281,7 +306,11 @@ fn m2l_bench(n: usize, p: usize) {
         for _ in 0..(reps * pairs.len()) {
             let ca = tree.cells[pairs[0].0];
             let cb = tree.cells[pairs[0].1];
-            let r = [cb.cen[0] - ca.cen[0], cb.cen[1] - ca.cen[1], cb.cen[2] - ca.cen[2]];
+            let r = [
+                cb.cen[0] - ca.cen[0],
+                cb.cen[1] - ca.cen[1],
+                cb.cen[2] - ca.cen[2],
+            ];
             fmm::harmonic::theta_table_into(r, p, &mut th);
         }
         best_th = best_th.min(t0.elapsed().as_secs_f64() / (reps * pairs.len()) as f64);
@@ -350,7 +379,15 @@ fn rot_sweep(n: usize) {
             let t0 = std::time::Instant::now();
             for _ in 0..reps {
                 for &(a, b) in &pairs {
-                    fmm::translate::m2l_mutual_scratch(&tree, a, b, &moments, &mut loc, p, &mut scratch);
+                    fmm::translate::m2l_mutual_scratch(
+                        &tree,
+                        a,
+                        b,
+                        &moments,
+                        &mut loc,
+                        p,
+                        &mut scratch,
+                    );
                 }
             }
             best_n = best_n.min(t0.elapsed().as_secs_f64() / (reps * pairs.len()) as f64);
@@ -410,15 +447,23 @@ fn net_force(parts: &[fmm::models::Particle], accel: &[[f64; 3]]) -> f64 {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let max_n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(1_000_000);
+    let max_n: usize = args
+        .get(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1_000_000);
     let p: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(8);
     let eps: f64 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(1e-5);
     let avx = std::is_x86_feature_detected!("avx512f");
-    let default_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let default_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
 
     // P2P throughput mode: fmm-bench p2p [N] [nthreads]
     if args.get(4).map(|s| s.as_str()) == Some("p2p") {
-        let n: usize = args.get(5).and_then(|s| s.parse::<usize>().ok()).unwrap_or(1_000_000);
+        let n: usize = args
+            .get(5)
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(1_000_000);
         let nt: usize = args.get(6).and_then(|s| s.parse().ok()).unwrap_or(8);
         let nleaf: usize = args.get(7).and_then(|s| s.parse().ok()).unwrap_or(16);
         p2p_bench(n, nt, nleaf);
@@ -435,15 +480,24 @@ fn main() {
 
     // TEMP Unit-3 mode: fmm-bench rot <N> — rotation vs naive across p.
     if args.get(4).map(|s| s.as_str()) == Some("rot") {
-        let n: usize = args.get(5).and_then(|s| s.parse::<usize>().ok()).unwrap_or(100_000);
+        let n: usize = args
+            .get(5)
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(100_000);
         rot_sweep(n);
         return;
     }
 
     // Unit-6 mode: fmm-bench tree <N> [n_leaf] — build vs refresh + sort share.
     if args.get(4).map(|s| s.as_str()) == Some("tree") {
-        let n: usize = args.get(5).and_then(|s| s.parse::<usize>().ok()).unwrap_or(1_000_000);
-        let nleaf: usize = args.get(6).and_then(|s| s.parse::<usize>().ok()).unwrap_or(16);
+        let n: usize = args
+            .get(5)
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(1_000_000);
+        let nleaf: usize = args
+            .get(6)
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(16);
         let mut parts = plummer(n, [0.0; 3], 42);
         // Jiggle positions so the second build sees different input.
         for (i, p) in parts.iter_mut().enumerate() {
@@ -482,7 +536,14 @@ fn main() {
                 sweep(max_n, p, eps, n, avx);
                 return;
             }
-            profile(n, p, eps, args.get(5).and_then(|s| s.parse().ok()).unwrap_or(default_threads));
+            profile(
+                n,
+                p,
+                eps,
+                args.get(5)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(default_threads),
+            );
             return;
         }
     }
@@ -491,75 +552,96 @@ fn main() {
 }
 
 fn profile(n: usize, p: usize, eps: f64, nthreads: usize) {
-        let parts = plummer(n, [0.0; 3], 42);
-        let f = Fmm::new(&parts, p, eps, 16);
-        for pass in 0..2 {
-            let t0 = Instant::now();
-            let tree = &f.tree;
-            let t1 = Instant::now();
-            let mut bodies = fmm::bodies::Bodies::from_parts(&parts, &tree.order);
-            let ncells = tree.cells.len();
-            let d = fmm::harmonic::dim(p);
-            let mut moments = vec![fmm::harmonic::C::ZERO; ncells * d];
-            if nthreads > 1 {
-                fmm::moments::compute_moments_par(&bodies, &tree, p, &mut moments, nthreads);
+    let parts = plummer(n, [0.0; 3], 42);
+    let f = Fmm::new(&parts, p, eps, 16);
+    for pass in 0..2 {
+        let t0 = Instant::now();
+        let tree = &f.tree;
+        let t1 = Instant::now();
+        let mut bodies = fmm::bodies::Bodies::from_parts(&parts, &tree.order);
+        let ncells = tree.cells.len();
+        let d = fmm::harmonic::dim(p);
+        let mut moments = vec![fmm::harmonic::C::ZERO; ncells * d];
+        if nthreads > 1 {
+            fmm::moments::compute_moments_par(&bodies, &tree, p, &mut moments, nthreads);
+        } else {
+            fmm::moments::compute_moments(&bodies, &tree, p, &mut moments);
+        }
+        let t2 = Instant::now();
+        let pows = fmm::moments::multipole_power(&moments, ncells, p);
+        let binom = fmm::moments::binomials(p);
+        let (_, fmin) = if nthreads > 1 {
+            fmm::mac::f_prepass_par(&bodies, &tree, nthreads)
+        } else {
+            fmm::mac::f_prepass(&bodies, &tree)
+        };
+        let t3 = Instant::now();
+        let mut locals = vec![fmm::harmonic::C::ZERO; ncells * d];
+        // Reset per-pass so printed stats are per-evaluation, not 2x.
+        let _ = fmm::walk::walk_counts();
+        if nthreads <= 1 {
+            let mut rot = if p >= fmm::rotation::ROT_P {
+                Some(fmm::rotation::RotCtx::new(p))
             } else {
-                fmm::moments::compute_moments(&bodies, &tree, p, &mut moments);
-            }
-            let t2 = Instant::now();
-            let pows = fmm::moments::multipole_power(&moments, ncells, p);
-            let binom = fmm::moments::binomials(p);
-            let (_, fmin) = if nthreads > 1 {
-                fmm::mac::f_prepass_par(&bodies, &tree, nthreads)
-            } else {
-                fmm::mac::f_prepass(&bodies, &tree)
+                None
             };
-            let t3 = Instant::now();
-            let mut locals = vec![fmm::harmonic::C::ZERO; ncells * d];
-            // Reset per-pass so printed stats are per-evaluation, not 2x.
-            let _ = fmm::walk::walk_counts();
-            if nthreads <= 1 {
-                let mut rot = if p >= fmm::rotation::ROT_P { Some(fmm::rotation::RotCtx::new(p)) } else { None };
-                fmm::walk::dual_walk(
-                    &mut bodies, &tree, p, eps, &pows, &binom, &fmin, &moments, &mut locals, rot.as_mut(),
-                );
-            } else {
-                fmm::walk::dual_walk_par(
-                    &mut bodies, &tree, p, eps, &pows, &binom, &fmin, &moments, &mut locals, nthreads,
-                );
-            }
-            let t4 = Instant::now();
-            if nthreads > 1 {
-                fmm::translate::l2l_down_par(&tree, &mut locals, p, nthreads);
-            } else {
-                fmm::translate::l2l_down(&tree, &mut locals, p);
-            }
-            let t5 = Instant::now();
-            let mut pot = vec![0.0; n];
-            let mut accel = vec![[0.0; 3]; n];
-            if nthreads > 1 {
-                fmm::translate::l2p_scatter_par(
-                    &tree, &bodies, &locals, p, &mut pot, &mut accel, nthreads,
-                );
-            } else {
-                fmm::translate::l2p_scatter(&tree, &bodies, &locals, p, &mut pot, &mut accel);
-            }
-            let t6 = Instant::now();
-            if pass == 1 {
-                println!("profile N={n} p={p} eps={eps} nthreads={nthreads}: tree-build+clone {:.4}s, moments {:.4}s, prepass/mac {:.4}s, walk {:.4}s, l2l {:.4}s, l2p+scatter {:.4}s, total {:.4}s",
+            fmm::walk::dual_walk(
+                &mut bodies,
+                &tree,
+                p,
+                eps,
+                &pows,
+                &binom,
+                &fmin,
+                &moments,
+                &mut locals,
+                rot.as_mut(),
+            );
+        } else {
+            fmm::walk::dual_walk_par(
+                &mut bodies,
+                &tree,
+                p,
+                eps,
+                &pows,
+                &binom,
+                &fmin,
+                &moments,
+                &mut locals,
+                nthreads,
+            );
+        }
+        let t4 = Instant::now();
+        if nthreads > 1 {
+            fmm::translate::l2l_down_par(&tree, &mut locals, p, nthreads);
+        } else {
+            fmm::translate::l2l_down(&tree, &mut locals, p);
+        }
+        let t5 = Instant::now();
+        let mut pot = vec![0.0; n];
+        let mut accel = vec![[0.0; 3]; n];
+        if nthreads > 1 {
+            fmm::translate::l2p_scatter_par(
+                &tree, &bodies, &locals, p, &mut pot, &mut accel, nthreads,
+            );
+        } else {
+            fmm::translate::l2p_scatter(&tree, &bodies, &locals, p, &mut pot, &mut accel);
+        }
+        let t6 = Instant::now();
+        if pass == 1 {
+            println!("profile N={n} p={p} eps={eps} nthreads={nthreads}: tree-build+clone {:.4}s, moments {:.4}s, prepass/mac {:.4}s, walk {:.4}s, l2l {:.4}s, l2p+scatter {:.4}s, total {:.4}s",
                     (t1 - t0).as_secs_f64(), (t2 - t1).as_secs_f64(), (t3 - t2).as_secs_f64(),
                     (t4 - t3).as_secs_f64(), (t5 - t4).as_secs_f64(), (t6 - t5).as_secs_f64(), (t6 - t0).as_secs_f64());
-                let (pop, acc, m2l, s2, p2, m2l_ops) = fmm::walk::walk_counts();
-                println!("  walk stats: pops={pop}, accept/M2L={m2l}, m2l-pair-ops={m2l_ops}, p2p_self={s2}, p2p_pair={p2} (accept-calls={acc})");
-                let (rec, merge, part, alloc, replay, reduce) = fmm::walk::walk_phase_ms();
-                println!("  walk phases (ms): record={rec} merge={merge} partition={part} alloc={alloc} replay={replay} reduce={reduce}");
-            }
+            let (pop, acc, m2l, s2, p2, m2l_ops) = fmm::walk::walk_counts();
+            println!("  walk stats: pops={pop}, accept/M2L={m2l}, m2l-pair-ops={m2l_ops}, p2p_self={s2}, p2p_pair={p2} (accept-calls={acc})");
+            let (rec, merge, part, alloc, replay, reduce) = fmm::walk::walk_phase_ms();
+            println!("  walk phases (ms): record={rec} merge={merge} partition={part} alloc={alloc} replay={replay} reduce={reduce}");
         }
+    }
 }
 
 // Sweep mode: fmm-bench [max_n] [p] [eps] [nthreads]
 fn sweep(max_n: usize, p: usize, eps: f64, nthreads: usize, avx: bool) {
-
     println!("FMM O(N) scaling sweep  (p={p}, eps={eps}, n_leaf=16, avx512={avx}, nthreads={nthreads}, best-of-2)");
 
     let ns: Vec<usize> = vec![1_000, 3_000, 10_000, 30_000, 100_000, 300_000, 1_000_000]
@@ -567,7 +649,10 @@ fn sweep(max_n: usize, p: usize, eps: f64, nthreads: usize, avx: bool) {
         .filter(|&n| n <= max_n)
         .collect();
 
-    println!("\n{:>10} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12}", "N", "t_fmm(s)", "t_dir(s)", "speedup", "max_s", "rms_s", "netF/|F|");
+    println!(
+        "\n{:>10} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12}",
+        "N", "t_fmm(s)", "t_dir(s)", "speedup", "max_s", "rms_s", "netF/|F|"
+    );
     for &n in &ns {
         let parts = plummer(n, [0.0; 3], 42);
         let t = time_fmm(&parts, p, eps, nthreads);
@@ -600,7 +685,10 @@ fn sweep(max_n: usize, p: usize, eps: f64, nthreads: usize, avx: bool) {
             let parts = plummer(n, [0.0; 3], 42);
             let td = time_direct(&parts);
             let tf = time_fmm(&parts, p, eps, nthreads);
-            println!("  N={n:>7}: direct {td:8.4}s  FMM {tf:8.4}s  speedup {:.1}x", td / tf);
+            println!(
+                "  N={n:>7}: direct {td:8.4}s  FMM {tf:8.4}s  speedup {:.1}x",
+                td / tf
+            );
         }
     }
 }

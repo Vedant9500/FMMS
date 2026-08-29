@@ -96,12 +96,7 @@ pub fn accept(
 
 /// Monopole (p=0, θ<1) tree-walk estimate of f_b for one particle.
 /// `stack` is caller-owned scratch, cleared per call.
-fn f_walk(
-    bodies: &crate::bodies::Bodies,
-    tree: &Octree,
-    i: usize,
-    stack: &mut Vec<usize>,
-) -> f64 {
+fn f_walk(bodies: &crate::bodies::Bodies, tree: &Octree, i: usize, stack: &mut Vec<usize>) -> f64 {
     let pb = [bodies.x[i], bodies.y[i], bodies.z[i]];
     stack.clear();
     stack.push(0);
@@ -226,8 +221,14 @@ mod tests {
     fn f_prepass_small() {
         // Two particles: f = m/d² each.
         let parts = vec![
-            Particle { mass: 1.0, pos: [0.0, 0.0, 0.0] },
-            Particle { mass: 2.0, pos: [3.0, 0.0, 0.0] },
+            Particle {
+                mass: 1.0,
+                pos: [0.0, 0.0, 0.0],
+            },
+            Particle {
+                mass: 2.0,
+                pos: [3.0, 0.0, 0.0],
+            },
         ];
         let tree = Octree::build(&parts, 1);
         let bodies = crate::bodies::Bodies::from_parts(&parts, &tree.order);

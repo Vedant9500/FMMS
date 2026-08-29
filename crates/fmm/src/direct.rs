@@ -32,7 +32,11 @@ pub fn direct(parts: &[Particle]) -> (Vec<[f64; 3]>, Vec<f64>) {
 
 /// Scaled acceleration error δa/f and relative error δa/a statistics.
 /// `f` is the per-particle estimate Σ m/|Δx|² (eq 4), computed exactly here.
-pub fn scaled_error(a_ref: &[[f64; 3]], a_fmm: &[[f64; 3]], parts: &[Particle]) -> (f64, f64, f64, f64) {
+pub fn scaled_error(
+    a_ref: &[[f64; 3]],
+    a_fmm: &[[f64; 3]],
+    parts: &[Particle],
+) -> (f64, f64, f64, f64) {
     let n = parts.len();
     // Exact f.
     let mut f = vec![0.0; n];
@@ -58,10 +62,9 @@ pub fn scaled_error(a_ref: &[[f64; 3]], a_fmm: &[[f64; 3]], parts: &[Particle]) 
         let dy = a_fmm[i][1] - a_ref[i][1];
         let dz = a_fmm[i][2] - a_ref[i][2];
         let da = (dx * dx + dy * dy + dz * dz).sqrt();
-        let aref = (a_ref[i][0] * a_ref[i][0]
-            + a_ref[i][1] * a_ref[i][1]
-            + a_ref[i][2] * a_ref[i][2])
-            .sqrt();
+        let aref =
+            (a_ref[i][0] * a_ref[i][0] + a_ref[i][1] * a_ref[i][1] + a_ref[i][2] * a_ref[i][2])
+                .sqrt();
         let s = da / f[i];
         let rel = if aref > 0.0 { da / aref } else { 0.0 };
         max_scaled = max_scaled.max(s);

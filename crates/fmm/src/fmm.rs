@@ -24,7 +24,12 @@ impl Fmm {
     /// Build with expansion centers at the cell center of mass (Phase-0
     /// default; momentum-conserving).
     pub fn new(parts: &[Particle], p: usize, eps: f64, n_leaf: usize) -> Self {
-        Fmm { tree: Octree::build(parts, n_leaf), p, eps, n_leaf }
+        Fmm {
+            tree: Octree::build(parts, n_leaf),
+            p,
+            eps,
+            n_leaf,
+        }
     }
 
     /// Build with an explicit center mode (com or Ritter bounding sphere).
@@ -35,7 +40,12 @@ impl Fmm {
         n_leaf: usize,
         mode: CenterMode,
     ) -> Self {
-        Fmm { tree: Octree::build_with_mode(parts, n_leaf, mode), p, eps, n_leaf }
+        Fmm {
+            tree: Octree::build_with_mode(parts, n_leaf, mode),
+            p,
+            eps,
+            n_leaf,
+        }
     }
 
     /// Rebuild the tree in place for new positions (allocation reuse across
@@ -77,15 +87,35 @@ impl Fmm {
         };
         let mut locals = vec![C::ZERO; ncells * d];
         if nthreads <= 1 {
-            let mut rot = if p >= crate::rotation::ROT_P { Some(RotCtx::new(p)) } else { None };
+            let mut rot = if p >= crate::rotation::ROT_P {
+                Some(RotCtx::new(p))
+            } else {
+                None
+            };
             crate::walk::dual_walk(
-                &mut bodies, &self.tree, p, self.eps, &pows, &binom, &fmin,
-                &moments, &mut locals, rot.as_mut(),
+                &mut bodies,
+                &self.tree,
+                p,
+                self.eps,
+                &pows,
+                &binom,
+                &fmin,
+                &moments,
+                &mut locals,
+                rot.as_mut(),
             );
         } else {
             crate::walk::dual_walk_par(
-                &mut bodies, &self.tree, p, self.eps, &pows, &binom, &fmin,
-                &moments, &mut locals, nthreads,
+                &mut bodies,
+                &self.tree,
+                p,
+                self.eps,
+                &pows,
+                &binom,
+                &fmin,
+                &moments,
+                &mut locals,
+                nthreads,
             );
         }
         // L2L pass down: each cell adds its expansion to its children.
@@ -104,6 +134,10 @@ impl Fmm {
         } else {
             crate::translate::l2p_scatter(&self.tree, &bodies, &locals, p, &mut pot, &mut accel);
         }
-        Result { accel, pot, n_cells: ncells }
+        Result {
+            accel,
+            pot,
+            n_cells: ncells,
+        }
     }
 }

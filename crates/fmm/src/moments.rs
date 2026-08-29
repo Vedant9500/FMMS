@@ -63,7 +63,11 @@ fn m2m_cell(tree: &Octree, c: usize, p: usize, moments: &mut [C], u: &mut [C]) {
             continue;
         }
         let child = tree.cells[ch as usize];
-        let d = [child.cen[0] - z[0], child.cen[1] - z[1], child.cen[2] - z[2]];
+        let d = [
+            child.cen[0] - z[0],
+            child.cen[1] - z[1],
+            child.cen[2] - z[2],
+        ];
         upsilon_table_into(d, p, u);
         let coff = ch as usize * dim;
         for n in 0..=p {
@@ -185,8 +189,14 @@ mod tests {
     #[test]
     fn monopole_is_mass() {
         let parts = vec![
-            Particle { mass: 2.0, pos: [1.0, 0.0, 0.0] },
-            Particle { mass: 3.0, pos: [0.0, 2.0, 0.0] },
+            Particle {
+                mass: 2.0,
+                pos: [1.0, 0.0, 0.0],
+            },
+            Particle {
+                mass: 3.0,
+                pos: [0.0, 2.0, 0.0],
+            },
         ];
         let tree = Octree::build(&parts, 1);
         let dim = crate::harmonic::dim(2);

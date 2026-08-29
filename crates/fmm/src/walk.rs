@@ -203,8 +203,22 @@ fn process_stack(
     let mut scratch = M2lScratch::new(p);
     while let Some((a, b)) = stack.pop() {
         process_pair(
-            bodies, tree, p, eps, pows, binom, fmin, moments, locals, rot.as_deref_mut(), None,
-            a, b, stack, &mut cnt, &mut scratch,
+            bodies,
+            tree,
+            p,
+            eps,
+            pows,
+            binom,
+            fmin,
+            moments,
+            locals,
+            rot.as_deref_mut(),
+            None,
+            a,
+            b,
+            stack,
+            &mut cnt,
+            &mut scratch,
         );
     }
     cnt.fold();
@@ -227,7 +241,9 @@ pub fn dual_walk(
 ) {
     let mut stack: Vec<(usize, usize)> = Vec::with_capacity(1024);
     stack.push((0, 0));
-    process_stack(bodies, tree, p, eps, pows, binom, fmin, moments, locals, rot, &mut stack);
+    process_stack(
+        bodies, tree, p, eps, pows, binom, fmin, moments, locals, rot, &mut stack,
+    );
 }
 
 /// Pairs popped from the shared stack per lock acquisition. Small batches
@@ -331,8 +347,9 @@ pub fn dual_walk_par(
         })
         .collect();
 
-    let stacks: Vec<std::sync::Mutex<Vec<(usize, usize)>>> =
-        (0..nthreads).map(|_| std::sync::Mutex::new(Vec::new())).collect();
+    let stacks: Vec<std::sync::Mutex<Vec<(usize, usize)>>> = (0..nthreads)
+        .map(|_| std::sync::Mutex::new(Vec::new()))
+        .collect();
     stacks[0].lock().unwrap().push((0, 0));
     let left = AtomicUsize::new(1);
     let park = std::sync::Mutex::new(());
@@ -394,8 +411,22 @@ pub fn dual_walk_par(
                     pending.clear();
                     for &(a, b) in batch.iter() {
                         process_pair(
-                            tb, tree, p, eps, pows, binom, fmin, moments, &mut nolocals, None,
-                            Some(rec), a, b, &mut pending, &mut cnt, &mut scratch,
+                            tb,
+                            tree,
+                            p,
+                            eps,
+                            pows,
+                            binom,
+                            fmin,
+                            moments,
+                            &mut nolocals,
+                            None,
+                            Some(rec),
+                            a,
+                            b,
+                            &mut pending,
+                            &mut cnt,
+                            &mut scratch,
                         );
                     }
 
@@ -460,7 +491,13 @@ pub fn dual_walk_par(
                     match rot.as_mut() {
                         Some(r) => r.m2l_pair(tree, a as usize, b as usize, moments, tl),
                         None => m2l_mutual_scratch(
-                            tree, a as usize, b as usize, moments, tl, p, &mut scratch,
+                            tree,
+                            a as usize,
+                            b as usize,
+                            moments,
+                            tl,
+                            p,
+                            &mut scratch,
                         ),
                     }
                 }
@@ -505,8 +542,12 @@ pub fn dual_walk_par(
         std::thread::scope(|s| {
             for k0 in (0..n).step_by(chunk.max(1)) {
                 let k1 = (k0 + chunk).min(n);
-                let (bax, bay, baz, bpot) =
-                    (crate::SendPtr(bax.ptr()), crate::SendPtr(bay.ptr()), crate::SendPtr(baz.ptr()), crate::SendPtr(bpot.ptr()));
+                let (bax, bay, baz, bpot) = (
+                    crate::SendPtr(bax.ptr()),
+                    crate::SendPtr(bay.ptr()),
+                    crate::SendPtr(baz.ptr()),
+                    crate::SendPtr(bpot.ptr()),
+                );
                 s.spawn(move || unsafe {
                     for k in k0..k1 {
                         *bax.ptr().add(k) += workers.iter().map(|(_, tb)| tb.ax[k]).sum::<f64>();
@@ -541,7 +582,9 @@ mod tests {
         let mut pairs: Vec<(u32, u32)> = Vec::new();
         let mut rng = 12345u64;
         let mut next = move || {
-            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            rng = rng
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (rng >> 33) as u32 % ncells as u32
         };
         for _ in 0..5000 {
@@ -582,17 +625,22 @@ mod tests {
 
         let mut bs = bodies0.clone();
         let mut ls = vec![C::ZERO; ncells * d];
-        dual_walk(&mut bs, &tree, p, eps, &pows, &binom, &fmin, &moments, &mut ls, None);
+        dual_walk(
+            &mut bs, &tree, p, eps, &pows, &binom, &fmin, &moments, &mut ls, None,
+        );
 
         let mut bp = bodies0.clone();
         let mut lp = vec![C::ZERO; ncells * d];
-        dual_walk_par(&mut bp, &tree, p, eps, &pows, &binom, &fmin, &moments, &mut lp, nthreads);
+        dual_walk_par(
+            &mut bp, &tree, p, eps, &pows, &binom, &fmin, &moments, &mut lp, nthreads,
+        );
 
         for i in 0..ncells * d {
             // Any real pair-split bug would differ at the level of the summed
             // terms (~1 relative); `local_tol` sits well above reassociation
             // rounding while staying far below that.
-            let tol = local_tol * (1.0 + ls[i].re.abs() + lp[i].re.abs() + ls[i].im.abs() + lp[i].im.abs());
+            let tol = local_tol
+                * (1.0 + ls[i].re.abs() + lp[i].re.abs() + ls[i].im.abs() + lp[i].im.abs());
             assert!(
                 (ls[i].re - lp[i].re).abs() < tol && (ls[i].im - lp[i].im).abs() < tol,
                 "locals[{i}]: serial ({},{}) vs par ({},{})",
@@ -604,10 +652,22 @@ mod tests {
         }
         let ntol = |a: f64, b: f64| 1e-10 * (1.0 + a.abs() + b.abs());
         for k in 0..n {
-            assert!((bs.ax[k] - bp.ax[k]).abs() < ntol(bs.ax[k], bp.ax[k]), "ax[{k}]");
-            assert!((bs.ay[k] - bp.ay[k]).abs() < ntol(bs.ay[k], bp.ay[k]), "ay[{k}]");
-            assert!((bs.az[k] - bp.az[k]).abs() < ntol(bs.az[k], bp.az[k]), "az[{k}]");
-            assert!((bs.pot[k] - bp.pot[k]).abs() < ntol(bs.pot[k], bp.pot[k]), "pot[{k}]");
+            assert!(
+                (bs.ax[k] - bp.ax[k]).abs() < ntol(bs.ax[k], bp.ax[k]),
+                "ax[{k}]"
+            );
+            assert!(
+                (bs.ay[k] - bp.ay[k]).abs() < ntol(bs.ay[k], bp.ay[k]),
+                "ay[{k}]"
+            );
+            assert!(
+                (bs.az[k] - bp.az[k]).abs() < ntol(bs.az[k], bp.az[k]),
+                "az[{k}]"
+            );
+            assert!(
+                (bs.pot[k] - bp.pot[k]).abs() < ntol(bs.pot[k], bp.pot[k]),
+                "pot[{k}]"
+            );
         }
     }
 

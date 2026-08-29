@@ -34,17 +34,26 @@ impl C {
 
     #[inline]
     pub const fn conj(self) -> Self {
-        C { re: self.re, im: -self.im }
+        C {
+            re: self.re,
+            im: -self.im,
+        }
     }
 
     #[inline]
     pub fn add(self, o: Self) -> Self {
-        C { re: self.re + o.re, im: self.im + o.im }
+        C {
+            re: self.re + o.re,
+            im: self.im + o.im,
+        }
     }
 
     #[inline]
     pub fn sub(self, o: Self) -> Self {
-        C { re: self.re - o.re, im: self.im - o.im }
+        C {
+            re: self.re - o.re,
+            im: self.im - o.im,
+        }
     }
 
     #[inline]
@@ -57,7 +66,10 @@ impl C {
 
     #[inline]
     pub fn scale(self, s: f64) -> Self {
-        C { re: self.re * s, im: self.im * s }
+        C {
+            re: self.re * s,
+            im: self.im * s,
+        }
     }
 }
 
@@ -94,7 +106,9 @@ pub fn theta_table_into(r: [f64; 3], p: usize, t: &mut [C]) {
     // m > 0: diagonal seed then upward recursion in n.
     for m in 1..=p {
         let mi = m as i32;
-        t[idx(m, mi)] = C::new(x, y).scale((2 * m - 1) as f64 / r2).mul(t[idx(m - 1, m as i32 - 1)]);
+        t[idx(m, mi)] = C::new(x, y)
+            .scale((2 * m - 1) as f64 / r2)
+            .mul(t[idx(m - 1, m as i32 - 1)]);
         for n in m + 1..=p {
             let a = (2 * n - 1) as f64 * z;
             let b = ((n - 1) * (n - 1) - m * m) as f64;
@@ -132,13 +146,19 @@ pub fn upsilon_table_into(r: [f64; 3], p: usize, u: &mut [C]) {
     for m in 0..=p {
         let mi = m as i32;
         if m > 0 {
-            u[idx(m, mi)] = C::new(x, y).scale(1.0 / (2 * m) as f64).mul(u[idx(m - 1, m as i32 - 1)]);
+            u[idx(m, mi)] = C::new(x, y)
+                .scale(1.0 / (2 * m) as f64)
+                .mul(u[idx(m - 1, m as i32 - 1)]);
         }
         for n in m + 1..=p {
             let a = (2 * n - 1) as f64 * z;
             let b = r2;
             let c = (n * n - m * m) as f64;
-            let p2 = if n >= m + 2 { u[idx(n - 2, mi)] } else { C::ZERO };
+            let p2 = if n >= m + 2 {
+                u[idx(n - 2, mi)]
+            } else {
+                C::ZERO
+            };
             u[idx(n, mi)] = u[idx(n - 1, mi)].scale(a).sub(p2.scale(b)).scale(1.0 / c);
         }
     }
@@ -174,11 +194,19 @@ mod tests {
         // U_n^m = Re(Υ_n^|m|) for m≥0, Im(Υ_n^|m|) for m<0 (eq 58a).
         let u_val = |n: usize, m: i32| -> f64 {
             let c = u[idx(n, m.unsigned_abs() as i32)];
-            if m >= 0 { c.re } else { c.im }
+            if m >= 0 {
+                c.re
+            } else {
+                c.im
+            }
         };
         let t_val = |n: usize, m: i32| -> f64 {
             let c = t[idx(n, m.unsigned_abs() as i32)];
-            if m >= 0 { c.re } else { c.im }
+            if m >= 0 {
+                c.re
+            } else {
+                c.im
+            }
         };
         // (n-m)!(n+m)! U must equal the polynomial; likewise r^{2n+1} T.
         let expect = |n: usize, m: i32, poly: f64| {
@@ -186,8 +214,18 @@ mod tests {
             let c = fact(n - am) * fact(n + am);
             let lhs_u = c * u_val(n, m);
             let lhs_t = r2.powf(n as f64 + 0.5) * t_val(n, m);
-            assert!((lhs_u - poly).abs() < 1e-12, "U n={} m={}: {lhs_u} vs {poly}", n, m);
-            assert!((lhs_t - poly).abs() < 1e-12, "T n={} m={}: {lhs_t} vs {poly}", n, m);
+            assert!(
+                (lhs_u - poly).abs() < 1e-12,
+                "U n={} m={}: {lhs_u} vs {poly}",
+                n,
+                m
+            );
+            assert!(
+                (lhs_t - poly).abs() < 1e-12,
+                "T n={} m={}: {lhs_t} vs {poly}",
+                n,
+                m
+            );
         };
 
         // Table 3 entries.

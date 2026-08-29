@@ -152,8 +152,14 @@ unsafe fn p2p_self_avx512(b: &mut Bodies, first: usize, count: usize) {
             let dz0 = _mm512_sub_pd(zb, z0);
             let r2 = _mm512_fmadd_pd(dz0, dz0, _mm512_fmadd_pd(dy0, dy0, _mm512_mul_pd(dx0, dx0)));
             let inv = _mm512_rsqrt14_pd(r2);
-            let inv = _mm512_mul_pd(_mm512_mul_pd(inv, _mm512_fnmadd_pd(_mm512_mul_pd(inv, inv), r2, three)), half);
-            let inv = _mm512_mul_pd(_mm512_mul_pd(inv, _mm512_fnmadd_pd(_mm512_mul_pd(inv, inv), r2, three)), half);
+            let inv = _mm512_mul_pd(
+                _mm512_mul_pd(inv, _mm512_fnmadd_pd(_mm512_mul_pd(inv, inv), r2, three)),
+                half,
+            );
+            let inv = _mm512_mul_pd(
+                _mm512_mul_pd(inv, _mm512_fnmadd_pd(_mm512_mul_pd(inv, inv), r2, three)),
+                half,
+            );
             let inv3 = _mm512_mul_pd(_mm512_mul_pd(inv, inv), inv);
             let f = _mm512_mul_pd(mb, inv3);
             a0x = _mm512_fmadd_pd(f, dx0, a0x);
@@ -166,8 +172,20 @@ unsafe fn p2p_self_avx512(b: &mut Bodies, first: usize, count: usize) {
             let dz1 = _mm512_sub_pd(zb, z1);
             let r2b = _mm512_fmadd_pd(dz1, dz1, _mm512_fmadd_pd(dy1, dy1, _mm512_mul_pd(dx1, dx1)));
             let invb = _mm512_rsqrt14_pd(r2b);
-            let invb = _mm512_mul_pd(_mm512_mul_pd(invb, _mm512_fnmadd_pd(_mm512_mul_pd(invb, invb), r2b, three)), half);
-            let invb = _mm512_mul_pd(_mm512_mul_pd(invb, _mm512_fnmadd_pd(_mm512_mul_pd(invb, invb), r2b, three)), half);
+            let invb = _mm512_mul_pd(
+                _mm512_mul_pd(
+                    invb,
+                    _mm512_fnmadd_pd(_mm512_mul_pd(invb, invb), r2b, three),
+                ),
+                half,
+            );
+            let invb = _mm512_mul_pd(
+                _mm512_mul_pd(
+                    invb,
+                    _mm512_fnmadd_pd(_mm512_mul_pd(invb, invb), r2b, three),
+                ),
+                half,
+            );
             let inv3b = _mm512_mul_pd(_mm512_mul_pd(invb, invb), invb);
             let fb = _mm512_mul_pd(mb, inv3b);
             a1x = _mm512_fmadd_pd(fb, dx1, a1x);
@@ -176,13 +194,25 @@ unsafe fn p2p_self_avx512(b: &mut Bodies, first: usize, count: usize) {
             p1 = _mm512_fmadd_pd(mb, invb, p1);
             let fm1 = _mm512_mul_pd(m1, inv3b);
             let axj = _mm512_loadu_pd(b.ax.as_ptr().add(first + o));
-            _mm512_storeu_pd(b.ax.as_mut_ptr().add(first + o), _mm512_fnmadd_pd(fm0, dx0, _mm512_fnmadd_pd(fm1, dx1, axj)));
+            _mm512_storeu_pd(
+                b.ax.as_mut_ptr().add(first + o),
+                _mm512_fnmadd_pd(fm0, dx0, _mm512_fnmadd_pd(fm1, dx1, axj)),
+            );
             let ayj = _mm512_loadu_pd(b.ay.as_ptr().add(first + o));
-            _mm512_storeu_pd(b.ay.as_mut_ptr().add(first + o), _mm512_fnmadd_pd(fm0, dy0, _mm512_fnmadd_pd(fm1, dy1, ayj)));
+            _mm512_storeu_pd(
+                b.ay.as_mut_ptr().add(first + o),
+                _mm512_fnmadd_pd(fm0, dy0, _mm512_fnmadd_pd(fm1, dy1, ayj)),
+            );
             let azj = _mm512_loadu_pd(b.az.as_ptr().add(first + o));
-            _mm512_storeu_pd(b.az.as_mut_ptr().add(first + o), _mm512_fnmadd_pd(fm0, dz0, _mm512_fnmadd_pd(fm1, dz1, azj)));
+            _mm512_storeu_pd(
+                b.az.as_mut_ptr().add(first + o),
+                _mm512_fnmadd_pd(fm0, dz0, _mm512_fnmadd_pd(fm1, dz1, azj)),
+            );
             let pj = _mm512_loadu_pd(b.pot.as_ptr().add(first + o));
-            _mm512_storeu_pd(b.pot.as_mut_ptr().add(first + o), _mm512_fmadd_pd(m0, inv, _mm512_fmadd_pd(m1, invb, pj)));
+            _mm512_storeu_pd(
+                b.pot.as_mut_ptr().add(first + o),
+                _mm512_fmadd_pd(m0, inv, _mm512_fmadd_pd(m1, invb, pj)),
+            );
             jj += 8;
         }
         for j in jj..count {
@@ -240,8 +270,14 @@ unsafe fn p2p_pair_avx512(
             let dz = _mm512_sub_pd(zb, zi);
             let r2 = _mm512_fmadd_pd(dz, dz, _mm512_fmadd_pd(dy, dy, _mm512_mul_pd(dx, dx)));
             let inv = _mm512_rsqrt14_pd(r2);
-            let inv = _mm512_mul_pd(_mm512_mul_pd(inv, _mm512_fnmadd_pd(_mm512_mul_pd(inv, inv), r2, three)), half);
-            let inv = _mm512_mul_pd(_mm512_mul_pd(inv, _mm512_fnmadd_pd(_mm512_mul_pd(inv, inv), r2, three)), half);
+            let inv = _mm512_mul_pd(
+                _mm512_mul_pd(inv, _mm512_fnmadd_pd(_mm512_mul_pd(inv, inv), r2, three)),
+                half,
+            );
+            let inv = _mm512_mul_pd(
+                _mm512_mul_pd(inv, _mm512_fnmadd_pd(_mm512_mul_pd(inv, inv), r2, three)),
+                half,
+            );
             let inv3 = _mm512_mul_pd(_mm512_mul_pd(inv, inv), inv);
             let f = _mm512_mul_pd(mb, inv3);
             axacc = _mm512_fmadd_pd(f, dx, axacc);
@@ -348,7 +384,11 @@ mod tests {
             assert!((ref_.ax[k] - simd.ax[k]).abs() < tol, "ax[{k}]");
             assert!((ref_.ay[k] - simd.ay[k]).abs() < tol, "ay[{k}]");
             assert!((ref_.az[k] - simd.az[k]).abs() < tol, "az[{k}]");
-            assert!((ref_.pot[k] - simd.pot[k]).abs() < 1e-12 * (1.0 + ref_.pot[k].abs() + simd.pot[k].abs()), "pot[{k}]");
+            assert!(
+                (ref_.pot[k] - simd.pot[k]).abs()
+                    < 1e-12 * (1.0 + ref_.pot[k].abs() + simd.pot[k].abs()),
+                "pot[{k}]"
+            );
         }
     }
 
@@ -372,7 +412,11 @@ mod tests {
             assert!((ref_.ax[k] - simd.ax[k]).abs() < tol, "ax[{k}]");
             assert!((ref_.ay[k] - simd.ay[k]).abs() < tol, "ay[{k}]");
             assert!((ref_.az[k] - simd.az[k]).abs() < tol, "az[{k}]");
-            assert!((ref_.pot[k] - simd.pot[k]).abs() < 1e-12 * (1.0 + ref_.pot[k].abs() + simd.pot[k].abs()), "pot[{k}]");
+            assert!(
+                (ref_.pot[k] - simd.pot[k]).abs()
+                    < 1e-12 * (1.0 + ref_.pot[k].abs() + simd.pot[k].abs()),
+                "pot[{k}]"
+            );
         }
     }
 

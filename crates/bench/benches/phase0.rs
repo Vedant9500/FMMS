@@ -51,14 +51,26 @@ fn roofline_report() {
         let n = (p + 1) * (p + 1);
         let bytes = ((n + n) * 16) as f64; // moments in + local out, complex f64
         let i = fmm::roofline::intensity(fl, bytes);
-        let verdict = if i > bal { "compute-bound" } else { "memory-bound" };
-        out.push_str(&format!("M2L p={p}: {fl:.0} flops, {i:.1} flops/byte -> {verdict}\n"));
+        let verdict = if i > bal {
+            "compute-bound"
+        } else {
+            "memory-bound"
+        };
+        out.push_str(&format!(
+            "M2L p={p}: {fl:.0} flops, {i:.1} flops/byte -> {verdict}\n"
+        ));
     }
     let fl = fmm::roofline::p2p_flops_per_pair();
     let bytes = 32.0; // 2 positions (6 f64) per pair
     let i = fmm::roofline::intensity(fl, bytes);
-    let verdict = if i > bal { "compute-bound" } else { "memory-bound" };
-    out.push_str(&format!("P2P/pair: {fl:.0} flops, {i:.2} flops/byte -> {verdict}\n"));
+    let verdict = if i > bal {
+        "compute-bound"
+    } else {
+        "memory-bound"
+    };
+    out.push_str(&format!(
+        "P2P/pair: {fl:.0} flops, {i:.2} flops/byte -> {verdict}\n"
+    ));
     println!("{out}");
 }
 
