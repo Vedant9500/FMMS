@@ -103,6 +103,7 @@ fn process_pair(
     locals: &mut [C],
     rot: Option<&mut RotCtx>,
     record: Option<&mut Vec<(u32, u32)>>,
+    record_p2p: Option<&mut Vec<(u32, u32)>>,
     a: usize,
     b: usize,
     pending: &mut Vec<(usize, usize)>,
@@ -117,6 +118,9 @@ fn process_pair(
         if tree.is_leaf(a) {
             // P2P within the leaf.
             cnt.selfp += 1;
+            if let Some(rp) = record_p2p {
+                rp.push((a as u32, a as u32));
+            }
             crate::p2p::p2p_self(bodies, ca.first, ca.count);
         } else {
             // All pairs of daughters including (i,i).
@@ -150,6 +154,9 @@ fn process_pair(
         }
     } else if tree.is_leaf(a) && tree.is_leaf(b) {
         cnt.pair += 1;
+        if let Some(rp) = record_p2p {
+            rp.push((a as u32, b as u32));
+        }
         crate::p2p::p2p_pair(bodies, ca.first, ca.count, cb.first, cb.count);
     } else if tree.is_leaf(a) {
         // Split the larger (non-leaf) cell b.
@@ -213,6 +220,7 @@ fn process_stack(
             moments,
             locals,
             rot.as_deref_mut(),
+            None,
             None,
             a,
             b,
@@ -317,8 +325,22 @@ fn partition_pairs(pairs: &mut [(u32, u32)], ncells: usize, nbuckets: usize) -> 
 /// accumulation order differs, so results agree to fp reassociation rounding.
 /// Requires `nthreads * (ncells·dim + N)·16` bytes of transient memory for
 /// the accumulators plus `8` bytes per recorded M2L pair.
-pub fn dual_walk_par(
-    bodies: &mut crate::bodies::Bodies,
+/// Phase 1 of the parallel walk as a reusable unit (GPU replay path consumes
+/// it): work-stealing traversal that records accepted M2L pairs and
+/// accumulates near-field P2P into per-thread `Bodies` copies.
+/// Returns the merged pair list plus per-thread bodies.
+/// The traversal is the former inlined phase 1 of `dual_walk_par`, moved
+/// verbatim; the accepted-pair set is independent of steal order.
+pub struct Recorded {
+    pub pairs: Vec<(u32, u32)>,
+    pub p2p: Vec<(u32, u32)>,
+    pub tbodies: Vec<crate::bodies::Bodies>,
+    pub record_ms: u64,
+    pub merge_ms: u64,
+}
+
+pub fn record_pairs_par(
+    bodies: &crate::bodies::Bodies,
     tree: &Octree,
     p: usize,
     eps: f64,
@@ -326,26 +348,20 @@ pub fn dual_walk_par(
     binom: &[f64],
     fmin: &[f64],
     moments: &[C],
-    locals: &mut [C],
     nthreads: usize,
-) {
-    let d = crate::harmonic::dim(p);
-    let ncells = tree.cells.len();
-    let n = bodies.x.len();
-    let use_rot = p >= crate::rotation::ROT_P;
+) -> Recorded {
     let t_start = std::time::Instant::now();
-
-    // Phase 1: walk + record; P2P into private bodies copies.
-    let mut workers: Vec<(Vec<(u32, u32)>, crate::bodies::Bodies)> = (0..nthreads)
-        .map(|_| {
-            let mut tb = bodies.clone();
-            tb.ax.iter_mut().for_each(|v| *v = 0.0);
-            tb.ay.iter_mut().for_each(|v| *v = 0.0);
-            tb.az.iter_mut().for_each(|v| *v = 0.0);
-            tb.pot.iter_mut().for_each(|v| *v = 0.0);
-            (Vec::new(), tb)
-        })
-        .collect();
+    let mut workers: Vec<(Vec<(u32, u32)>, Vec<(u32, u32)>, crate::bodies::Bodies)> =
+        (0..nthreads)
+            .map(|_| {
+                let mut tb = bodies.clone();
+                tb.ax.iter_mut().for_each(|v| *v = 0.0);
+                tb.ay.iter_mut().for_each(|v| *v = 0.0);
+                tb.az.iter_mut().for_each(|v| *v = 0.0);
+                tb.pot.iter_mut().for_each(|v| *v = 0.0);
+                (Vec::new(), Vec::new(), tb)
+            })
+            .collect();
 
     let stacks: Vec<std::sync::Mutex<Vec<(usize, usize)>>> = (0..nthreads)
         .map(|_| std::sync::Mutex::new(Vec::new()))
@@ -361,7 +377,7 @@ pub fn dual_walk_par(
         let park = &park;
         let cv = &cv;
         for (i, slot) in workers.iter_mut().enumerate() {
-            let (rec, tb) = (&mut slot.0, &mut slot.1);
+            let (rec, rec_p2p, tb) = (&mut slot.0, &mut slot.1, &mut slot.2);
             s.spawn(move || {
                 let mut batch: Vec<(usize, usize)> = Vec::with_capacity(BATCH);
                 let mut pending: Vec<(usize, usize)> = Vec::with_capacity(BATCH * 8);
@@ -422,6 +438,7 @@ pub fn dual_walk_par(
                             &mut nolocals,
                             None,
                             Some(rec),
+                            Some(rec_p2p),
                             a,
                             b,
                             &mut pending,
@@ -448,14 +465,54 @@ pub fn dual_walk_par(
         }
     });
 
-    // Merge recorded pairs and partition by min-cell subtree bucket.
+    // Merge recorded pairs.
     let t_record = t_start.elapsed().as_millis() as u64;
-    let npairs: usize = workers.iter().map(|(r, _)| r.len()).sum();
+    let npairs: usize = workers.iter().map(|(r, _, _)| r.len()).sum();
+    let np2p: usize = workers.iter().map(|(_, r, _)| r.len()).sum();
     let mut pairs: Vec<(u32, u32)> = Vec::with_capacity(npairs);
-    for (r, _) in &mut workers {
+    let mut p2p: Vec<(u32, u32)> = Vec::with_capacity(np2p);
+    for (r, rp, _) in &mut workers {
         pairs.append(r);
+        p2p.append(rp);
     }
+    let tbodies: Vec<crate::bodies::Bodies> =
+        workers.into_iter().map(|(_, _, tb)| tb).collect();
     let t_merge = t_start.elapsed().as_millis() as u64 - t_record;
+    T_RECORD_MS.store(t_record, Ordering::Relaxed);
+    T_MERGE_MS.store(t_merge, Ordering::Relaxed);
+    Recorded {
+        pairs,
+        p2p,
+        tbodies,
+        record_ms: t_record,
+        merge_ms: t_merge,
+    }
+}
+
+pub fn dual_walk_par(
+    bodies: &mut crate::bodies::Bodies,
+    tree: &Octree,
+    p: usize,
+    eps: f64,
+    pows: &[f64],
+    binom: &[f64],
+    fmin: &[f64],
+    moments: &[C],
+    locals: &mut [C],
+    nthreads: usize,
+) {
+    let d = crate::harmonic::dim(p);
+    let ncells = tree.cells.len();
+    let n = bodies.x.len();
+    let use_rot = p >= crate::rotation::ROT_P;
+    let t_start = std::time::Instant::now();
+
+    // Phase 1: walk + record; P2P into private bodies copies.
+    let rec = record_pairs_par(bodies, tree, p, eps, pows, binom, fmin, moments, nthreads);
+    let (t_record, t_merge) = (rec.record_ms, rec.merge_ms);
+    let mut pairs = rec.pairs;
+    let workers = rec.tbodies;
+    let npairs = pairs.len();
     let nbuckets = 1024.min(ncells).max(1);
     let ends = partition_pairs(&mut pairs, ncells, nbuckets);
     let t_part = t_start.elapsed().as_millis() as u64 - t_record - t_merge;
@@ -550,18 +607,16 @@ pub fn dual_walk_par(
                 );
                 s.spawn(move || unsafe {
                     for k in k0..k1 {
-                        *bax.ptr().add(k) += workers.iter().map(|(_, tb)| tb.ax[k]).sum::<f64>();
-                        *bay.ptr().add(k) += workers.iter().map(|(_, tb)| tb.ay[k]).sum::<f64>();
-                        *baz.ptr().add(k) += workers.iter().map(|(_, tb)| tb.az[k]).sum::<f64>();
-                        *bpot.ptr().add(k) += workers.iter().map(|(_, tb)| tb.pot[k]).sum::<f64>();
+                        *bax.ptr().add(k) += workers.iter().map(|tb| tb.ax[k]).sum::<f64>();
+                        *bay.ptr().add(k) += workers.iter().map(|tb| tb.ay[k]).sum::<f64>();
+                        *baz.ptr().add(k) += workers.iter().map(|tb| tb.az[k]).sum::<f64>();
+                        *bpot.ptr().add(k) += workers.iter().map(|tb| tb.pot[k]).sum::<f64>();
                     }
                 });
             }
         });
     }
     let t_end = t_start.elapsed().as_millis() as u64;
-    T_RECORD_MS.store(t_record, Ordering::Relaxed);
-    T_MERGE_MS.store(t_merge, Ordering::Relaxed);
     T_PART_MS.store(t_part, Ordering::Relaxed);
     T_ALLOC_MS.store(t_alloc0 - t_record - t_merge - t_part, Ordering::Relaxed);
     T_REPLAY_MS.store(t_replay_done - t_alloc0, Ordering::Relaxed);
@@ -604,6 +659,62 @@ mod tests {
         }
         pairs.sort_unstable();
         assert_eq!(pairs, sorted);
+    }
+
+    #[test]
+    fn record_pairs_deterministic_set() {
+        let n = 2048;
+        let (p, eps, n_leaf, nthreads) = (4, 1e-2, 16, 4);
+        let parts = plummer(n, [0.0; 3], 77);
+        let tree = Octree::build(&parts, n_leaf);
+        let d = dim(p);
+        let ncells = tree.cells.len();
+        let mut moments = vec![C::ZERO; ncells * d];
+        let bodies = Bodies::from_parts(&parts, &tree.order);
+        crate::moments::compute_moments(&bodies, &tree, p, &mut moments);
+        let pows = crate::moments::multipole_power(&moments, ncells, p);
+        let binom = crate::moments::binomials(p);
+        let (_, fmin) = crate::mac::f_prepass(&bodies, &tree);
+        let run = || {
+            let rec = record_pairs_par(&bodies, &tree, p, eps, &pows, &binom, &fmin, &moments, nthreads);
+            assert!(!rec.pairs.is_empty());
+            let mut s = rec.pairs;
+            s.sort_unstable();
+            s
+        };
+        assert_eq!(run(), run());
+    }
+
+    #[test]
+    fn record_p2p_leaf_pairs() {
+        let n = 2048;
+        let (p, eps, n_leaf, nthreads) = (4, 1e-2, 16, 4);
+        let parts = plummer(n, [0.0; 3], 77);
+        let tree = Octree::build(&parts, n_leaf);
+        let d = dim(p);
+        let ncells = tree.cells.len();
+        let mut moments = vec![C::ZERO; ncells * d];
+        let bodies = Bodies::from_parts(&parts, &tree.order);
+        crate::moments::compute_moments(&bodies, &tree, p, &mut moments);
+        let pows = crate::moments::multipole_power(&moments, ncells, p);
+        let binom = crate::moments::binomials(p);
+        let (_, fmin) = crate::mac::f_prepass(&bodies, &tree);
+        let rec = record_pairs_par(&bodies, &tree, p, eps, &pows, &binom, &fmin, &moments, nthreads);
+        assert!(!rec.p2p.is_empty());
+        for &(a, b) in &rec.p2p {
+            assert!(tree.is_leaf(a as usize) && tree.is_leaf(b as usize));
+        }
+        // Every leaf appears (self pairs cover all leaves).
+        let mut seen = vec![false; ncells];
+        for &(a, b) in &rec.p2p {
+            seen[a as usize] = true;
+            seen[b as usize] = true;
+        }
+        for c in 0..ncells {
+            if tree.is_leaf(c) {
+                assert!(seen[c], "leaf {c} missing");
+            }
+        }
     }
 
     /// Run the walk both serial and threaded and check the M2L locals and the

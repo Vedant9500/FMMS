@@ -1,0 +1,23 @@
+[package]
+name = "fmms-visual"
+version.workspace = true
+edition.workspace = true
+default-run = "fmms-visual"
+
+[[bin]]
+name = "fmms-visual"
+path = "src/main.rs"
+
+[dependencies]
+fmm = { path = "../fmm" }
+wgpu = "30"
+winit = "0.30"
+egui = "0.36"
+egui-wgpu = "0.36"
+egui-winit = "0.36"
+pollster = "0.4"
+bytemuck = { version = "1", features = ["derive"] }
+glam = "0.30"
+
+[dev-dependencies]
+naga = { version = "30", features = ["wgsl-in"] }

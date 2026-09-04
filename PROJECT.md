@@ -9,7 +9,7 @@ Workspace layout and what each crate/module does. Companion to `README.md`
 crates/
 ├── fmm/       the library: FMM implementation (published crate `fmm`)
 ├── bench/     O(N) scaling sweep + phase profile binary (crate `fmm-bench`)
-└── visual/    (planned) live GPU visual system — not yet a workspace member
+└── visual/    live GPU visual system V0 harness (bin `fmms-visual`, workspace member)
 ```
 
 `crates/fmm/src/`:

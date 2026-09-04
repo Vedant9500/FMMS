@@ -2,6 +2,95 @@
 
 Source of truth for exit gates: `ROADMAP.md` Phase 1 (lines 34-48).
 
+## Session log — 2026-09-03: visual side quest V0 harness
+
+Motivation break from FMM optimization. Scaffolded `crates/visual`
+(bin `fmms-visual`, now a workspace member) as a minimal but
+no-redesign V0: GPU-resident prev/curr storage buffers with vertex-shader
+interpolation (alpha), camera-relative f32 rebase from f64 world,
+fixed-timestep accumulator + render interpolation, instanced billboard
+quads (same quad becomes the V2 sphere impostor), HDR rgba16float +
+Reinhard tonemap pass, winit orbit camera + egui overlay.
+Physics behind a trait: direct O(N²) default (N ≤ 1500), FMM backend
+(`--fmm`, auto above 1500). Verified: builds warning-free, 1 headless
+sim test green, live screenshots (black sky, Plummer cluster, overlay).
+Run: `cargo run --release -p fmms-visual -- [--n 1500] [--dt 0.004] [--fmm]`.
+Next: GPU frustum culling + indirect draw, bloom, FMM-as-compute path.
+
+## Session log — 2026-09-04: visual side quest, lag + star-look pass
+
+Complaints: render engine lagged; bodies looked like white Blender spheres
+with a haze instead of stars.
+- Lag root cause measured: Direct O(N²) on the render thread, 6.85 ms/accel
+  @N=1500 → ~55 ms/frame at 4 substeps. `Direct::accel` now scoped-thread
+  parallel above N=600 (2.33 ms/accel, maxdiff 3.5e-15, new exactness test);
+  per-frame `Vec` churn removed (reused staging buffers, inline speeds);
+  bloom targets quarter-res.
+- Star look: billboard shader now gaussian core (whitened, 5x HDR) +
+  power-law halo in star color + magnitude-gated diffraction spikes; tonemap
+  Reinhard → ACES.
+- Grid-of-squares artifact: headless probe (`cargo run -p fmms-visual --bin
+  probe -- --mode single|sparse|cluster [--dump]`, PPM out, RTX 4060) showed
+  the 5-tap blur kernel stamping discrete dots — my radius-scaled 2-texel
+  step broke the kernel's overlap assumption. Fix: step pinned to 1 texel,
+  `bloom size` slider now sets pair count 1..3. Verified smooth in probe
+  (single/sparse/cluster renders + bright/blur stage dumps).
+- Probe keeps `GpuState` honest: `target()` now returns texture+view
+  (COPY_SRC added) for readback. `render::tests::shaders_parse` (naga
+  dev-dep) validates all 4 WGSL shaders headless.
+Tests: 3 unit green (`cargo test -p fmms-visual`); app + probe warning-free.
+
+## Session log — 2026-09-04: UniSim-look pass (bloom restraint)
+
+User reference `/mnt/windows_d/unisim/python/max_scale_3d.py::ultra_fast_render`:
+bg (2,2,12), per-star RGB classes, size hierarchy (99% are 1px + dim
+4-neighbor cross only if bright; heroes are flat discs, zero glow), distance
+dimming with floor. No fullscreen bloom pass exists there at all.
+- Ported: `SPACE_BG` hdr clear, mag-gated core width (dim dots filled,
+  heroes structured), quadratic size curve, core whitening 0.82→0.55, core
+  heat 5.0→2.2 so temp colors survive ACES, bg quads halved.
+- Bloom complaint (cotton balls): sprite halo now gated to top ~15%
+  (`smoothstep(0.6,0.95,mag)`, quad 2.5→2.0); post defaults bloom 0.9→0.35,
+  threshold 1.0→1.5 so only multi-pixel hero cores pass the 2x2 box average.
+  Probe-verified smooth; `bloom size` slider = pair count 1..3.
+
+## Session log — 2026-09-04: 100k-body scaling pass
+
+Measured first (`probe --phys`, 12 threads): Direct hopeless at 100k
+(5e9 pairs); FMM 450 ms/eval at science params, 178 ms floor at visual
+params (p=4, eps=1e-2, n_leaf=64; refresh only 4 ms, walk owns the rest;
+16 threads worse than 12, bandwidth-bound). 30k = 57 ms (linear).
+- 1 eval/step: KDK accel cached across steps (new exactness test),
+  ~5.6 steps/s @100k, ~17/s @30k.
+- Physics moved to background thread, snapshots over mpsc; render
+  interpolates stretched over arrival intervals — display stays 60 fps
+  at any step rate (new streaming test).
+- Init O(N²) virial rescale skipped above 5000 (was minutes at 100k).
+- Backend presets by N: Direct ≤1500, FMM(6,1e-4,16) ≤10k,
+  FMM(4,1e-2,64) above; threads capped 12; velocity clamp 5.0 above 20k.
+- Render: 102k billboards measure 0.8–1.3 ms + ~6 MB upload; default
+  point size now scales 1/sqrt(N) (verified no whiteout in probe).
+- dt default 0.01 above 20k bodies (0.004 below), `--dt` overrides.
+
+## Session log — 2026-09-04: GPU-compute FMM kickoff (docs/10-gpu-fmm.md)
+
+Leveraged: docs/03 (M2L-is-the-game, symmetry, fp32), finding
+fnd-8d3e0d6773d4, PERF-ANALYSIS walk split (record 0.44 s vs replay
+5.64 s @1M), toolchain (CUDA 13.3 + RTX 4060 cc8.9 present, chose wgpu).
+Locked: wgpu compute (zero-copy with renderer) over CUDA interop; fp32
+visual-first contract (fp64 CPU path untouched); hybrid CPU-traversal /
+GPU-replay split.
+- S1 done: `visual/src/gpufmm.rs` one-sided M2L (p=4, one thread/pair),
+  `probe --m2l` harness vs fp64 CPU on real octree pairs. Measured:
+  GPU 0.023 µs/pair @500k vs CPU 0.268 µs (11.6x), max rel 1.6e-4.
+  Kernel is latency-bound (~18 GB/s of ~272) — S4 headroom documented.
+- Next: S2 full replay (sort-by-dst + segmented accumulate) + GPU
+  up/down sweeps; gate rel err ~1e-3 vs direct.
+- S2a landed: `record_pairs_par` extracted from `dual_walk_par` (suite +
+  exit gate green); GPU two-kernel replay validated @30k (11.6 ms vs CPU
+  27.3 ms total, rel 5e-4 vs both CPU refs). Kernel still latency-bound
+  (~140 GFLOPS); S4 tuning gates the big win. S2b next: sweeps + P2P.
+
 ## Session log — 2026-08-22: Tier 1 (Units 4–7) iteration (OPTIMIZATION-PLAN.md)
 
 Problem: Tier 0 left the walk at its DRAM floor (~87% of a step); the
