@@ -144,10 +144,11 @@ pub struct Sim {
 enum Backend {
     Direct(Direct),
     Fmm(FmmBackend),
+    Gpu(crate::gpufmm::GpuBackend),
 }
 
 impl Sim {
-    pub fn new(n: usize, dt: f64, use_fmm: bool) -> Self {
+    pub fn new(n: usize, dt: f64, use_fmm: bool, gpu: Option<crate::gpufmm::GpuBackend>) -> Self {
         let parts = plummer(n, [0.0; 3], 42);
         let mut rng = Rng::new(1234);
         let mut pos = Vec::with_capacity(n);
@@ -183,7 +184,9 @@ impl Sim {
         }
         let prev = pos.clone();
         let prev_vel = vel.clone();
-        let backend = if use_fmm || n > 1500 {
+        let backend = if let Some(g) = gpu {
+            Backend::Gpu(g)
+        } else if use_fmm || n > 1500 {
             if n > 10000 {
                 Backend::Fmm(FmmBackend::new(4, 1e-2, 64))
             } else {
@@ -223,6 +226,7 @@ impl Sim {
             None => match &mut self.backend {
                 Backend::Direct(d) => d.accel(&self.pos, &self.mass),
                 Backend::Fmm(f) => f.accel(&self.pos, &self.mass),
+                Backend::Gpu(g) => g.accel(&self.pos, &self.mass),
             },
         };
         for i in 0..self.pos.len() {
@@ -236,6 +240,7 @@ impl Sim {
         let a1 = match &mut self.backend {
             Backend::Direct(d) => d.accel(&self.pos, &self.mass),
             Backend::Fmm(f) => f.accel(&self.pos, &self.mass),
+            Backend::Gpu(g) => g.accel(&self.pos, &self.mass),
         };
         for i in 0..self.pos.len() {
             self.vel[i][0] += a1[i][0] * dt * 0.5;
@@ -377,7 +382,7 @@ mod tests {
 
     #[test]
     fn kdk_advances_finite() {
-        let mut sim = Sim::new(128, 0.004, false);
+        let mut sim = Sim::new(128, 0.004, false, None);
         for _ in 0..3 {
             sim.step();
         }
@@ -435,8 +440,8 @@ mod tests {
 
     #[test]
     fn cached_accel_matches_fresh() {
-        let mut a = Sim::new(64, 0.004, false);
-        let mut b = Sim::new(64, 0.004, false);
+        let mut a = Sim::new(64, 0.004, false, None);
+        let mut b = Sim::new(64, 0.004, false, None);
         for _ in 0..4 {
             a.step();
         }
@@ -456,7 +461,7 @@ mod tests {
     #[test]
     fn large_n_init_skips_virial() {
         let t = std::time::Instant::now();
-        let sim = Sim::new(6000, 0.004, false);
+        let sim = Sim::new(6000, 0.004, false, None);
         assert_eq!(sim.n(), 6000);
         assert!(t.elapsed() < std::time::Duration::from_secs(20));
         for i in 0..sim.n() {
@@ -468,7 +473,7 @@ mod tests {
 
     #[test]
     fn physics_loop_streams_snaps() {
-        let sim = Sim::new(128, 0.004, false);
+        let sim = Sim::new(128, 0.004, false, None);
         let (tx, rx) = std::sync::mpsc::channel();
         let ctl = std::sync::Arc::new(Ctl::new());
         std::thread::spawn(move || physics_loop(sim, tx, ctl));

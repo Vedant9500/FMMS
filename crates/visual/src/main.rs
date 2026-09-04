@@ -1,5 +1,6 @@
 mod camera;
 mod gpu;
+mod gpufmm;
 mod render;
 mod sim;
 
@@ -7,6 +8,7 @@ use camera::{rebase, Camera};
 use gpu::{GpuItem, GpuState, Uniform};
 use sim::{physics_loop, Ctl, Msg, Sim};
 use std::sync::Arc;
+use std::collections::VecDeque;
 use std::time::Instant;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
@@ -18,6 +20,7 @@ struct Args {
     n: usize,
     dt: f64,
     fmm: bool,
+    gpu: bool,
 }
 
 fn parse_args() -> Args {
@@ -25,6 +28,7 @@ fn parse_args() -> Args {
     let mut n = 1500usize;
     let mut dt = None::<f64>;
     let mut fmm = false;
+    let mut gpu = false;
     let mut i = 1;
     while i < a.len() {
         match a[i].as_str() {
@@ -40,11 +44,15 @@ fn parse_args() -> Args {
                 fmm = true;
                 i += 1;
             }
+            "--gpu" => {
+                gpu = true;
+                i += 1;
+            }
             _ => i += 1,
         }
     }
     let dt = dt.unwrap_or(if n > 20000 { 0.01 } else { 0.004 });
-    Args { n, dt, fmm }
+    Args { n, dt, fmm, gpu }
 }
 
 fn post_binds(
@@ -206,18 +214,29 @@ struct App {
     stage_prev: Vec<GpuItem>,
     stage_curr: Vec<GpuItem>,
     stage_bg: Vec<GpuItem>,
-    r0pos: Vec<[f64; 3]>,
-    r1pos: Vec<[f64; 3]>,
-    r0vel: Vec<[f64; 3]>,
-    r1vel: Vec<[f64; 3]>,
     temp: Vec<f32>,
     mag: Vec<f32>,
     body_n: usize,
-    blend: f64,
+    hist: VecDeque<HistSnap>,
     interval_ema: f64,
     last_arrival: Option<Instant>,
     sim_time: f64,
     sim_steps: u64,
+}
+
+/// Render trails physics by this fixed lag and interpolates between
+/// bracketing snaps. Must exceed the slowest step (refresh ~150 ms+ under
+/// render contention); latency is invisible, hunting is impossible.
+const LAG_S: f64 = 0.35;
+/// Snap history cap: must hold lag/mean-interval + margin (~9 at 100k).
+const HIST_CAP: usize = 10;
+/// One physics snapshot with render-side arrival stamp.
+struct HistSnap {
+    pos: Vec<[f64; 3]>,
+    vel: Vec<[f64; 3]>,
+    time: f64,
+    steps: u64,
+    arrival: Instant,
 }
 
 impl App {
@@ -246,14 +265,10 @@ impl App {
             stage_prev: Vec::new(),
             stage_curr: Vec::new(),
             stage_bg: Vec::new(),
-            r0pos: Vec::new(),
-            r1pos: Vec::new(),
-            r0vel: Vec::new(),
-            r1vel: Vec::new(),
             temp: Vec::new(),
             mag: Vec::new(),
             body_n: 0,
-            blend: 1.0,
+            hist: VecDeque::new(),
             interval_ema: 0.25,
             last_arrival: None,
             sim_time: 0.0,
@@ -384,7 +399,12 @@ impl App {
         );
         let egui_renderer =
             egui_wgpu::Renderer::new(&device, format, egui_wgpu::RendererOptions::default());
-        let sim = Sim::new(args.n, args.dt, args.fmm);
+        let gpu_backend = if args.gpu || args.n > 30000 {
+            Some(gpufmm::GpuBackend::new(&device, &queue, 4))
+        } else {
+            None
+        };
+        let sim = Sim::new(args.n, args.dt, args.fmm, gpu_backend);
         gpu_state.n = sim.n();
         let (tx, rx) = std::sync::mpsc::channel();
         let ctl = Arc::new(Ctl::new());
@@ -545,8 +565,9 @@ impl App {
         if real_dt > 0.0 {
             self.fps = self.fps * 0.95 + (1.0 / real_dt.max(1e-6)) as f32 * 0.05;
         }
-        // Drain physics snapshots, keep newest. Stretch each snapshot over
-        // its arrival interval so motion stays smooth at any step rate.
+        // Drain physics snapshots into a short history. Render trails by a
+        // fixed lag and interpolates between bracketing snaps, so bursty
+        // arrivals (slow refresh step + fast frozen steps) render uniformly.
         if let Some(rx) = self.rx.as_ref() {
             while let Ok(msg) = rx.try_recv() {
                 match msg {
@@ -563,62 +584,68 @@ impl App {
                             self.phys_rate = (1.0 / self.interval_ema.max(1e-3)) as f32;
                         }
                         self.last_arrival = Some(arrival);
-                        if self.r1pos.is_empty() {
-                            self.r0pos = s.pos.clone();
-                            self.r0vel = s.vel.clone();
-                            self.r1pos = s.pos;
-                            self.r1vel = s.vel;
-                            self.blend = 1.0;
-                        } else {
-                            let b = self.blend.clamp(0.0, 1.0);
-                            for i in 0..self.r0pos.len().min(s.pos.len()) {
-                                for d in 0..3 {
-                                    self.r0pos[i][d] += (self.r1pos[i][d] - self.r0pos[i][d]) * b;
-                                    self.r0vel[i][d] += (self.r1vel[i][d] - self.r0vel[i][d]) * b;
-                                }
-                            }
-                            self.r1pos = s.pos;
-                            self.r1vel = s.vel;
-                            self.blend = 0.0;
+                        self.hist.push_back(HistSnap {
+                            pos: s.pos,
+                            vel: s.vel,
+                            time: s.time,
+                            steps: s.steps,
+                            arrival,
+                        });
+                        while self.hist.len() > HIST_CAP {
+                            self.hist.pop_front();
                         }
-                        self.sim_time = s.time;
-                        self.sim_steps = s.steps;
+                        if let Some(h) = self.hist.back() {
+                            self.sim_time = h.time;
+                            self.sim_steps = h.steps;
+                        }
                     }
                 }
             }
         }
-        if !self.paused {
-            self.blend = (self.blend + real_dt / self.interval_ema.max(1e-3)).min(1.0);
+        // Bracket render time between snaps; hold newest on gaps/startup.
+        // Fixed lag (EMA drives the phys-rate readout only): an adaptive
+        // lag hunts bursty arrivals with a ~10-snap time constant.
+        let rt = now - std::time::Duration::from_secs_f64(if self.paused { 0.0 } else { LAG_S });
+        while self.hist.len() >= 2 && self.hist[1].arrival <= rt {
+            self.hist.pop_front();
         }
+        let (p0, p1, v0, v1, alpha) = match (self.hist.front(), self.hist.get(1)) {
+            (Some(a), Some(b)) => {
+                let span = (b.arrival - a.arrival).as_secs_f64().max(1e-6);
+                let t = ((rt - a.arrival).as_secs_f64() / span).clamp(0.0, 1.0);
+                (&a.pos[..], &b.pos[..], &a.vel[..], &b.vel[..], t)
+            }
+            (Some(a), None) => (&a.pos[..], &a.pos[..], &a.vel[..], &a.vel[..], 1.0),
+            (None, _) => (&[][..], &[][..], &[][..], &[][..], 1.0),
+        };
 
         let gfx = self.gfx.as_mut().unwrap();
         let eye = self.camera.eye();
-        let n = self.body_n.min(self.r1pos.len());
-        let alpha = self.blend.clamp(0.0, 1.0) as f32;
+        let n = self.body_n.min(p0.len().min(p1.len()));
         self.stage_prev.clear();
         self.stage_curr.clear();
         self.stage_prev.reserve(n);
         self.stage_curr.reserve(n);
         for i in 0..n {
-            let a = alpha as f64;
-            let p0 = self.r0pos[i];
-            let p1 = self.r1pos[i];
-            let v0 = self.r0vel[i];
-            let v1 = self.r1vel[i];
+            let a = alpha;
+            let q0 = p0[i];
+            let q1 = p1[i];
+            let u0 = v0[i];
+            let u1 = v1[i];
             let w = [
-                p0[0] + (p1[0] - p0[0]) * a,
-                p0[1] + (p1[1] - p0[1]) * a,
-                p0[2] + (p1[2] - p0[2]) * a,
+                q0[0] + (q1[0] - q0[0]) * a,
+                q0[1] + (q1[1] - q0[1]) * a,
+                q0[2] + (q1[2] - q0[2]) * a,
             ];
             let v = [
-                v0[0] + (v1[0] - v0[0]) * a,
-                v0[1] + (v1[1] - v0[1]) * a,
-                v0[2] + (v1[2] - v0[2]) * a,
+                u0[0] + (u1[0] - u0[0]) * a,
+                u0[1] + (u1[1] - u0[1]) * a,
+                u0[2] + (u1[2] - u0[2]) * a,
             ];
-            let psp = (v0[0] * v0[0] + v0[1] * v0[1] + v0[2] * v0[2]).sqrt() as f32;
+            let psp = (u0[0] * u0[0] + u0[1] * u0[1] + u0[2] * u0[2]).sqrt() as f32;
             let sp = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt() as f32;
             self.stage_prev.push(GpuItem {
-                pos: rebase(&p0, &eye),
+                pos: rebase(&q0, &eye),
                 speed: psp,
                 misc: [self.temp[i], self.mag[i], 0.0, 0.0],
             });

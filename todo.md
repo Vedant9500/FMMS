@@ -90,6 +90,39 @@ GPU-replay split.
   exit gate green); GPU two-kernel replay validated @30k (11.6 ms vs CPU
   27.3 ms total, rel 5e-4 vs both CPU refs). Kernel still latency-bound
   (~140 GFLOPS); S4 tuning gates the big win. S2b next: sweeps + P2P.
+- S2b landed: 5 sweep/P2P kernels + `--gpufull` triangle harness
+  (gpu-vs-direct, gpu-vs-cpufmm, cpufmm-vs-direct). @8k/p6: mean vs direct
+  5.9e-4 (gate green), pipeline-exact vs CPU-FMM at p4 (8e-6 max).
+  Shared-uniform-across-dispatches footgun documented in code. Next: S3
+  engine integration, then S4 (symmetry/shared-mem + f64 P2P distances).
+- S3 landed: `GpuBackend` in Sim (`--gpu`, auto >30k), K=4 frozen-tree
+  reuse validated (`--gpureuse`: frozen mean = truncation floor).
+  `--gpuloop`: 100k 11.9 steps/s vs CPU 5.8 (2x); 30k 35.7/s. Slot→id
+  scatter bug caught by validation. 15 visual tests green, warning-free.
+- S4 landed: profile-driven, plan overturned by measurement (`--gpuprof`).
+  m2l-red thread-per-(cell,coef) 21.4→1.9ms; P2P per-leaf shared-tile
+  20→11.9ms; fat-halo split (12 leaves/39% iters) →2.3ms total.
+  `--gpuloop`: 100k 25.6 steps/s (4.4x CPU), 30k 51.7/s. Triangle green,
+  19 visual tests green, warning-free. Wall now CPU traversal (~27ms
+  amortized) — S5 territory. Skipped by Amdahl: S1 mutual/hoist,
+  Kohnke symmetry (no stencil in adaptive octree), DS-P2P distances.
+- App polish: fixed harness-only dead_code warnings (`submit`/`stats`/
+  `profile_step`); render now trails physics by a fixed lag (4x arrival
+  EMA, 0.1–0.6 s) interpolating between bracketing snaps instead of
+  stretching each snap over the EMA — K=4 refresh makes arrivals bursty
+  (slow refresh + 3 fast), old scheme froze at blend=1 between snaps.
+  Segfault triage via coredumpctl: crash is smithay-clipboard's worker
+  racing Wayland teardown inside `wl_proxy_destroy` (pre-existing, 7+
+  dumps incl. pre-S4, both x11/wayland backends — clipboard lib drives
+  its own Wayland connection). App has no text inputs, so the OS
+  clipboard is dead weight: `egui-winit` now `default-features = false
+  + wayland,x11` (drops clipboard/links; in-app fallback covers the
+  unused copy/paste). arboard+smithay fully out of the tree; 5-min
+  100k soak pending.
+- Render lag is now a 0.35 s constant (EMA drives the readout only):
+  per-step probe timing shows arrivals [17,17,17,140]ms, and in-app
+  render contention stretches the refresh gap past any EMA-derived lag,
+  starving the bracket every 4th step. History cap 10.
 
 ## Session log — 2026-08-22: Tier 1 (Units 4–7) iteration (OPTIMIZATION-PLAN.md)
 

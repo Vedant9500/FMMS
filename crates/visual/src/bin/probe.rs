@@ -409,7 +409,7 @@ fn m2lacc_bench(device: &wgpu::Device, queue: &wgpu::Queue) {
         let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("acc-red"), timestamp_writes: None });
         pass.set_pipeline(&red_pipe);
         pass.set_bind_group(0, &red_bind, &[]);
-        pass.dispatch_workgroups((ncells as u32).div_ceil(64), 1, 1);
+        pass.dispatch_workgroups(((ncells * d) as u32).div_ceil(64), 1, 1);
     }
     let rb = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("acc-rb"),
@@ -530,28 +530,11 @@ fn gpufull_bench(device: &wgpu::Device, queue: &wgpu::Queue, n: usize, reference
         cursors[a as usize] += 1;
     }
 
-    // P2P neighbor-leaf lists (shared per leaf, referenced per body).
-    let mut partners: Vec<Vec<u32>> = vec![Vec::new(); ncells];
-    for &(a, b) in &rec.p2p {
-        partners[a as usize].push(b);
-        if a != b {
-            partners[b as usize].push(a);
-        }
-    }
-    let mut nstart = vec![0u32; nslots];
-    let mut ncount = vec![0u32; nslots];
-    let mut nlist = Vec::new();
-    for &l in &leaf_ids {
-        let c = l as usize;
-        let base = nlist.len() as u32;
-        nlist.extend_from_slice(&partners[c]);
-        for k in tree.cells[c].first..tree.cells[c].first + tree.cells[c].count {
-            nstart[k] = base;
-            ncount[k] = partners[c].len() as u32;
-        }
-    }
-    println!("gpufull n={n}: cells={ncells} leaves={} m2l={} directed={total} p2pranges={} record={record_ms:.1}ms",
-        leaf_ids.len(), rec.pairs.len(), nlist.len());
+    // P2P partner-body CSR per leaf ordinal (tiled kernel) + fat split.
+    let mut pb = gpufmm::build_p2p_bodies(&rec.p2p, ncells, &leaf_ids, &cfirst, &ccount);
+    let fj = gpufmm::split_fat(&mut pb, &leaf_ids, &cfirst, &ccount, gpufmm::FAT_THR, gpufmm::FAT_CHUNK);
+    println!("gpufull n={n}: cells={ncells} leaves={} m2l={} directed={total} p2pbodies={} record={record_ms:.1}ms",
+        leaf_ids.len(), rec.pairs.len(), pb.list.len());
 
     // GPU buffers.
     use wgpu::util::DeviceExt;
@@ -597,9 +580,20 @@ fn gpufull_bench(device: &wgpu::Device, queue: &wgpu::Queue, n: usize, reference
     });
     let gs_buf = sbuf("g-gstart", bytemuck::cast_slice(&starts));
     let gc_buf = sbuf("g-gcount", bytemuck::cast_slice(&counts));
-    let ns_buf = sbuf("g-nstart", bytemuck::cast_slice(&nstart));
-    let nc_buf = sbuf("g-ncount", bytemuck::cast_slice(&ncount));
-    let nl_buf = sbuf("g-nlist", bytemuck::cast_slice(&nlist));
+    let pbs_buf = sbuf("g-pbstart", bytemuck::cast_slice(&pb.start));
+    let pbc_buf = sbuf("g-pbcount", bytemuck::cast_slice(&pb.count));
+    let pbl_buf = sbuf("g-pblist", bytemuck::cast_slice(&pb.list));
+    let fjs_buf = sbuf("g-fjob-s0", bytemuck::cast_slice(&fj.job_s0));
+    let fjc_buf = sbuf("g-fjob-cc", bytemuck::cast_slice(&fj.job_cc));
+    let fjo_buf = sbuf("g-fjob-o", bytemuck::cast_slice(&fj.job_off));
+    let fjn_buf = sbuf("g-fjob-n", bytemuck::cast_slice(&fj.job_len));
+    let fscr_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("g-fscr"), size: (fj.njobs.max(1) * 64 * 16) as u64,
+        usage: wgpu::BufferUsages::STORAGE, mapped_at_creation: false,
+    });
+    let ffs_buf = sbuf("g-ffstart", bytemuck::cast_slice(&fj.fat_start));
+    let ffc_buf = sbuf("g-ffcf", bytemuck::cast_slice(&fj.fat_cf));
+    let ffx_buf = sbuf("g-ffcc", bytemuck::cast_slice(&fj.fat_cc));
     let bind2 = |layout: &wgpu::BindGroupLayout, bufs: &[&wgpu::Buffer]| {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("g-bind"),
@@ -612,15 +606,19 @@ fn gpufull_bench(device: &wgpu::Device, queue: &wgpu::Queue, n: usize, reference
     };
 
     let p2m_l = gpufmm::sweep_layout(device, "p2m", 6, 5);
-    let p2m_p = gpufmm::sweep_pipeline(device, "p2m", &gpufmm::p2m_source(p), &p2m_l);
+    let p2m_p = gpufmm::sweep_pipeline(device, "p2m", &gpufmm::p2m_source(p as u32), &p2m_l);
     let m2m_l = gpufmm::sweep_layout(device, "m2m", 4, 0);
-    let m2m_p = gpufmm::sweep_pipeline(device, "m2m", &gpufmm::m2m_source(p), &m2m_l);
+    let m2m_p = gpufmm::sweep_pipeline(device, "m2m", &gpufmm::m2m_source(p as u32), &m2m_l);
     let l2l_l = gpufmm::sweep_layout(device, "l2l", 4, 0);
-    let l2l_p = gpufmm::sweep_pipeline(device, "l2l", &gpufmm::l2l_source(p), &l2l_l);
+    let l2l_p = gpufmm::sweep_pipeline(device, "l2l", &gpufmm::l2l_source(p as u32), &l2l_l);
     let l2p_l = gpufmm::sweep_layout(device, "l2p", 5, 4);
-    let l2p_p = gpufmm::sweep_pipeline(device, "l2p", &gpufmm::l2p_source(p), &l2p_l);
-    let p2p_l = gpufmm::sweep_layout(device, "p2p", 7, 6);
-    let p2p_p = gpufmm::sweep_pipeline(device, "p2p", &gpufmm::p2p_source(p), &p2p_l);
+    let l2p_p = gpufmm::sweep_pipeline(device, "l2p", &gpufmm::l2p_source(p as u32), &l2p_l);
+    let p2p_l = gpufmm::sweep_layout(device, "p2p", 8, 7);
+    let p2p_p = gpufmm::sweep_pipeline(device, "p2p", &gpufmm::p2p_source(p as u32), &p2p_l);
+    let fat_l = gpufmm::sweep_layout(device, "fat", 7, 6);
+    let fat_p = gpufmm::sweep_pipeline(device, "fat", &gpufmm::fat_p2p_source(), &fat_l);
+    let fatred_l = gpufmm::sweep_layout(device, "fatred", 5, 4);
+    let fatred_p = gpufmm::sweep_pipeline(device, "fatred", &gpufmm::fat_red_source(), &fatred_l);
     let s1_l = gpufmm::m2l_layout(device);
     let s1_p = gpufmm::m2l_pipeline(device, &s1_l);
     let red_l = gpufmm::m2l_red_layout(device);
@@ -669,7 +667,7 @@ fn gpufull_bench(device: &wgpu::Device, queue: &wgpu::Queue, n: usize, reference
     pass(&mut enc, "m2ls1", &s1_p, &s1_l, &[&mom_buf, &gsrc_buf, &gr_buf, &slots_buf],
         &[0u32, d as u32, total as u32, 0u32], total.max(1) as u32, &mut keepalive, &mut keepbind);
     pass(&mut enc, "m2lred", &red_p, &red_l, &[&slots_buf, &gs_buf, &gc_buf, &loc_buf],
-        &[ncells as u32, d as u32, 0u32, 0u32], ncells as u32, &mut keepalive, &mut keepbind);
+        &[ncells as u32, d as u32, 0u32, 0u32], (ncells * d) as u32, &mut keepalive, &mut keepbind);
     for l in 0..nlevels {
         let lo = level_off[l];
         let ct = level_off[l + 1] - lo;
@@ -680,8 +678,12 @@ fn gpufull_bench(device: &wgpu::Device, queue: &wgpu::Queue, n: usize, reference
     }
     pass(&mut enc, "l2p", &l2p_p, &l2p_l, &[&pos_buf, &cos_buf, &cen_buf, &loc_buf, &acc_buf],
         &[d as u32, nslots as u32, 0, 0], nslots as u32, &mut keepalive, &mut keepbind);
-    pass(&mut enc, "p2p", &p2p_p, &p2p_l, &[&pos_buf, &ns_buf, &nc_buf, &nl_buf, &cf_buf, &cc_buf, &acc_buf],
-        &[nslots as u32, 0, 0, 0], nslots as u32, &mut keepalive, &mut keepbind);
+    pass(&mut enc, "p2p", &p2p_p, &p2p_l, &[&pos_buf, &leaf_buf, &cf_buf, &cc_buf, &pbs_buf, &pbc_buf, &pbl_buf, &acc_buf],
+        &[leaf_ids.len() as u32, 0, 0, 0], leaf_ids.len() as u32 * 64, &mut keepalive, &mut keepbind);
+    pass(&mut enc, "fat", &fat_p, &fat_l, &[&pos_buf, &fjs_buf, &fjc_buf, &fjo_buf, &fjn_buf, &pbl_buf, &fscr_buf],
+        &[fj.njobs as u32, 0, 0, 0], fj.njobs as u32 * 64, &mut keepalive, &mut keepbind);
+    pass(&mut enc, "fatred", &fatred_p, &fatred_l, &[&fscr_buf, &ffs_buf, &ffc_buf, &ffx_buf, &acc_buf],
+        &[fj.nfat as u32, 0, 0, 0], fj.nfat as u32 * 64, &mut keepalive, &mut keepbind);
     let rb = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("g-rb"), size: (nslots * 16) as u64,
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false,
@@ -766,6 +768,102 @@ fn rel_err_fmm_direct(fa: &[[f64; 3]], da: &[[f64; 3]], n: usize) -> (f64, f64) 
     (max_rel, sum_rel / n as f64)
 }
 
+fn gpuloop_bench(device: &wgpu::Device, queue: &wgpu::Queue, n: usize, steps: usize) {
+    let parts = fmm::models::plummer(n, [0.0; 3], 42);
+    let pos: Vec<[f64; 3]> = parts.iter().map(|p| p.pos).collect();
+    let mass: Vec<f64> = parts.iter().map(|p| p.mass).collect();
+    let mut be = gpufmm::GpuBackend::new(device, queue, 4);
+    be.accel(&pos, &mass);
+    let t = std::time::Instant::now();
+    let mut per = Vec::with_capacity(steps);
+    for _ in 0..steps {
+        let s = std::time::Instant::now();
+        be.accel(&pos, &mass);
+        per.push(s.elapsed().as_secs_f64() * 1000.0);
+    }
+    let ms = t.elapsed().as_secs_f64() * 1000.0 / steps as f64;
+    println!("gpuloop n={n} steps={steps} k=4: {ms:.1} ms/step = {:.1} steps/s", 1000.0 / ms);
+    if steps <= 16 {
+        let s: Vec<String> = per.iter().map(|v| format!("{v:.0}")).collect();
+        println!("  per-step ms: {}", s.join(" "));
+    }
+}
+
+fn gpuprof_bench(device: &wgpu::Device, queue: &wgpu::Queue, n: usize, reps: usize) {
+    let parts = fmm::models::plummer(n, [0.0; 3], 42);
+    let pos: Vec<[f64; 3]> = parts.iter().map(|p| p.pos).collect();
+    let mass: Vec<f64> = parts.iter().map(|p| p.mass).collect();
+    let mut be = gpufmm::GpuBackend::new(device, queue, u64::MAX);
+    be.accel_with_refresh(&pos, &mass, true);
+    let (ncells, total, nleaf, nlevels, nlist) = be.stats();
+    let (mcc, avgcc, mt, at, mx) = be.p2p_dist();
+    println!("gpuprof n={n}: cells={ncells} leaves={nleaf} levels={nlevels} directed={total} p2pnlist={nlist}");
+    println!("  leaf cc: max={mcc} avg={avgcc:.1} | partners: max={mt} avg={at:.0} | max prod={mx}");
+    let (nl, nb, ni) = be.fat_census();
+    println!("  fat-split: leaves={nl} bodies={nb} iters={ni}");
+    println!("f64: {} timestamp: {}", device.features().contains(wgpu::Features::SHADER_F64),
+        device.features().contains(wgpu::Features::TIMESTAMP_QUERY));
+    let mut best: Vec<(&str, f64)> = be.profile_step(&pos, &mass).into_iter().map(|(k, _)| (k, f64::MAX)).collect();
+    for _ in 0..reps {
+        for (i, (k, v)) in be.profile_step(&pos, &mass).into_iter().enumerate() {
+            if v < best[i].1 {
+                best[i] = (k, v);
+            }
+        }
+    }
+    let sum: f64 = best.iter().map(|(_, v)| v).sum();
+    for (k, v) in &best {
+        println!("  {k:8} {v:7.2} ms ({:.0}%)", 100.0 * v / sum.max(1e-9));
+    }
+    println!("  {:8} {sum:.2} ms split-total", "sum");
+}
+
+fn gpureuse_check(device: &wgpu::Device, queue: &wgpu::Queue, k: u64) {
+    let n = 30000usize;
+    let parts = fmm::models::plummer(n, [0.0; 3], 42);
+    let pos0: Vec<[f64; 3]> = parts.iter().map(|p| p.pos).collect();
+    let mass: Vec<f64> = parts.iter().map(|p| p.mass).collect();
+    // Random-walk drift proxy: K steps x N(0, 0.007) per dim (~v*dt per step).
+    let mut rng = fmm::models::Rng::new(5);
+    let gauss = |rng: &mut fmm::models::Rng| {
+        let u1 = rng.unit().max(1e-12);
+        let u2 = rng.unit();
+        (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos() * 0.007
+    };
+    let mut pos = pos0.clone();
+    for _ in 0..k {
+        for p in pos.iter_mut() {
+            for d in 0..3 {
+                p[d] += gauss(&mut rng);
+            }
+        }
+    }
+    let mut be = gpufmm::GpuBackend::new(device, queue, u64::MAX);
+    let a_fresh = be.accel_with_refresh(&pos, &mass, true);
+    let mut be2 = gpufmm::GpuBackend::new(device, queue, u64::MAX);
+    be2.accel_with_refresh(&pos0, &mass, true);
+    let a_frozen = be2.accel_with_refresh(&pos, &mass, false);
+    let fmm = fmm::fmm::Fmm::new(
+        &pos.iter().zip(mass.iter()).map(|(p, m)| fmm::models::Particle { mass: *m, pos: *p }).collect::<Vec<_>>(),
+        4, 1e-2, 64,
+    );
+    let tmp_parts: Vec<fmm::models::Particle> = pos.iter().zip(mass.iter())
+        .map(|(p, m)| fmm::models::Particle { mass: *m, pos: *p }).collect();
+    let out = fmm.run_threaded(&tmp_parts, 12);
+    let cmp = |name: &str, a: &[[f64; 3]], b: &[[f64; 3]]| {
+        let (mut mx, mut sm) = (0.0f64, 0.0f64);
+        for i in 0..n {
+            let e = ((a[i][0] - b[i][0]).powi(2) + (a[i][1] - b[i][1]).powi(2) + (a[i][2] - b[i][2]).powi(2)).sqrt();
+            let m = (b[i][0].powi(2) + b[i][1].powi(2) + b[i][2].powi(2)).sqrt().max(1e-9);
+            mx = mx.max(e / m);
+            sm += e / m;
+        }
+        println!("{name}: max={mx:e} mean={:e}", sm / n as f64);
+    };
+    cmp("frozen-K vs cpu-fmm-fresh", &a_frozen, &out.accel);
+    cmp("fresh-gpu vs cpu-fmm-fresh", &a_fresh, &out.accel);
+}
+
 fn phys_bench(n: usize, p: usize, eps: f64, n_leaf: usize, iters: usize, nt: usize) {
     let parts = fmm::models::plummer(n, [0.0; 3], 42);
     let mut f = fmm::fmm::Fmm::new(&parts, p, eps, n_leaf);
@@ -811,7 +909,10 @@ fn main() {
     let mut dump_stages = false;
     let mut m2l_mode: Option<usize> = None;
     let mut m2lacc_mode = false;
-    let mut gpufull_mode: Option<(usize, String)> = None;
+    let mut gpufull_mode: Option<(usize, String, usize, f64)> = None;
+    let mut gpuloop_mode: Option<(usize, usize)> = None;
+    let mut gpuprof_mode: Option<(usize, usize)> = None;
+    let mut gpureuse_mode: Option<u64> = None;
     let mut count = 1500usize;
     let mut point_size = 0.035f32;
     let mut i = 1;
@@ -886,7 +987,26 @@ fn main() {
             "--gpufull" => {
                 let nn: usize = a.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(8192);
                 let rf: String = a.get(i + 2).cloned().unwrap_or("direct".to_string());
-                gpufull_mode = Some((nn, rf));
+                let pp: usize = a.get(i + 3).and_then(|s| s.parse().ok()).unwrap_or(4);
+                let ee: f64 = a.get(i + 4).and_then(|s| s.parse().ok()).unwrap_or(0.01);
+                gpufull_mode = Some((nn, rf, pp, ee));
+                i += 5;
+            }
+            "--gpuloop" => {
+                let nn: usize = a.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(100000);
+                let st: usize = a.get(i + 2).and_then(|s| s.parse().ok()).unwrap_or(8);
+                gpuloop_mode = Some((nn, st));
+                i += 3;
+            }
+            "--gpureuse" => {
+                let kk: u64 = a.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(4);
+                gpureuse_mode = Some(kk);
+                i += 2;
+            }
+            "--gpuprof" => {
+                let nn: usize = a.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(100000);
+                let rr: usize = a.get(i + 2).and_then(|s| s.parse().ok()).unwrap_or(5);
+                gpuprof_mode = Some((nn, rr));
                 i += 3;
             }
             _ => i += 1,
@@ -920,8 +1040,20 @@ fn main() {
         m2lacc_bench(&device, &queue);
         return;
     }
-    if let Some((nn, rf)) = gpufull_mode {
-        gpufull_bench(&device, &queue, nn, &rf);
+    if let Some((nn, rf, pp, ee)) = gpufull_mode {
+        gpufull_bench(&device, &queue, nn, &rf, pp, ee);
+        return;
+    }
+    if let Some((nn, st)) = gpuloop_mode {
+        gpuloop_bench(&device, &queue, nn, st);
+        return;
+    }
+    if let Some((nn, rr)) = gpuprof_mode {
+        gpuprof_bench(&device, &queue, nn, rr);
+        return;
+    }
+    if let Some(kk) = gpureuse_mode {
+        gpureuse_check(&device, &queue, kk);
         return;
     }
 

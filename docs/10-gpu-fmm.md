@@ -33,15 +33,53 @@
   the GPU (~500 threads, 33.7 ms); two-kernel S1-slots + segmented reduce
   fixed it. Parity, not victory: kernel runs ~140 GFLOPS (1% of peak,
   latency-bound Θ recursion) — S4 now gates the real win.
-- [ ] **S2b — GPU sweeps + P2P.** P2M/M2M upsweep, L2L/L2P downsweep
-  level-sweep kernels; near-field P2P kernel. Gate: full-eval rel err
-  ~1e-3 vs direct.
-- [ ] **S3 — visual-engine integration.** `GpuBackend` behind `Physics`
-  (or parallel to it): CPU tree build (4 ms @100k, keep) + traversal,
-  GPU resident moments/locals, download accels only.
-- [ ] **S4 — kernel tuning.** Shared-mem tiling across pairs sharing a
-  source cell, Kohnke symmetry classes (docs/03 §2.1), occupancy sweep.
-  Target: saturate VRAM bandwidth on replay.
+- [x] **S2b — GPU sweeps + P2P** (`WGSL_HELPERS` shared Υ-table prelude,
+  `p2m/m2m/l2l/l2p/p2p_source(p)` generators, `probe --gpufull N ref p eps`).
+  Full eval @8k/p6/eps=1e-4: GPU 40 ms; **gpu-vs-cpu-fmm max 8.2e-6 (p4)
+  / 3.2e-2 max tails (p6)**; **mean vs direct 5.9e-4 — gate green**.
+  @30k/loose: GPU 27.4 ms vs CPU 61.6 ms (2.2x end-to-end incl. 13 ms CPU
+  record), pipeline agreement max 2.7e-5. Caught en route: a shared uniform
+  rewritten between dispatches silently broadcasts the last value to every
+  pass (all writes land pre-submit) — per-dispatch uniform buffers now.
+  Known tail: fp32 close-encounter pairs (max 3e-2); S4 fix = f64/HiGPUs
+  distances in P2P.
+- [x] **S3 — visual-engine integration.** `GpuBackend` (visual preset
+  p=4/eps=1e-2/nl=64) behind `sim::Physics`, `--gpu` flag + auto above
+  30k. Temporal coherence: tree + interaction lists refresh every K=4
+  steps, positions upload fresh, moments/locals recompute on GPU, accels
+  download only (~2 MB/step). `probe --gpuloop`: **100k @ 83.9 ms/step
+  (11.9 steps/s) vs CPU 172 ms (5.8/s) — 2x**; 30k @ 28 ms (35.7/s).
+  `probe --gpureuse`: frozen-K4 mean 4.9e-3 = truncation floor (adds
+  nothing); fresh-vs-CPU max 1.8e-5. Caught en route: backend returned
+  slot order, Sim needs particle-id order — scatter added (was a dynamics
+  bug). Remaining wall: CPU traversal ~55 ms (prepass+record) even
+  amortized; S4/S5 territory.
+- [x] **S4 — kernel tuning** (measured, not as planned — the profile
+  overturned the plan). `probe --gpuprof` (isolated submit+poll per stage;
+  no timestamp queries on this adapter) @100k showed M2L-s1 healthy
+  (~640 GFLOPS) but **m2l-red 21.4 ms (42%) + p2p 20.0 ms (39%)**:
+  - m2l-red was thread-per-cell (6143 threads, serial DIM chains) →
+    thread-per-(cell, coef), 153k threads, contiguous slot reads:
+    **21.4 → 1.9 ms (11x)**.
+  - P2P thread-per-body → per-leaf workgroup, partner tile in 10 KB
+    shared mem (chunked ×512, any size): 20.0 → 11.9 ms.
+  - Census then showed the real pathology: 12 halo leaves (lone bodies
+    in huge cells fail MAC vs everything) hold 100k partners each —
+    39% of P2P iters in 0.37% of bodies, serial 100k-chains as the
+    occupancy tail. Fix: `split_fat` (>4096 partners → 2048-slice jobs,
+    one WG each, scratch partials + reduce; 7 storage bindings to fit
+    the adapter's 8/stage limit): **P2P → 2.3 ms total (7x)**.
+  - End-to-end `--gpuloop`: **100k 39.0 ms/step (25.6/s) vs S3 83.9
+    (11.9/s) vs CPU 172 (5.8/s) — 2.1x on S3, 4.4x on CPU**; 30k
+    19.3 ms (51.7/s). Triangle unchanged (mean 5.86e-4; p4 vs CPU-FMM
+    max 8.5e-6; frozen-K4 still on truncation floor).
+  - Deliberately NOT done: S1 mutual-kernel halving / reciprocal hoist
+    (s1 is 6% — Amdahl says no), Kohnke symmetry classes (adaptive
+    octree has no 189-stencil to symmetrize; the planned shared-mem
+    M2L tiling died to measurement — s1 was never the wall), P2P
+    double-single distances (fp32 max-tail 3e-2 stands; SHADER_F64
+    absent, DS upload is S5 scope). Remaining wall is CPU traversal
+    (~27 ms amortized) — S5 (GPU traversal) territory.
 
 ## Notes
 
