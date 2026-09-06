@@ -497,7 +497,9 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
         accel[own_s[i]] += acc[i];
     }}
 }}
-"#, wg = P2P_WG)
+"#,
+        wg = P2P_WG
+    )
 }
 
 pub fn sweep_layout(
@@ -785,7 +787,13 @@ pub fn group_m2l(pairs: &[(u32, u32)], ncells: usize) -> M2lGroups {
         gdst[cursors[a as usize] as usize] = a;
         cursors[a as usize] += 1;
     }
-    M2lGroups { gsrc, gdst, starts, counts, total }
+    M2lGroups {
+        gsrc,
+        gdst,
+        starts,
+        counts,
+        total,
+    }
 }
 
 /// Flat partner-body CSR per leaf ordinal for the tiled P2P kernel.
@@ -819,7 +827,9 @@ pub fn build_p2p_bodies(
     for (w, &l) in leaf_ids.iter().enumerate() {
         start[w] = list.len() as u32;
         for &q in &partners[l as usize] {
-            for k in leaf_first[q as usize] as usize..(leaf_first[q as usize] + leaf_count[q as usize]) as usize {
+            for k in leaf_first[q as usize] as usize
+                ..(leaf_first[q as usize] + leaf_count[q as usize]) as usize
+            {
                 list.push(k as u32);
             }
         }
@@ -891,7 +901,19 @@ pub fn split_fat(
     }
     fat_start.push(job_s0.len() as u32);
     let (nfat, njobs) = (fat_cf.len(), job_s0.len());
-    FatJobs { job_s0, job_cc, job_off, job_len, fat_start, fat_cf, fat_cc, nfat, njobs, bodies, iters }
+    FatJobs {
+        job_s0,
+        job_cc,
+        job_off,
+        job_len,
+        fat_start,
+        fat_cf,
+        fat_cc,
+        nfat,
+        njobs,
+        bodies,
+        iters,
+    }
 }
 
 /// One workgroup per fat job: tile one partner slice, partial sums per own
@@ -1061,7 +1083,16 @@ pub fn cell_tables(tree: &Octree, nslots: usize) -> CellTables {
             cell_of_slot[k] = l;
         }
     }
-    CellTables { centers, cfirst, ccount, children, leaf_ids, level_cells, level_off, cell_of_slot }
+    CellTables {
+        centers,
+        cfirst,
+        ccount,
+        children,
+        leaf_ids,
+        level_cells,
+        level_off,
+        cell_of_slot,
+    }
 }
 
 fn nthreads() -> usize {
@@ -1182,9 +1213,24 @@ impl GpuBackend {
         }
     }
 
-    fn ensure(&mut self, ncells: usize, nslots: usize, total: usize, pbl: usize, fjobs: usize, nfat: usize) {
+    fn ensure(
+        &mut self,
+        ncells: usize,
+        nslots: usize,
+        total: usize,
+        pbl: usize,
+        fjobs: usize,
+        nfat: usize,
+    ) {
         let ok = match &self.bufs {
-            Some(b) => ncells <= b.cap_cells && nslots <= b.cap_slots && total <= b.cap_pairs && pbl <= b.cap_pbl && fjobs <= b.cap_fjobs && nfat <= b.cap_nfat,
+            Some(b) => {
+                ncells <= b.cap_cells
+                    && nslots <= b.cap_slots
+                    && total <= b.cap_pairs
+                    && pbl <= b.cap_pbl
+                    && fjobs <= b.cap_fjobs
+                    && nfat <= b.cap_nfat
+            }
             None => false,
         };
         if ok {
@@ -1205,38 +1251,98 @@ impl GpuBackend {
             cf: mk("b-cf", (ncells * 4) as u64, wgpu::BufferUsages::COPY_DST),
             cc: mk("b-cc", (ncells * 4) as u64, wgpu::BufferUsages::COPY_DST),
             ch: mk("b-ch", (ncells * 32) as u64, wgpu::BufferUsages::COPY_DST),
-            leaves: mk("b-leaves", (ncells * 4) as u64, wgpu::BufferUsages::COPY_DST),
-            levels: mk("b-levels", (ncells * 4) as u64, wgpu::BufferUsages::COPY_DST),
-            cos: mk("b-cos", (nslots * 4) as u64, wgpu::BufferUsages::COPY_DST),
-            mom: mk("b-mom", (ncells * d * 8) as u64, wgpu::BufferUsages::empty()),
-            loc: mk("b-loc", (ncells * d * 8) as u64, wgpu::BufferUsages::empty()),
-            acc: mk(
-                "b-acc",
-                (nslots * 16) as u64,
-                wgpu::BufferUsages::COPY_SRC,
+            leaves: mk(
+                "b-leaves",
+                (ncells * 4) as u64,
+                wgpu::BufferUsages::COPY_DST,
             ),
+            levels: mk(
+                "b-levels",
+                (ncells * 4) as u64,
+                wgpu::BufferUsages::COPY_DST,
+            ),
+            cos: mk("b-cos", (nslots * 4) as u64, wgpu::BufferUsages::COPY_DST),
+            mom: mk(
+                "b-mom",
+                (ncells * d * 8) as u64,
+                wgpu::BufferUsages::empty(),
+            ),
+            loc: mk(
+                "b-loc",
+                (ncells * d * 8) as u64,
+                wgpu::BufferUsages::empty(),
+            ),
+            acc: mk("b-acc", (nslots * 16) as u64, wgpu::BufferUsages::COPY_SRC),
             rb: self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("b-rb"),
                 size: ((nslots * 16) as u64).max(16),
                 usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                 mapped_at_creation: false,
             }),
-            gsrc: mk("b-gsrc", (total.max(1) * 4) as u64, wgpu::BufferUsages::COPY_DST),
-            gr: mk("b-gr", (total.max(1) * 16) as u64, wgpu::BufferUsages::COPY_DST),
-            slots: mk("b-slots", (total.max(1) * d * 8) as u64, wgpu::BufferUsages::empty()),
+            gsrc: mk(
+                "b-gsrc",
+                (total.max(1) * 4) as u64,
+                wgpu::BufferUsages::COPY_DST,
+            ),
+            gr: mk(
+                "b-gr",
+                (total.max(1) * 16) as u64,
+                wgpu::BufferUsages::COPY_DST,
+            ),
+            slots: mk(
+                "b-slots",
+                (total.max(1) * d * 8) as u64,
+                wgpu::BufferUsages::empty(),
+            ),
             gs: mk("b-gs", (ncells * 4) as u64, wgpu::BufferUsages::COPY_DST),
             gc: mk("b-gc", (ncells * 4) as u64, wgpu::BufferUsages::COPY_DST),
             pbs: mk("b-pbs", (ncells * 4) as u64, wgpu::BufferUsages::COPY_DST),
             pbc: mk("b-pbc", (ncells * 4) as u64, wgpu::BufferUsages::COPY_DST),
-            pbl: mk("b-pbl", (pbl.max(1) * 4) as u64, wgpu::BufferUsages::COPY_DST),
-            fjob_s0: mk("b-fjob-s0", (fjobs.max(1) * 4) as u64, wgpu::BufferUsages::COPY_DST),
-            fjob_cc: mk("b-fjob-cc", (fjobs.max(1) * 4) as u64, wgpu::BufferUsages::COPY_DST),
-            fjob_o: mk("b-fjob-o", (fjobs.max(1) * 4) as u64, wgpu::BufferUsages::COPY_DST),
-            fjob_n: mk("b-fjob-n", (fjobs.max(1) * 4) as u64, wgpu::BufferUsages::COPY_DST),
-            fscr: mk("b-fscr", (fjobs.max(1) * 64 * 16) as u64, wgpu::BufferUsages::empty()),
-            ffstart: mk("b-ffstart", ((nfat + 1).max(1) * 4) as u64, wgpu::BufferUsages::COPY_DST),
-            ffcf: mk("b-ffcf", (nfat.max(1) * 4) as u64, wgpu::BufferUsages::COPY_DST),
-            ffcc: mk("b-ffcc", (nfat.max(1) * 4) as u64, wgpu::BufferUsages::COPY_DST),
+            pbl: mk(
+                "b-pbl",
+                (pbl.max(1) * 4) as u64,
+                wgpu::BufferUsages::COPY_DST,
+            ),
+            fjob_s0: mk(
+                "b-fjob-s0",
+                (fjobs.max(1) * 4) as u64,
+                wgpu::BufferUsages::COPY_DST,
+            ),
+            fjob_cc: mk(
+                "b-fjob-cc",
+                (fjobs.max(1) * 4) as u64,
+                wgpu::BufferUsages::COPY_DST,
+            ),
+            fjob_o: mk(
+                "b-fjob-o",
+                (fjobs.max(1) * 4) as u64,
+                wgpu::BufferUsages::COPY_DST,
+            ),
+            fjob_n: mk(
+                "b-fjob-n",
+                (fjobs.max(1) * 4) as u64,
+                wgpu::BufferUsages::COPY_DST,
+            ),
+            fscr: mk(
+                "b-fscr",
+                (fjobs.max(1) * 64 * 16) as u64,
+                wgpu::BufferUsages::empty(),
+            ),
+            ffstart: mk(
+                "b-ffstart",
+                ((nfat + 1).max(1) * 4) as u64,
+                wgpu::BufferUsages::COPY_DST,
+            ),
+            ffcf: mk(
+                "b-ffcf",
+                (nfat.max(1) * 4) as u64,
+                wgpu::BufferUsages::COPY_DST,
+            ),
+            ffcc: mk(
+                "b-ffcc",
+                (nfat.max(1) * 4) as u64,
+                wgpu::BufferUsages::COPY_DST,
+            ),
             cap_cells: ncells,
             cap_slots: nslots,
             cap_pairs: total.max(1),
@@ -1262,11 +1368,13 @@ impl GpuBackend {
         count: u32,
     ) -> f64 {
         use wgpu::util::DeviceExt;
-        let ub = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("g-uni"),
-            contents: bytemuck::bytes_of(vals),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
+        let ub = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("g-uni"),
+                contents: bytemuck::bytes_of(vals),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
         let mut all: Vec<&wgpu::Buffer> = bufs.to_vec();
         all.push(&ub);
         let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1281,9 +1389,9 @@ impl GpuBackend {
                 })
                 .collect::<Vec<_>>(),
         });
-        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some(label),
-        });
+        let mut enc = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some(label) });
         {
             let mut p = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some(label),
@@ -1308,7 +1416,13 @@ impl GpuBackend {
     #[allow(dead_code)]
     pub fn stats(&self) -> (usize, usize, usize, usize, usize) {
         let (ct, g, pl, _, _) = self.tables.as_ref().expect("no tables");
-        (ct.centers.len(), g.total, ct.leaf_ids.len(), ct.level_off.len() - 1, pl.list.len())
+        (
+            ct.centers.len(),
+            g.total,
+            ct.leaf_ids.len(),
+            ct.level_off.len() - 1,
+            pl.list.len(),
+        )
     }
 
     /// P2P work distribution: (max cc, avg cc, max partner bodies, avg, max product).
@@ -1347,40 +1461,65 @@ impl GpuBackend {
         let n = pos.len();
         self.parts.clear();
         for i in 0..n {
-            self.parts.push(fmm::models::Particle { mass: mass[i], pos: pos[i] });
+            self.parts.push(fmm::models::Particle {
+                mass: mass[i],
+                pos: pos[i],
+            });
         }
         let (ncells, nslots, nlevels, d, nleaf) = {
             let (ct, _, _, _, order) = self.tables.as_ref().expect("no tables");
             let bodies = fmm::bodies::Bodies::from_parts(&self.parts, order);
             let pos: Vec<[f32; 4]> = (0..n)
-                .map(|k| [bodies.x[k] as f32, bodies.y[k] as f32, bodies.z[k] as f32, bodies.m[k] as f32])
+                .map(|k| {
+                    [
+                        bodies.x[k] as f32,
+                        bodies.y[k] as f32,
+                        bodies.z[k] as f32,
+                        bodies.m[k] as f32,
+                    ]
+                })
                 .collect();
             let b = self.bufs.as_ref().unwrap();
             self.upload(&b.pos, &pos);
-            (ct.centers.len(), n as u32, ct.level_off.len() - 1, DIM as u32, ct.leaf_ids.len())
+            (
+                ct.centers.len(),
+                n as u32,
+                ct.level_off.len() - 1,
+                DIM as u32,
+                ct.leaf_ids.len(),
+            )
         };
         let b = self.bufs.as_ref().unwrap();
         let mut out = Vec::new();
         out.push((
             "p2m",
             self.submit(
-                "p2m", &self.p2m_pipe, &self.p2m_layout,
+                "p2m",
+                &self.p2m_pipe,
+                &self.p2m_layout,
                 &[&b.pos, &b.leaves, &b.cen, &b.cf, &b.cc, &b.mom],
-                &[d, nleaf as u32, 0, 0], nleaf as u32,
+                &[d, nleaf as u32, 0, 0],
+                nleaf as u32,
             ),
         ));
         let mut t_m2m = 0.0;
         {
             let (ct, _, _, _, _) = self.tables.as_ref().unwrap();
             for l in (0..nlevels).rev() {
-                let (lo, ct_) = (ct.level_off[l] as u32, (ct.level_off[l + 1] - ct.level_off[l]) as u32);
+                let (lo, ct_) = (
+                    ct.level_off[l] as u32,
+                    (ct.level_off[l + 1] - ct.level_off[l]) as u32,
+                );
                 if ct_ == 0 {
                     continue;
                 }
                 t_m2m += self.submit(
-                    "m2m", &self.m2m_pipe, &self.m2m_layout,
+                    "m2m",
+                    &self.m2m_pipe,
+                    &self.m2m_layout,
                     &[&b.mom, &b.cen, &b.ch, &b.levels],
-                    &[d, ct_, lo, 0], ct_,
+                    &[d, ct_, lo, 0],
+                    ct_,
                 );
             }
         }
@@ -1389,31 +1528,43 @@ impl GpuBackend {
         out.push((
             "m2l-s1",
             self.submit(
-                "m2ls1", &self.s1_pipe, &self.s1_layout,
+                "m2ls1",
+                &self.s1_pipe,
+                &self.s1_layout,
                 &[&b.mom, &b.gsrc, &b.gr, &b.slots],
-                &[0, d, total.max(1) as u32, 0], total.max(1) as u32,
+                &[0, d, total.max(1) as u32, 0],
+                total.max(1) as u32,
             ),
         ));
         out.push((
             "m2l-red",
             self.submit(
-                "m2lred", &self.red_pipe, &self.red_layout,
+                "m2lred",
+                &self.red_pipe,
+                &self.red_layout,
                 &[&b.slots, &b.gs, &b.gc, &b.loc],
-                &[ncells as u32, d, 0, 0], ncells as u32 * d,
+                &[ncells as u32, d, 0, 0],
+                ncells as u32 * d,
             ),
         ));
         let mut t_l2l = 0.0;
         {
             let (ct, _, _, _, _) = self.tables.as_ref().unwrap();
             for l in 0..nlevels {
-                let (lo, ct_) = (ct.level_off[l] as u32, (ct.level_off[l + 1] - ct.level_off[l]) as u32);
+                let (lo, ct_) = (
+                    ct.level_off[l] as u32,
+                    (ct.level_off[l + 1] - ct.level_off[l]) as u32,
+                );
                 if ct_ == 0 {
                     continue;
                 }
                 t_l2l += self.submit(
-                    "l2l", &self.l2l_pipe, &self.l2l_layout,
+                    "l2l",
+                    &self.l2l_pipe,
+                    &self.l2l_layout,
                     &[&b.loc, &b.cen, &b.ch, &b.levels],
-                    &[d, ct_, lo, 0], ct_,
+                    &[d, ct_, lo, 0],
+                    ct_,
                 );
             }
         }
@@ -1421,17 +1572,25 @@ impl GpuBackend {
         out.push((
             "l2p",
             self.submit(
-                "l2p", &self.l2p_pipe, &self.l2p_layout,
+                "l2p",
+                &self.l2p_pipe,
+                &self.l2p_layout,
                 &[&b.pos, &b.cos, &b.cen, &b.loc, &b.acc],
-                &[d, nslots, 0, 0], nslots,
+                &[d, nslots, 0, 0],
+                nslots,
             ),
         ));
         out.push((
             "p2p",
             self.submit(
-                "p2p", &self.p2p_pipe, &self.p2p_layout,
-                &[&b.pos, &b.leaves, &b.cf, &b.cc, &b.pbs, &b.pbc, &b.pbl, &b.acc],
-                &[nleaf as u32, 0, 0, 0], nleaf as u32 * 64,
+                "p2p",
+                &self.p2p_pipe,
+                &self.p2p_layout,
+                &[
+                    &b.pos, &b.leaves, &b.cf, &b.cc, &b.pbs, &b.pbc, &b.pbl, &b.acc,
+                ],
+                &[nleaf as u32, 0, 0, 0],
+                nleaf as u32 * 64,
             ),
         ));
         let (njobs, nfat) = {
@@ -1441,23 +1600,33 @@ impl GpuBackend {
         out.push((
             "p2p-fat",
             self.submit(
-                "fat", &self.fat_pipe, &self.fat_layout,
-                &[&b.pos, &b.fjob_s0, &b.fjob_cc, &b.fjob_o, &b.fjob_n, &b.pbl, &b.fscr],
-                &[njobs, 0, 0, 0], njobs * 64,
+                "fat",
+                &self.fat_pipe,
+                &self.fat_layout,
+                &[
+                    &b.pos, &b.fjob_s0, &b.fjob_cc, &b.fjob_o, &b.fjob_n, &b.pbl, &b.fscr,
+                ],
+                &[njobs, 0, 0, 0],
+                njobs * 64,
             ),
         ));
         out.push((
             "p2p-fred",
             self.submit(
-                "fatred", &self.fatred_pipe, &self.fatred_layout,
+                "fatred",
+                &self.fatred_pipe,
+                &self.fatred_layout,
                 &[&b.fscr, &b.ffstart, &b.ffcf, &b.ffcc, &b.acc],
-                &[nfat, 0, 0, 0], nfat * 64,
+                &[nfat, 0, 0, 0],
+                nfat * 64,
             ),
         ));
         let t = std::time::Instant::now();
-        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("prof-copy"),
-        });
+        let mut enc = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("prof-copy"),
+            });
         enc.copy_buffer_to_buffer(&b.acc, 0, &b.rb, 0, (n * 16) as u64);
         let idx = self.queue.submit([enc.finish()]);
         let (tx, rx) = std::sync::mpsc::channel();
@@ -1488,7 +1657,10 @@ impl GpuBackend {
         self.parts.clear();
         self.parts.reserve(n);
         for i in 0..n {
-            self.parts.push(fmm::models::Particle { mass: mass[i], pos: pos[i] });
+            self.parts.push(fmm::models::Particle {
+                mass: mass[i],
+                pos: pos[i],
+            });
         }
         if refresh || self.tables.is_none() {
             let tree = Octree::build(&self.parts, N_LEAF);
@@ -1500,19 +1672,24 @@ impl GpuBackend {
             let pows = fmm::moments::multipole_power(&moments, ncells, P);
             let binom = fmm::moments::binomials(P);
             let (_, fmin) = fmm::mac::f_prepass_par(&bodies, &tree, nt);
-            let rec =
-                fmm::walk::record_pairs_par(&bodies, &tree, P, EPS, &pows, &binom, &fmin, &moments, nt);
+            let rec = fmm::walk::record_pairs_par(
+                &bodies, &tree, P, EPS, &pows, &binom, &fmin, &moments, nt,
+            );
             let g = group_m2l(&rec.pairs, ncells);
             let ct = cell_tables(&tree, n);
-            let mut pl = build_p2p_bodies(
-                &rec.p2p,
-                ncells,
+            let mut pl = build_p2p_bodies(&rec.p2p, ncells, &ct.leaf_ids, &ct.cfirst, &ct.ccount);
+            assert!(
+                ct.leaf_ids.iter().all(|&l| ct.ccount[l as usize] <= 64),
+                "leaf over 64 bodies"
+            );
+            let fj = split_fat(
+                &mut pl,
                 &ct.leaf_ids,
                 &ct.cfirst,
                 &ct.ccount,
+                FAT_THR,
+                FAT_CHUNK,
             );
-            assert!(ct.leaf_ids.iter().all(|&l| ct.ccount[l as usize] <= 64), "leaf over 64 bodies");
-            let fj = split_fat(&mut pl, &ct.leaf_ids, &ct.cfirst, &ct.ccount, FAT_THR, FAT_CHUNK);
             self.ensure(ncells, n, g.total, pl.list.len(), fj.njobs, fj.nfat);
             let b = self.bufs.as_ref().unwrap();
             self.upload(&b.cen, &ct.centers);
@@ -1529,7 +1706,12 @@ impl GpuBackend {
                 .map(|j| {
                     let ca = tree.cells[g.gsrc[j] as usize].cen;
                     let cb = tree.cells[g.gdst[j] as usize].cen;
-                    [(cb[0] - ca[0]) as f32, (cb[1] - ca[1]) as f32, (cb[2] - ca[2]) as f32, 0.0]
+                    [
+                        (cb[0] - ca[0]) as f32,
+                        (cb[1] - ca[1]) as f32,
+                        (cb[2] - ca[2]) as f32,
+                        0.0,
+                    ]
                 })
                 .collect();
             self.upload(&b.gr, &gr);
@@ -1554,33 +1736,54 @@ impl GpuBackend {
         let nlevels = ct.level_off.len() - 1;
         let bodies = fmm::bodies::Bodies::from_parts(&self.parts, order);
         let pos: Vec<[f32; 4]> = (0..n)
-            .map(|k| [bodies.x[k] as f32, bodies.y[k] as f32, bodies.z[k] as f32, bodies.m[k] as f32])
+            .map(|k| {
+                [
+                    bodies.x[k] as f32,
+                    bodies.y[k] as f32,
+                    bodies.z[k] as f32,
+                    bodies.m[k] as f32,
+                ]
+            })
             .collect();
         let b = self.bufs.as_ref().unwrap();
         self.upload(&b.pos, &pos);
-        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("gpu-step"),
-        });
+        let mut enc = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("gpu-step"),
+            });
         let mut keepalive: Vec<wgpu::Buffer> = Vec::new();
         let mut keepbind: Vec<wgpu::BindGroup> = Vec::new();
-        let pass = |enc: &mut wgpu::CommandEncoder, label: &str, pipe: &wgpu::ComputePipeline,
-                    layout: &wgpu::BindGroupLayout, bufs: &[&wgpu::Buffer], vals: &[u32; 4], count: u32,
-                    keepalive: &mut Vec<wgpu::Buffer>, keepbind: &mut Vec<wgpu::BindGroup>| {
+        let pass = |enc: &mut wgpu::CommandEncoder,
+                    label: &str,
+                    pipe: &wgpu::ComputePipeline,
+                    layout: &wgpu::BindGroupLayout,
+                    bufs: &[&wgpu::Buffer],
+                    vals: &[u32; 4],
+                    count: u32,
+                    keepalive: &mut Vec<wgpu::Buffer>,
+                    keepbind: &mut Vec<wgpu::BindGroup>| {
             use wgpu::util::DeviceExt;
-            let ub = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("g-uni"),
-                contents: bytemuck::bytes_of(vals),
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
+            let ub = self
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("g-uni"),
+                    contents: bytemuck::bytes_of(vals),
+                    usage: wgpu::BufferUsages::UNIFORM,
+                });
             let mut all: Vec<&wgpu::Buffer> = bufs.to_vec();
             all.push(&ub);
             let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some(label),
                 layout,
-                entries: &all.iter().enumerate().map(|(i, b)| wgpu::BindGroupEntry {
-                    binding: i as u32,
-                    resource: b.as_entire_binding(),
-                }).collect::<Vec<_>>(),
+                entries: &all
+                    .iter()
+                    .enumerate()
+                    .map(|(i, b)| wgpu::BindGroupEntry {
+                        binding: i as u32,
+                        resource: b.as_entire_binding(),
+                    })
+                    .collect::<Vec<_>>(),
             });
             {
                 let mut p = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -1595,58 +1798,143 @@ impl GpuBackend {
             keepbind.push(bg);
         };
         let b = self.bufs.as_ref().unwrap();
-        pass(&mut enc, "p2m", &self.p2m_pipe, &self.p2m_layout,
+        pass(
+            &mut enc,
+            "p2m",
+            &self.p2m_pipe,
+            &self.p2m_layout,
             &[&b.pos, &b.leaves, &b.cen, &b.cf, &b.cc, &b.mom],
-            &[d, ct.leaf_ids.len() as u32, 0, 0], ct.leaf_ids.len() as u32,
-            &mut keepalive, &mut keepbind);
+            &[d, ct.leaf_ids.len() as u32, 0, 0],
+            ct.leaf_ids.len() as u32,
+            &mut keepalive,
+            &mut keepbind,
+        );
         for l in (0..nlevels).rev() {
-            let (lo, ct_) = (ct.level_off[l] as u32, (ct.level_off[l + 1] - ct.level_off[l]) as u32);
-            if ct_ == 0 { continue; }
-            pass(&mut enc, "m2m", &self.m2m_pipe, &self.m2m_layout,
+            let (lo, ct_) = (
+                ct.level_off[l] as u32,
+                (ct.level_off[l + 1] - ct.level_off[l]) as u32,
+            );
+            if ct_ == 0 {
+                continue;
+            }
+            pass(
+                &mut enc,
+                "m2m",
+                &self.m2m_pipe,
+                &self.m2m_layout,
                 &[&b.mom, &b.cen, &b.ch, &b.levels],
-                &[d, ct_, lo, 0], ct_, &mut keepalive, &mut keepbind);
+                &[d, ct_, lo, 0],
+                ct_,
+                &mut keepalive,
+                &mut keepbind,
+            );
         }
-        pass(&mut enc, "m2ls1", &self.s1_pipe, &self.s1_layout,
+        pass(
+            &mut enc,
+            "m2ls1",
+            &self.s1_pipe,
+            &self.s1_layout,
             &[&b.mom, &b.gsrc, &b.gr, &b.slots],
-            &[0, d, g.total.max(1) as u32, 0], g.total.max(1) as u32,
-            &mut keepalive, &mut keepbind);
-        pass(&mut enc, "m2lred", &self.red_pipe, &self.red_layout,
+            &[0, d, g.total.max(1) as u32, 0],
+            g.total.max(1) as u32,
+            &mut keepalive,
+            &mut keepbind,
+        );
+        pass(
+            &mut enc,
+            "m2lred",
+            &self.red_pipe,
+            &self.red_layout,
             &[&b.slots, &b.gs, &b.gc, &b.loc],
-            &[ncells as u32, d, 0, 0], ncells as u32 * d, &mut keepalive, &mut keepbind);
+            &[ncells as u32, d, 0, 0],
+            ncells as u32 * d,
+            &mut keepalive,
+            &mut keepbind,
+        );
         for l in 0..nlevels {
-            let (lo, ct_) = (ct.level_off[l] as u32, (ct.level_off[l + 1] - ct.level_off[l]) as u32);
-            if ct_ == 0 { continue; }
-            pass(&mut enc, "l2l", &self.l2l_pipe, &self.l2l_layout,
+            let (lo, ct_) = (
+                ct.level_off[l] as u32,
+                (ct.level_off[l + 1] - ct.level_off[l]) as u32,
+            );
+            if ct_ == 0 {
+                continue;
+            }
+            pass(
+                &mut enc,
+                "l2l",
+                &self.l2l_pipe,
+                &self.l2l_layout,
                 &[&b.loc, &b.cen, &b.ch, &b.levels],
-                &[d, ct_, lo, 0], ct_, &mut keepalive, &mut keepbind);
+                &[d, ct_, lo, 0],
+                ct_,
+                &mut keepalive,
+                &mut keepbind,
+            );
         }
-        pass(&mut enc, "l2p", &self.l2p_pipe, &self.l2p_layout,
+        pass(
+            &mut enc,
+            "l2p",
+            &self.l2p_pipe,
+            &self.l2p_layout,
             &[&b.pos, &b.cos, &b.cen, &b.loc, &b.acc],
-            &[d, nslots, 0, 0], nslots, &mut keepalive, &mut keepbind);
-        pass(&mut enc, "p2p", &self.p2p_pipe, &self.p2p_layout,
-            &[&b.pos, &b.leaves, &b.cf, &b.cc, &b.pbs, &b.pbc, &b.pbl, &b.acc],
-            &[ct.leaf_ids.len() as u32, 0, 0, 0], ct.leaf_ids.len() as u32 * 64, // workgroups*64; WG size is P2P_WG
-            &mut keepalive, &mut keepbind);
+            &[d, nslots, 0, 0],
+            nslots,
+            &mut keepalive,
+            &mut keepbind,
+        );
+        pass(
+            &mut enc,
+            "p2p",
+            &self.p2p_pipe,
+            &self.p2p_layout,
+            &[
+                &b.pos, &b.leaves, &b.cf, &b.cc, &b.pbs, &b.pbc, &b.pbl, &b.acc,
+            ],
+            &[ct.leaf_ids.len() as u32, 0, 0, 0],
+            ct.leaf_ids.len() as u32 * 64, // workgroups*64; WG size is P2P_WG
+            &mut keepalive,
+            &mut keepbind,
+        );
         let (njobs, nfat) = {
             let (_, _, _, fj, _) = self.tables.as_ref().unwrap();
             (fj.njobs as u32, fj.nfat as u32)
         };
-        pass(&mut enc, "fat", &self.fat_pipe, &self.fat_layout,
-            &[&b.pos, &b.fjob_s0, &b.fjob_cc, &b.fjob_o, &b.fjob_n, &b.pbl, &b.fscr],
-            &[njobs, 0, 0, 0], njobs * 64,
-            &mut keepalive, &mut keepbind);
-        pass(&mut enc, "fatred", &self.fatred_pipe, &self.fatred_layout,
+        pass(
+            &mut enc,
+            "fat",
+            &self.fat_pipe,
+            &self.fat_layout,
+            &[
+                &b.pos, &b.fjob_s0, &b.fjob_cc, &b.fjob_o, &b.fjob_n, &b.pbl, &b.fscr,
+            ],
+            &[njobs, 0, 0, 0],
+            njobs * 64,
+            &mut keepalive,
+            &mut keepbind,
+        );
+        pass(
+            &mut enc,
+            "fatred",
+            &self.fatred_pipe,
+            &self.fatred_layout,
             &[&b.fscr, &b.ffstart, &b.ffcf, &b.ffcc, &b.acc],
-            &[nfat, 0, 0, 0], nfat * 64,
-            &mut keepalive, &mut keepbind);
+            &[nfat, 0, 0, 0],
+            nfat * 64,
+            &mut keepalive,
+            &mut keepbind,
+        );
         enc.copy_buffer_to_buffer(&b.acc, 0, &b.rb, 0, (n * 16) as u64);
         self.queue.submit([enc.finish()]);
         let (tx, rx) = std::sync::mpsc::channel();
-        b.rb.map_async(wgpu::MapMode::Read, .., move |r| { let _ = tx.send(r); });
-        self.device.poll(wgpu::PollType::Wait {
-            submission_index: None,
-            timeout: Some(std::time::Duration::from_secs(120)),
-        }).unwrap();
+        b.rb.map_async(wgpu::MapMode::Read, .., move |r| {
+            let _ = tx.send(r);
+        });
+        self.device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: Some(std::time::Duration::from_secs(120)),
+            })
+            .unwrap();
         rx.recv().unwrap().unwrap();
         let data = b.rb.get_mapped_range(..).expect("map").to_vec();
         b.rb.unmap();

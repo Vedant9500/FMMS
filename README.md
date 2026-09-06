@@ -40,6 +40,8 @@ is the strongest known serial formulation.
 | `docs/07-parallel.md` | Threading, MPI, task-based, load balancing |
 | `docs/08-references.md` | Annotated bibliography with URLs |
 | `docs/09-visual-system.md` | Live 3D visual system (Universe-Sandbox-style): GPU-driven rendering, precision, LOD, planets, trails, stack |
+| `docs/10-gpu-fmm.md` | GPU-compute FMM stages (M2L kernels, replay, sweeps, engine integration) |
+| `docs/11-visual-roadmap.md` | Visual track plan: stars done/future, gas & dust next, later phases |
 
 ## Roadmap
 

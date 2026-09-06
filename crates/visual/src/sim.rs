@@ -161,6 +161,10 @@ pub struct Sim {
     pub mass: Vec<f64>,
     pub temp: Vec<f32>,
     pub mag: Vec<f32>,
+    pub teff: Vec<f32>,
+    pub lum: Vec<f32>,
+    pub gas: Vec<crate::ic::Gas>,
+    pub gas_om: f32,
     pub prev: Vec<[f64; 3]>,
     pub prev_vel: Vec<[f64; 3]>,
     pub time: f64,
@@ -179,19 +183,30 @@ enum Backend {
 }
 
 impl Sim {
-    pub fn new(n: usize, dt: f64, use_fmm: bool, gpu: Option<crate::gpufmm::GpuBackend>, preset: crate::ic::Preset) -> Self {
-        let (stars, halo) = crate::ic::generate(preset, n, 42);
+    pub fn new(
+        n: usize,
+        dt: f64,
+        use_fmm: bool,
+        gpu: Option<crate::gpufmm::GpuBackend>,
+        preset: crate::ic::Preset,
+    ) -> Self {
+        let (stars, gas, halo) = crate::ic::generate(preset, n, 42);
+        let gas_om = crate::ic::pattern_speed(preset);
         let mut pos = Vec::with_capacity(n);
         let mut vel = Vec::with_capacity(n);
         let mut mass = Vec::with_capacity(n);
         let mut temp = Vec::with_capacity(n);
         let mut mag = Vec::with_capacity(n);
+        let mut teff = Vec::with_capacity(n);
+        let mut lum = Vec::with_capacity(n);
         for st in &stars {
             pos.push(st.pos);
             vel.push(st.vel);
             mass.push(st.mass);
             temp.push(st.temp);
             mag.push(st.mag);
+            teff.push(st.teff);
+            lum.push(st.lum);
         }
         remove_com(&mut pos, &mut vel, &mass);
         if preset == crate::ic::Preset::Cluster && n <= 5000 {
@@ -226,6 +241,10 @@ impl Sim {
             acc: None,
             vmax,
             halo,
+            teff,
+            lum,
+            gas,
+            gas_om,
         }
     }
 
@@ -314,6 +333,10 @@ pub struct Snap {
 pub struct Static {
     pub temp: Vec<f32>,
     pub mag: Vec<f32>,
+    pub teff: Vec<f32>,
+    pub lum: Vec<f32>,
+    pub gas: Vec<crate::ic::Gas>,
+    pub gas_om: f32,
     pub n: usize,
 }
 
@@ -388,6 +411,10 @@ pub fn physics_loop(mut sim: Sim, tx: std::sync::mpsc::SyncSender<Msg>, ctl: std
     tx.send(Msg::Static(Static {
         temp: sim.temp.clone(),
         mag: sim.mag.clone(),
+        teff: sim.teff.clone(),
+        lum: sim.lum.clone(),
+        gas: sim.gas.clone(),
+        gas_om: sim.gas_om,
         n,
     }))
     .ok();
@@ -557,7 +584,12 @@ mod tests {
 
     #[test]
     fn presets_run_finite() {
-        for preset in [Preset::Cluster, Preset::Spiral, Preset::Merger, Preset::BlackHole] {
+        for preset in [
+            Preset::Cluster,
+            Preset::Spiral,
+            Preset::Merger,
+            Preset::BlackHole,
+        ] {
             let mut sim = Sim::new(64, 0.004, false, None, preset);
             for _ in 0..3 {
                 sim.step();
@@ -573,7 +605,12 @@ mod tests {
 
     #[test]
     fn accel_cap_bounds_huge_and_nonfinite() {
-        let mut a = vec![[1e6, 0.0, 0.0], [f64::INFINITY, 0.0, 0.0], [f64::NAN, 1.0, 2.0], [3.0, 4.0, 0.0]];
+        let mut a = vec![
+            [1e6, 0.0, 0.0],
+            [f64::INFINITY, 0.0, 0.0],
+            [f64::NAN, 1.0, 2.0],
+            [3.0, 4.0, 0.0],
+        ];
         cap_accel(&mut a);
         for v in &a {
             for &x in v {
@@ -697,7 +734,11 @@ mod tests {
                 sdt = (span / (hist.len() as f64 - 1.0)).max(1e-9);
                 let wall = (b.arrival - f.arrival).as_secs_f64().max(1e-6);
                 let inst = span / wall;
-                rate = if rate <= 0.0 { inst } else { rate * 0.85 + inst * 0.15 };
+                rate = if rate <= 0.0 {
+                    inst
+                } else {
+                    rate * 0.85 + inst * 0.15
+                };
             }
             let (f, b) = (hist.front().unwrap(), hist.back().unwrap());
             let mut rt = match cur {
@@ -717,8 +758,9 @@ mod tests {
             cur = Some(rt);
         }
         let tail = &deltas[300..];
-        let (mn, mx) =
-            tail.iter().fold((f64::INFINITY, 0.0f64), |(a, b), &d| (a.min(d), b.max(d)));
+        let (mn, mx) = tail
+            .iter()
+            .fold((f64::INFINITY, 0.0f64), |(a, b), &d| (a.min(d), b.max(d)));
         assert!(mn > 0.0, "cursor stalls: min {mn}");
         assert!(mx / mn < 3.0, "pulsing: min {mn} max {mx}");
     }

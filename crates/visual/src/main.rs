@@ -8,8 +8,8 @@ mod sim;
 use camera::{rebase, Camera};
 use gpu::{GpuItem, GpuState, Uniform};
 use sim::{advance_cursor, bracket, physics_loop, Ctl, HistSnap, Msg, Sim};
-use std::sync::Arc;
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::time::Instant;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
@@ -44,7 +44,10 @@ fn parse_args() -> Args {
                 i += 2;
             }
             "--preset" => {
-                preset = a.get(i + 1).and_then(|s| ic::Preset::from_str(s)).unwrap_or(preset);
+                preset = a
+                    .get(i + 1)
+                    .and_then(|s| ic::Preset::from_str(s))
+                    .unwrap_or(preset);
                 i += 2;
             }
             "--fmm" => {
@@ -59,7 +62,13 @@ fn parse_args() -> Args {
         }
     }
     let dt = dt.unwrap_or(if n > 20000 { 0.01 } else { 0.004 });
-    Args { n, dt, fmm, gpu, preset }
+    Args {
+        n,
+        dt,
+        fmm,
+        gpu,
+        preset,
+    }
 }
 
 fn post_binds(
@@ -143,6 +152,39 @@ fn post_binds(
     )
 }
 
+fn gas_pair(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    cap: usize,
+) -> (wgpu::Buffer, wgpu::Buffer, wgpu::BindGroup) {
+    let size = (cap * std::mem::size_of::<GpuItem>()) as u64;
+    let mk = |label: &str| {
+        device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        })
+    };
+    let prev = mk("gas-prev");
+    let curr = mk("gas-curr");
+    let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("gas-bind"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: prev.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: curr.as_entire_binding(),
+            },
+        ],
+    });
+    (prev, curr, bind)
+}
+
 fn bg_stars() -> Vec<([f64; 3], f32, f32)> {
     let mut rng = fmm::models::Rng::new(99);
     let mut out = Vec::with_capacity(2200);
@@ -192,6 +234,14 @@ struct Graphics {
     bg_curr: wgpu::Buffer,
     bg_bind: wgpu::BindGroup,
     bg_n: usize,
+    emission: wgpu::RenderPipeline,
+    dust: wgpu::RenderPipeline,
+    gas_em_prev: wgpu::Buffer,
+    gas_em_curr: wgpu::Buffer,
+    gas_em_bind: wgpu::BindGroup,
+    gas_dust_prev: wgpu::Buffer,
+    gas_dust_curr: wgpu::Buffer,
+    gas_dust_bind: wgpu::BindGroup,
     sampler: wgpu::Sampler,
     egui_renderer: egui_wgpu::Renderer,
     egui_state: egui_winit::State,
@@ -221,8 +271,13 @@ struct App {
     stage_prev: Vec<GpuItem>,
     stage_curr: Vec<GpuItem>,
     stage_bg: Vec<GpuItem>,
+    stage_gas_em: Vec<GpuItem>,
+    stage_gas_dust: Vec<GpuItem>,
     temp: Vec<f32>,
     mag: Vec<f32>,
+    census: [usize; 8],
+    gas: Vec<ic::Gas>,
+    gas_om: f32,
     body_n: usize,
     hist: VecDeque<HistSnap>,
     render_t: Option<f64>,
@@ -257,10 +312,10 @@ impl App {
             paused: false,
             speed: 1.0,
             point_size,
-            exposure: 1.4,
-            bloom: 0.35,
+            exposure: 1.0,
+            bloom: 0.12,
             threshold: 1.5,
-            radius: 2.0,
+            radius: 1.0,
             fps: 60.0,
             phys_rate: 0.0,
             dragging: None,
@@ -270,8 +325,13 @@ impl App {
             stage_prev: Vec::new(),
             stage_curr: Vec::new(),
             stage_bg: Vec::new(),
+            stage_gas_em: Vec::new(),
+            stage_gas_dust: Vec::new(),
             temp: Vec::new(),
             mag: Vec::new(),
+            census: [0; 8],
+            gas: Vec::new(),
+            gas_om: 0.0,
             body_n: 0,
             hist: VecDeque::new(),
             render_t: None,
@@ -351,6 +411,18 @@ impl App {
             render::bright_pipeline(&device, gpu_state.hdr_format, &tex_layout, &uni_layout);
         let blur = render::blur_pipeline(&device, gpu_state.hdr_format, &tex_layout, &uni_layout);
         let tonemap = render::tonemap_pipeline(&device, format, &composite_layout, &uni_layout);
+        let emission = render::emission_pipeline(
+            &device,
+            gpu_state.hdr_format,
+            &uniform_layout,
+            &storage_layout,
+        );
+        let dust = render::dust_pipeline(
+            &device,
+            gpu_state.hdr_format,
+            &uniform_layout,
+            &storage_layout,
+        );
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("post-smp"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -424,6 +496,8 @@ impl App {
             .spawn(move || physics_loop(sim, tx, ctl_thread))
             .expect("physics thread");
         let bg_n = 2200usize;
+        let (gas_em_prev, gas_em_curr, gas_em_bind) = gas_pair(&device, &storage_layout, 512);
+        let (gas_dust_prev, gas_dust_curr, gas_dust_bind) = gas_pair(&device, &storage_layout, 832);
         let bg_size = (bg_n * std::mem::size_of::<GpuItem>()) as u64;
         let bg_prev = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("bg-prev"),
@@ -476,9 +550,9 @@ impl App {
             &blur_uni_v,
             &bright_uni,
             &bloom_uni,
-            1.4,
+            1.0,
             1.5,
-            0.35,
+            0.12,
         );
         let gfx = Graphics {
             window,
@@ -512,6 +586,14 @@ impl App {
             bg_curr,
             bg_bind,
             bg_n,
+            emission,
+            dust,
+            gas_em_prev,
+            gas_em_curr,
+            gas_em_bind,
+            gas_dust_prev,
+            gas_dust_curr,
+            gas_dust_bind,
             sampler,
             egui_renderer,
             egui_state,
@@ -580,8 +662,11 @@ impl App {
             while let Ok(msg) = rx.try_recv() {
                 match msg {
                     Msg::Static(s) => {
+                        self.census = ic::census(&s.teff, &s.lum);
                         self.temp = s.temp;
                         self.mag = s.mag;
+                        self.gas_om = s.gas_om;
+                        self.gas = s.gas;
                         self.body_n = s.n;
                     }
                     Msg::Snap(s) => {
@@ -620,17 +705,34 @@ impl App {
                 self.sim_dt = (span / (n as f64 - 1.0)).max(1e-9);
                 let wall = (b.arrival - f.arrival).as_secs_f64().max(1e-6);
                 let inst = span / wall;
-                self.sim_rate = if self.sim_rate <= 0.0 { inst } else { self.sim_rate * 0.85 + inst * 0.15 };
+                self.sim_rate = if self.sim_rate <= 0.0 {
+                    inst
+                } else {
+                    self.sim_rate * 0.85 + inst * 0.15
+                };
             }
             let mut rt = match self.render_t {
                 Some(t) => t,
                 None => {
-                    let target = (self.sim_rate * BUFFER_WALL_S).clamp(2.0 * self.sim_dt, 8.0 * self.sim_dt);
-                    if self.paused { b.time } else { (b.time - target).max(f.time) }
+                    let target =
+                        (self.sim_rate * BUFFER_WALL_S).clamp(2.0 * self.sim_dt, 8.0 * self.sim_dt);
+                    if self.paused {
+                        b.time
+                    } else {
+                        (b.time - target).max(f.time)
+                    }
                 }
             };
             if !self.paused && self.sim_rate > 0.0 {
-                rt = advance_cursor(rt, f.time, b.time, self.sim_rate, self.sim_dt, real_dt.min(0.25), BUFFER_WALL_S);
+                rt = advance_cursor(
+                    rt,
+                    f.time,
+                    b.time,
+                    self.sim_rate,
+                    self.sim_dt,
+                    real_dt.min(0.25),
+                    BUFFER_WALL_S,
+                );
             }
             while self.hist.len() > HIST_CAP {
                 self.hist.pop_front();
@@ -703,6 +805,48 @@ impl App {
             .write_buffer(&gfx.bg_prev, 0, bytemuck::cast_slice(&self.stage_bg));
         gfx.queue
             .write_buffer(&gfx.bg_curr, 0, bytemuck::cast_slice(&self.stage_bg));
+        self.stage_gas_em.clear();
+        self.stage_gas_dust.clear();
+        let gang = self.gas_om as f64 * self.render_t.unwrap_or(0.0);
+        let (gca, gsa) = (gang.cos(), gang.sin());
+        for g in self.gas.iter() {
+            let rx = g.pos[0] * gca - g.pos[1] * gsa;
+            let ry = g.pos[0] * gsa + g.pos[1] * gca;
+            let item = GpuItem {
+                pos: rebase(&[rx, ry, g.pos[2]], &eye),
+                speed: 0.0,
+                misc: [g.seed, g.size, g.kind, 0.0],
+            };
+            if g.kind < 2.5 {
+                if self.stage_gas_em.len() < 512 {
+                    self.stage_gas_em.push(item);
+                }
+            } else if self.stage_gas_dust.len() < 832 {
+                self.stage_gas_dust.push(item);
+            }
+        }
+        gfx.queue.write_buffer(
+            &gfx.gas_em_prev,
+            0,
+            bytemuck::cast_slice(&self.stage_gas_em),
+        );
+        gfx.queue.write_buffer(
+            &gfx.gas_em_curr,
+            0,
+            bytemuck::cast_slice(&self.stage_gas_em),
+        );
+        gfx.queue.write_buffer(
+            &gfx.gas_dust_prev,
+            0,
+            bytemuck::cast_slice(&self.stage_gas_dust),
+        );
+        gfx.queue.write_buffer(
+            &gfx.gas_dust_curr,
+            0,
+            bytemuck::cast_slice(&self.stage_gas_dust),
+        );
+        let em_n = self.stage_gas_em.len();
+        let dust_n = self.stage_gas_dust.len();
         let aspect = gfx.config.width as f32 / gfx.config.height.max(1) as f32;
         let vp = self.camera.view_proj(aspect);
         let (right, up) = self.camera.basis();
@@ -713,7 +857,12 @@ impl App {
             // Staging buffers already hold the interpolated state; the
             // shader must not interpolate a second time (that would square
             // the blend into an easing curve).
-            params: [self.point_size, 1.0, self.exposure, 0.0],
+            params: [
+                self.point_size,
+                1.0,
+                self.exposure,
+                self.render_t.unwrap_or(0.0) as f32,
+            ],
         };
         gfx.gpu_state
             .upload(&gfx.queue, &self.stage_prev, &self.stage_curr, &uni);
@@ -741,6 +890,17 @@ impl App {
         let mut full = gfx.egui_ctx.run_ui(raw_input, |ui| {
             egui::Window::new("fmms V0").show(ui.ctx(), |ui| {
                 ui.label(format!("bodies: {n}"));
+                ui.label(format!(
+                    "OBAFGKM+G: {} {} {} {} {} {} {} {}",
+                    self.census[0],
+                    self.census[1],
+                    self.census[2],
+                    self.census[3],
+                    self.census[4],
+                    self.census[5],
+                    self.census[6],
+                    self.census[7]
+                ));
                 ui.label(format!("fps: {fps:.0}  phys: {phys:.1}/s"));
                 ui.label(format!("sim t: {sim_time:.2}"));
                 ui.label(format!("steps: {sim_steps}"));
@@ -823,6 +983,12 @@ impl App {
             pass.draw(0..4, 0..n as u32);
             pass.set_bind_group(1, &gfx.bg_bind, &[]);
             pass.draw(0..4, 0..bg_n as u32);
+            pass.set_pipeline(&gfx.emission);
+            pass.set_bind_group(1, &gfx.gas_em_bind, &[]);
+            pass.draw(0..4, 0..em_n as u32);
+            pass.set_pipeline(&gfx.dust);
+            pass.set_bind_group(1, &gfx.gas_dust_bind, &[]);
+            pass.draw(0..4, 0..dust_n as u32);
         }
         post_pass(
             &mut enc,

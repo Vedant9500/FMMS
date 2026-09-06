@@ -351,17 +351,16 @@ pub fn record_pairs_par(
     nthreads: usize,
 ) -> Recorded {
     let t_start = std::time::Instant::now();
-    let mut workers: Vec<(Vec<(u32, u32)>, Vec<(u32, u32)>, crate::bodies::Bodies)> =
-        (0..nthreads)
-            .map(|_| {
-                let mut tb = bodies.clone();
-                tb.ax.iter_mut().for_each(|v| *v = 0.0);
-                tb.ay.iter_mut().for_each(|v| *v = 0.0);
-                tb.az.iter_mut().for_each(|v| *v = 0.0);
-                tb.pot.iter_mut().for_each(|v| *v = 0.0);
-                (Vec::new(), Vec::new(), tb)
-            })
-            .collect();
+    let mut workers: Vec<(Vec<(u32, u32)>, Vec<(u32, u32)>, crate::bodies::Bodies)> = (0..nthreads)
+        .map(|_| {
+            let mut tb = bodies.clone();
+            tb.ax.iter_mut().for_each(|v| *v = 0.0);
+            tb.ay.iter_mut().for_each(|v| *v = 0.0);
+            tb.az.iter_mut().for_each(|v| *v = 0.0);
+            tb.pot.iter_mut().for_each(|v| *v = 0.0);
+            (Vec::new(), Vec::new(), tb)
+        })
+        .collect();
 
     let stacks: Vec<std::sync::Mutex<Vec<(usize, usize)>>> = (0..nthreads)
         .map(|_| std::sync::Mutex::new(Vec::new()))
@@ -475,8 +474,7 @@ pub fn record_pairs_par(
         pairs.append(r);
         p2p.append(rp);
     }
-    let tbodies: Vec<crate::bodies::Bodies> =
-        workers.into_iter().map(|(_, _, tb)| tb).collect();
+    let tbodies: Vec<crate::bodies::Bodies> = workers.into_iter().map(|(_, _, tb)| tb).collect();
     let t_merge = t_start.elapsed().as_millis() as u64 - t_record;
     T_RECORD_MS.store(t_record, Ordering::Relaxed);
     T_MERGE_MS.store(t_merge, Ordering::Relaxed);
@@ -676,7 +674,9 @@ mod tests {
         let binom = crate::moments::binomials(p);
         let (_, fmin) = crate::mac::f_prepass(&bodies, &tree);
         let run = || {
-            let rec = record_pairs_par(&bodies, &tree, p, eps, &pows, &binom, &fmin, &moments, nthreads);
+            let rec = record_pairs_par(
+                &bodies, &tree, p, eps, &pows, &binom, &fmin, &moments, nthreads,
+            );
             assert!(!rec.pairs.is_empty());
             let mut s = rec.pairs;
             s.sort_unstable();
@@ -699,7 +699,9 @@ mod tests {
         let pows = crate::moments::multipole_power(&moments, ncells, p);
         let binom = crate::moments::binomials(p);
         let (_, fmin) = crate::mac::f_prepass(&bodies, &tree);
-        let rec = record_pairs_par(&bodies, &tree, p, eps, &pows, &binom, &fmin, &moments, nthreads);
+        let rec = record_pairs_par(
+            &bodies, &tree, p, eps, &pows, &binom, &fmin, &moments, nthreads,
+        );
         assert!(!rec.p2p.is_empty());
         for &(a, b) in &rec.p2p {
             assert!(tree.is_leaf(a as usize) && tree.is_leaf(b as usize));

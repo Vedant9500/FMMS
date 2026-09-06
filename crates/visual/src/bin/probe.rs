@@ -7,10 +7,10 @@ mod gpu;
 #[allow(dead_code)]
 #[path = "../gpufmm.rs"]
 mod gpufmm;
-#[path = "../render.rs"]
-mod render;
 #[path = "../ic.rs"]
 mod ic;
+#[path = "../render.rs"]
+mod render;
 #[allow(dead_code)]
 #[path = "../sim.rs"]
 mod sim;
@@ -48,6 +48,19 @@ fn craft_count(mode: &str, eye: &[f64; 3], count: usize) -> Vec<GpuItem> {
     };
     match mode {
         "single" => push([0.0, 0.0, 0.0], 0.3, 1.0, 0.0),
+        "ramp" => {
+            let table = [
+                (0.05f32, 1.0f32),
+                (0.20, 0.85),
+                (0.35, 0.65),
+                (0.50, 0.55),
+                (0.62, 0.50),
+                (0.75, 0.40),
+                (0.92, 0.15),
+            ];
+            let (t, m) = table[count.min(6)];
+            push([0.0, 0.0, 0.0], t, m, 0.0);
+        }
         "sparse" => {
             for _ in 0..150 {
                 push(
@@ -189,16 +202,35 @@ fn m2l_bench(device: &wgpu::Device, queue: &wgpu::Queue, npairs: usize) {
         label: Some("m2l-bind"),
         layout: &layout,
         entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: mom_buf.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: src_buf.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 2, resource: r_buf.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 3, resource: out_buf.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 4, resource: uni_buf.as_entire_binding() },
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: mom_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: src_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: r_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: out_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: uni_buf.as_entire_binding(),
+            },
         ],
     });
-    let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("m2l") });
+    let mut enc =
+        device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("m2l") });
     {
-        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("m2l"), timestamp_writes: None });
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("m2l"),
+            timestamp_writes: None,
+        });
         pass.set_pipeline(&pipe);
         pass.set_bind_group(0, &bind, &[]);
         pass.dispatch_workgroups((npairs as u32).div_ceil(64), 1, 1);
@@ -216,7 +248,10 @@ fn m2l_bench(device: &wgpu::Device, queue: &wgpu::Queue, npairs: usize) {
         let _ = tx.send(r);
     });
     device
-        .poll(wgpu::PollType::Wait { submission_index: None, timeout: Some(std::time::Duration::from_secs(60)) })
+        .poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: Some(std::time::Duration::from_secs(60)),
+        })
         .unwrap();
     rx.recv().unwrap().unwrap();
     let gpu_ms = t.elapsed().as_secs_f64() * 1000.0;
@@ -237,7 +272,10 @@ fn m2l_bench(device: &wgpu::Device, queue: &wgpu::Queue, npairs: usize) {
             max_rel = max_rel.max(ar / denom).max(ai / denom);
         }
     }
-    println!("gpu one-sided: {:.3} us/pair ({npairs} pairs in {gpu_ms:.1} ms)", gpu_ms * 1000.0 / npairs as f64);
+    println!(
+        "gpu one-sided: {:.3} us/pair ({npairs} pairs in {gpu_ms:.1} ms)",
+        gpu_ms * 1000.0 / npairs as f64
+    );
     println!("vs cpu: max_abs={max_abs:e} max_rel={max_rel:e}");
 }
 
@@ -258,7 +296,8 @@ fn m2lacc_bench(device: &wgpu::Device, queue: &wgpu::Queue) {
     let (_, fmin) = fmm::mac::f_prepass_par(&bodies, &tree, nt);
 
     let t = std::time::Instant::now();
-    let rec = fmm::walk::record_pairs_par(&bodies, &tree, p, 1e-2, &pows, &binom, &fmin, &moments, nt);
+    let rec =
+        fmm::walk::record_pairs_par(&bodies, &tree, p, 1e-2, &pows, &binom, &fmin, &moments, nt);
     let record_ms = t.elapsed().as_secs_f64() * 1000.0;
     println!("record: {} pairs in {record_ms:.1} ms", rec.pairs.len());
 
@@ -299,7 +338,11 @@ fn m2lacc_bench(device: &wgpu::Device, queue: &wgpu::Queue) {
             let src = gsrc[starts[c] as usize + s] as usize;
             let cc = tree.cells[c].cen;
             let cs = tree.cells[src].cen;
-            fmm::harmonic::theta_table_into([cc[0] - cs[0], cc[1] - cs[1], cc[2] - cs[2]], p, &mut th);
+            fmm::harmonic::theta_table_into(
+                [cc[0] - cs[0], cc[1] - cs[1], cc[2] - cs[2]],
+                p,
+                &mut th,
+            );
             for nn in 0..=p {
                 for m in -(nn as i32)..=nn as i32 {
                     let mut fb = C::ZERO;
@@ -322,7 +365,18 @@ fn m2lacc_bench(device: &wgpu::Device, queue: &wgpu::Queue) {
     let mut b2 = bodies.clone();
     let mut locals_b = vec![C::ZERO; ncells * d];
     let t = std::time::Instant::now();
-    fmm::walk::dual_walk_par(&mut b2, &tree, p, 1e-2, &pows, &binom, &fmin, &moments, &mut locals_b, nt);
+    fmm::walk::dual_walk_par(
+        &mut b2,
+        &tree,
+        p,
+        1e-2,
+        &pows,
+        &binom,
+        &fmin,
+        &moments,
+        &mut locals_b,
+        nt,
+    );
     let walk_ms = t.elapsed().as_secs_f64() * 1000.0;
     println!("cpu dual_walk_par total: {walk_ms:.1} ms");
 
@@ -369,11 +423,26 @@ fn m2lacc_bench(device: &wgpu::Device, queue: &wgpu::Queue) {
         label: Some("acc-s1bind"),
         layout: &s1_layout,
         entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: mom_buf.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: src_buf.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 2, resource: r_buf.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 3, resource: slots_buf.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 4, resource: s1_uni.as_entire_binding() },
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: mom_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: src_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: r_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: slots_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: s1_uni.as_entire_binding(),
+            },
         ],
     });
     let gstart_buf = init("acc-gstart", bytemuck::cast_slice(&starts));
@@ -395,23 +464,46 @@ fn m2lacc_bench(device: &wgpu::Device, queue: &wgpu::Queue) {
         label: Some("acc-redbind"),
         layout: &red_layout,
         entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: slots_buf.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: gstart_buf.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 2, resource: gcount_buf.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 3, resource: out_buf.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 4, resource: red_uni.as_entire_binding() },
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: slots_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: gstart_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: gcount_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: out_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: red_uni.as_entire_binding(),
+            },
         ],
     });
-    let up_mb = (m32.len() * 8 + rslots.len() * 16 + gsrc.len() * 4 + starts.len() * 8) as f64 / 1e6;
-    let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("acc") });
+    let up_mb =
+        (m32.len() * 8 + rslots.len() * 16 + gsrc.len() * 4 + starts.len() * 8) as f64 / 1e6;
+    let mut enc =
+        device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("acc") });
     {
-        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("acc-s1"), timestamp_writes: None });
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("acc-s1"),
+            timestamp_writes: None,
+        });
         pass.set_pipeline(&s1_pipe);
         pass.set_bind_group(0, &s1_bind, &[]);
         pass.dispatch_workgroups((total as u32).div_ceil(64), 1, 1);
     }
     {
-        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("acc-red"), timestamp_writes: None });
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("acc-red"),
+            timestamp_writes: None,
+        });
         pass.set_pipeline(&red_pipe);
         pass.set_bind_group(0, &red_bind, &[]);
         pass.dispatch_workgroups(((ncells * d) as u32).div_ceil(64), 1, 1);
@@ -430,7 +522,10 @@ fn m2lacc_bench(device: &wgpu::Device, queue: &wgpu::Queue) {
         let _ = tx.send(r);
     });
     device
-        .poll(wgpu::PollType::Wait { submission_index: None, timeout: Some(std::time::Duration::from_secs(60)) })
+        .poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: Some(std::time::Duration::from_secs(60)),
+        })
         .unwrap();
     rx.recv().unwrap().unwrap();
     let gpu_ms = t.elapsed().as_secs_f64() * 1000.0;
@@ -457,7 +552,14 @@ fn m2lacc_bench(device: &wgpu::Device, queue: &wgpu::Queue) {
     cmp("refA serial-one-sided", &locals_a);
     cmp("refB dual_walk_par", &locals_b);
 }
-fn gpufull_bench(device: &wgpu::Device, queue: &wgpu::Queue, n: usize, reference: &str, p: usize, eps: f64) {
+fn gpufull_bench(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    n: usize,
+    reference: &str,
+    p: usize,
+    eps: f64,
+) {
     use fmm::harmonic::{dim, C};
     let d = dim(p);
     let nt = 12usize;
@@ -468,8 +570,11 @@ fn gpufull_bench(device: &wgpu::Device, queue: &wgpu::Queue, n: usize, reference
     let nslots = bodies.x.len();
 
     // CPU cell tables.
-    let centers: Vec<[f32; 4]> = tree.cells.iter()
-        .map(|c| [c.cen[0] as f32, c.cen[1] as f32, c.cen[2] as f32, 0.0]).collect();
+    let centers: Vec<[f32; 4]> = tree
+        .cells
+        .iter()
+        .map(|c| [c.cen[0] as f32, c.cen[1] as f32, c.cen[2] as f32, 0.0])
+        .collect();
     let cfirst: Vec<u32> = tree.cells.iter().map(|c| c.first as u32).collect();
     let ccount: Vec<u32> = tree.cells.iter().map(|c| c.count as u32).collect();
     let mut children = vec![u32::MAX; ncells * 8];
@@ -494,7 +599,14 @@ fn gpufull_bench(device: &wgpu::Device, queue: &wgpu::Queue, n: usize, reference
         }
     }
     let pos: Vec<[f32; 4]> = (0..nslots)
-        .map(|k| [bodies.x[k] as f32, bodies.y[k] as f32, bodies.z[k] as f32, bodies.m[k] as f32])
+        .map(|k| {
+            [
+                bodies.x[k] as f32,
+                bodies.y[k] as f32,
+                bodies.z[k] as f32,
+                bodies.m[k] as f32,
+            ]
+        })
         .collect();
 
     // Traversal: M2L pairs + P2P leaf pairs.
@@ -507,7 +619,17 @@ fn gpufull_bench(device: &wgpu::Device, queue: &wgpu::Queue, n: usize, reference
     let binom = fmm::moments::binomials(p);
     let (_, fmin) = fmm::mac::f_prepass_par(&bodies, &tree, nt);
     let t = std::time::Instant::now();
-    let rec = fmm::walk::record_pairs_par(&bodies, &tree, p, eps, &pows, &binom, &fmin, &moments_cpu, nt);
+    let rec = fmm::walk::record_pairs_par(
+        &bodies,
+        &tree,
+        p,
+        eps,
+        &pows,
+        &binom,
+        &fmin,
+        &moments_cpu,
+        nt,
+    );
     let record_ms = t.elapsed().as_secs_f64() * 1000.0;
 
     // M2L groups by dst.
@@ -537,7 +659,14 @@ fn gpufull_bench(device: &wgpu::Device, queue: &wgpu::Queue, n: usize, reference
 
     // P2P partner-body CSR per leaf ordinal (tiled kernel) + fat split.
     let mut pb = gpufmm::build_p2p_bodies(&rec.p2p, ncells, &leaf_ids, &cfirst, &ccount);
-    let fj = gpufmm::split_fat(&mut pb, &leaf_ids, &cfirst, &ccount, gpufmm::FAT_THR, gpufmm::FAT_CHUNK);
+    let fj = gpufmm::split_fat(
+        &mut pb,
+        &leaf_ids,
+        &cfirst,
+        &ccount,
+        gpufmm::FAT_THR,
+        gpufmm::FAT_CHUNK,
+    );
     println!("gpufull n={n}: cells={ncells} leaves={} m2l={} directed={total} p2pbodies={} record={record_ms:.1}ms",
         leaf_ids.len(), rec.pairs.len(), pb.list.len());
 
@@ -556,32 +685,48 @@ fn gpufull_bench(device: &wgpu::Device, queue: &wgpu::Queue, n: usize, reference
     let cc_buf = sbuf("g-ccount", bytemuck::cast_slice(&ccount));
     let ch_buf = sbuf("g-children", bytemuck::cast_slice(&children));
     let leaf_buf = sbuf("g-leaves", bytemuck::cast_slice(&leaf_ids));
-    let lvl_buf = sbuf("g-levels", bytemuck::cast_slice(&level_idx.iter().map(|&c| c as u32).collect::<Vec<_>>()));
+    let lvl_buf = sbuf(
+        "g-levels",
+        bytemuck::cast_slice(&level_idx.iter().map(|&c| c as u32).collect::<Vec<_>>()),
+    );
     let cos_buf = sbuf("g-cos", bytemuck::cast_slice(&cell_of_slot));
     let mom_buf = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("g-mom"), size: (ncells * d * 8) as u64,
-        usage: wgpu::BufferUsages::STORAGE, mapped_at_creation: false,
+        label: Some("g-mom"),
+        size: (ncells * d * 8) as u64,
+        usage: wgpu::BufferUsages::STORAGE,
+        mapped_at_creation: false,
     });
     let loc_buf = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("g-loc"), size: (ncells * d * 8) as u64,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false,
+        label: Some("g-loc"),
+        size: (ncells * d * 8) as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
     });
     let acc_buf = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("g-acc"), size: (nslots * 16) as u64,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false,
+        label: Some("g-acc"),
+        size: (nslots * 16) as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
     });
     let rslots: Vec<[f32; 4]> = (0..total)
         .map(|j| {
             let ca = tree.cells[gsrc[j] as usize].cen;
             let cb = tree.cells[gdst[j] as usize].cen;
-            [(cb[0] - ca[0]) as f32, (cb[1] - ca[1]) as f32, (cb[2] - ca[2]) as f32, 0.0]
+            [
+                (cb[0] - ca[0]) as f32,
+                (cb[1] - ca[1]) as f32,
+                (cb[2] - ca[2]) as f32,
+                0.0,
+            ]
         })
         .collect();
     let gsrc_buf = sbuf("g-gsrc", bytemuck::cast_slice(&gsrc));
     let gr_buf = sbuf("g-gr", bytemuck::cast_slice(&rslots));
     let slots_buf = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("g-slots"), size: (total.max(1) * d * 8) as u64,
-        usage: wgpu::BufferUsages::STORAGE, mapped_at_creation: false,
+        label: Some("g-slots"),
+        size: (total.max(1) * d * 8) as u64,
+        usage: wgpu::BufferUsages::STORAGE,
+        mapped_at_creation: false,
     });
     let gs_buf = sbuf("g-gstart", bytemuck::cast_slice(&starts));
     let gc_buf = sbuf("g-gcount", bytemuck::cast_slice(&counts));
@@ -593,8 +738,10 @@ fn gpufull_bench(device: &wgpu::Device, queue: &wgpu::Queue, n: usize, reference
     let fjo_buf = sbuf("g-fjob-o", bytemuck::cast_slice(&fj.job_off));
     let fjn_buf = sbuf("g-fjob-n", bytemuck::cast_slice(&fj.job_len));
     let fscr_buf = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("g-fscr"), size: (fj.njobs.max(1) * 64 * 16) as u64,
-        usage: wgpu::BufferUsages::STORAGE, mapped_at_creation: false,
+        label: Some("g-fscr"),
+        size: (fj.njobs.max(1) * 64 * 16) as u64,
+        usage: wgpu::BufferUsages::STORAGE,
+        mapped_at_creation: false,
     });
     let ffs_buf = sbuf("g-ffstart", bytemuck::cast_slice(&fj.fat_start));
     let ffc_buf = sbuf("g-ffcf", bytemuck::cast_slice(&fj.fat_cf));
@@ -603,10 +750,14 @@ fn gpufull_bench(device: &wgpu::Device, queue: &wgpu::Queue, n: usize, reference
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("g-bind"),
             layout,
-            entries: &bufs.iter().enumerate().map(|(i, b)| wgpu::BindGroupEntry {
-                binding: i as u32,
-                resource: b.as_entire_binding(),
-            }).collect::<Vec<_>>(),
+            entries: &bufs
+                .iter()
+                .enumerate()
+                .map(|(i, b)| wgpu::BindGroupEntry {
+                    binding: i as u32,
+                    resource: b.as_entire_binding(),
+                })
+                .collect::<Vec<_>>(),
         })
     };
 
@@ -630,7 +781,9 @@ fn gpufull_bench(device: &wgpu::Device, queue: &wgpu::Queue, n: usize, reference
     let red_p = gpufmm::m2l_red_pipeline(device, &red_l);
 
     let t = std::time::Instant::now();
-    let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("gfull") });
+    let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("gfull"),
+    });
     // NOTE: each dispatch gets its OWN uniform buffer. A shared buffer
     // rewritten between dispatches does NOT work: all writes land before
     // the single submit, so every pass would read the last value.
@@ -643,15 +796,24 @@ fn gpufull_bench(device: &wgpu::Device, queue: &wgpu::Queue, n: usize, reference
     };
     let mut keepalive: Vec<wgpu::Buffer> = Vec::new();
     let mut keepbind: Vec<wgpu::BindGroup> = Vec::new();
-    let pass = |enc: &mut wgpu::CommandEncoder, label: &str, pipe: &wgpu::ComputePipeline,
-                layout: &wgpu::BindGroupLayout, bufs: &[&wgpu::Buffer], vals: &[u32; 4], n: u32,
-                keepalive: &mut Vec<wgpu::Buffer>, keepbind: &mut Vec<wgpu::BindGroup>| {
+    let pass = |enc: &mut wgpu::CommandEncoder,
+                label: &str,
+                pipe: &wgpu::ComputePipeline,
+                layout: &wgpu::BindGroupLayout,
+                bufs: &[&wgpu::Buffer],
+                vals: &[u32; 4],
+                n: u32,
+                keepalive: &mut Vec<wgpu::Buffer>,
+                keepbind: &mut Vec<wgpu::BindGroup>| {
         let ub = mkuni(vals);
         let mut all: Vec<&wgpu::Buffer> = bufs.to_vec();
         all.push(&ub);
         let bg = bind2(layout, &all);
         {
-            let mut p = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some(label), timestamp_writes: None });
+            let mut p = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some(label),
+                timestamp_writes: None,
+            });
             p.set_pipeline(pipe);
             p.set_bind_group(0, &bg, &[]);
             p.dispatch_workgroups(n.div_ceil(64), 1, 1);
@@ -659,45 +821,143 @@ fn gpufull_bench(device: &wgpu::Device, queue: &wgpu::Queue, n: usize, reference
         keepalive.push(ub);
         keepbind.push(bg);
     };
-    pass(&mut enc, "p2m", &p2m_p, &p2m_l, &[&pos_buf, &leaf_buf, &cen_buf, &cf_buf, &cc_buf, &mom_buf],
-        &[d as u32, leaf_ids.len() as u32, 0, 0], leaf_ids.len() as u32, &mut keepalive, &mut keepbind);
+    pass(
+        &mut enc,
+        "p2m",
+        &p2m_p,
+        &p2m_l,
+        &[&pos_buf, &leaf_buf, &cen_buf, &cf_buf, &cc_buf, &mom_buf],
+        &[d as u32, leaf_ids.len() as u32, 0, 0],
+        leaf_ids.len() as u32,
+        &mut keepalive,
+        &mut keepbind,
+    );
     for l in (0..nlevels).rev() {
         let lo = level_off[l];
         let ct = level_off[l + 1] - lo;
         let (lo, ct) = (lo as u32, ct as u32);
-        if ct == 0 { continue; }
-        pass(&mut enc, "m2m", &m2m_p, &m2m_l, &[&mom_buf, &cen_buf, &ch_buf, &lvl_buf],
-            &[d as u32, ct, lo, 0], ct, &mut keepalive, &mut keepbind);
+        if ct == 0 {
+            continue;
+        }
+        pass(
+            &mut enc,
+            "m2m",
+            &m2m_p,
+            &m2m_l,
+            &[&mom_buf, &cen_buf, &ch_buf, &lvl_buf],
+            &[d as u32, ct, lo, 0],
+            ct,
+            &mut keepalive,
+            &mut keepbind,
+        );
     }
-    pass(&mut enc, "m2ls1", &s1_p, &s1_l, &[&mom_buf, &gsrc_buf, &gr_buf, &slots_buf],
-        &[0u32, d as u32, total as u32, 0u32], total.max(1) as u32, &mut keepalive, &mut keepbind);
-    pass(&mut enc, "m2lred", &red_p, &red_l, &[&slots_buf, &gs_buf, &gc_buf, &loc_buf],
-        &[ncells as u32, d as u32, 0u32, 0u32], (ncells * d) as u32, &mut keepalive, &mut keepbind);
+    pass(
+        &mut enc,
+        "m2ls1",
+        &s1_p,
+        &s1_l,
+        &[&mom_buf, &gsrc_buf, &gr_buf, &slots_buf],
+        &[0u32, d as u32, total as u32, 0u32],
+        total.max(1) as u32,
+        &mut keepalive,
+        &mut keepbind,
+    );
+    pass(
+        &mut enc,
+        "m2lred",
+        &red_p,
+        &red_l,
+        &[&slots_buf, &gs_buf, &gc_buf, &loc_buf],
+        &[ncells as u32, d as u32, 0u32, 0u32],
+        (ncells * d) as u32,
+        &mut keepalive,
+        &mut keepbind,
+    );
     for l in 0..nlevels {
         let lo = level_off[l];
         let ct = level_off[l + 1] - lo;
         let (lo, ct) = (lo as u32, ct as u32);
-        if ct == 0 { continue; }
-        pass(&mut enc, "l2l", &l2l_p, &l2l_l, &[&loc_buf, &cen_buf, &ch_buf, &lvl_buf],
-            &[d as u32, ct, lo, 0], ct, &mut keepalive, &mut keepbind);
+        if ct == 0 {
+            continue;
+        }
+        pass(
+            &mut enc,
+            "l2l",
+            &l2l_p,
+            &l2l_l,
+            &[&loc_buf, &cen_buf, &ch_buf, &lvl_buf],
+            &[d as u32, ct, lo, 0],
+            ct,
+            &mut keepalive,
+            &mut keepbind,
+        );
     }
-    pass(&mut enc, "l2p", &l2p_p, &l2p_l, &[&pos_buf, &cos_buf, &cen_buf, &loc_buf, &acc_buf],
-        &[d as u32, nslots as u32, 0, 0], nslots as u32, &mut keepalive, &mut keepbind);
-    pass(&mut enc, "p2p", &p2p_p, &p2p_l, &[&pos_buf, &leaf_buf, &cf_buf, &cc_buf, &pbs_buf, &pbc_buf, &pbl_buf, &acc_buf],
-        &[leaf_ids.len() as u32, 0, 0, 0], leaf_ids.len() as u32 * 64, &mut keepalive, &mut keepbind);
-    pass(&mut enc, "fat", &fat_p, &fat_l, &[&pos_buf, &fjs_buf, &fjc_buf, &fjo_buf, &fjn_buf, &pbl_buf, &fscr_buf],
-        &[fj.njobs as u32, 0, 0, 0], fj.njobs as u32 * 64, &mut keepalive, &mut keepbind);
-    pass(&mut enc, "fatred", &fatred_p, &fatred_l, &[&fscr_buf, &ffs_buf, &ffc_buf, &ffx_buf, &acc_buf],
-        &[fj.nfat as u32, 0, 0, 0], fj.nfat as u32 * 64, &mut keepalive, &mut keepbind);
+    pass(
+        &mut enc,
+        "l2p",
+        &l2p_p,
+        &l2p_l,
+        &[&pos_buf, &cos_buf, &cen_buf, &loc_buf, &acc_buf],
+        &[d as u32, nslots as u32, 0, 0],
+        nslots as u32,
+        &mut keepalive,
+        &mut keepbind,
+    );
+    pass(
+        &mut enc,
+        "p2p",
+        &p2p_p,
+        &p2p_l,
+        &[
+            &pos_buf, &leaf_buf, &cf_buf, &cc_buf, &pbs_buf, &pbc_buf, &pbl_buf, &acc_buf,
+        ],
+        &[leaf_ids.len() as u32, 0, 0, 0],
+        leaf_ids.len() as u32 * 64,
+        &mut keepalive,
+        &mut keepbind,
+    );
+    pass(
+        &mut enc,
+        "fat",
+        &fat_p,
+        &fat_l,
+        &[
+            &pos_buf, &fjs_buf, &fjc_buf, &fjo_buf, &fjn_buf, &pbl_buf, &fscr_buf,
+        ],
+        &[fj.njobs as u32, 0, 0, 0],
+        fj.njobs as u32 * 64,
+        &mut keepalive,
+        &mut keepbind,
+    );
+    pass(
+        &mut enc,
+        "fatred",
+        &fatred_p,
+        &fatred_l,
+        &[&fscr_buf, &ffs_buf, &ffc_buf, &ffx_buf, &acc_buf],
+        &[fj.nfat as u32, 0, 0, 0],
+        fj.nfat as u32 * 64,
+        &mut keepalive,
+        &mut keepbind,
+    );
     let rb = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("g-rb"), size: (nslots * 16) as u64,
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false,
+        label: Some("g-rb"),
+        size: (nslots * 16) as u64,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
     });
     enc.copy_buffer_to_buffer(&acc_buf, 0, &rb, 0, (nslots * 16) as u64);
     queue.submit([enc.finish()]);
     let (tx, rx) = std::sync::mpsc::channel();
-    rb.map_async(wgpu::MapMode::Read, .., move |r| { let _ = tx.send(r); });
-    device.poll(wgpu::PollType::Wait { submission_index: None, timeout: Some(std::time::Duration::from_secs(120)) }).unwrap();
+    rb.map_async(wgpu::MapMode::Read, .., move |r| {
+        let _ = tx.send(r);
+    });
+    device
+        .poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: Some(std::time::Duration::from_secs(120)),
+        })
+        .unwrap();
     rx.recv().unwrap().unwrap();
     let gpu_ms = t.elapsed().as_secs_f64() * 1000.0;
     let data = rb.get_mapped_range(..).expect("map").to_vec();
@@ -735,14 +995,21 @@ fn rel_err(gpu_acc: &[[f32; 4]], da: &[[f64; 3]], order: &[u32], nslots: usize) 
         let dy = gpu_acc[k][1] as f64 - da[id][1];
         let dz = gpu_acc[k][2] as f64 - da[id][2];
         let err = (dx * dx + dy * dy + dz * dz).sqrt();
-        let mag = (da[id][0] * da[id][0] + da[id][1] * da[id][1] + da[id][2] * da[id][2]).sqrt().max(1e-9);
+        let mag = (da[id][0] * da[id][0] + da[id][1] * da[id][1] + da[id][2] * da[id][2])
+            .sqrt()
+            .max(1e-9);
         max_rel = max_rel.max(err / mag);
         sum_rel += err / mag;
     }
     (max_rel, sum_rel / nslots as f64)
 }
 
-fn rel_err_gpu_fmm(gpu_acc: &[[f32; 4]], fa: &[[f64; 3]], order: &[u32], nslots: usize) -> (f64, f64) {
+fn rel_err_gpu_fmm(
+    gpu_acc: &[[f32; 4]],
+    fa: &[[f64; 3]],
+    order: &[u32],
+    nslots: usize,
+) -> (f64, f64) {
     let mut max_rel = 0.0f64;
     let mut sum_rel = 0.0f64;
     for k in 0..nslots {
@@ -751,7 +1018,9 @@ fn rel_err_gpu_fmm(gpu_acc: &[[f32; 4]], fa: &[[f64; 3]], order: &[u32], nslots:
         let dy = gpu_acc[k][1] as f64 - fa[id][1];
         let dz = gpu_acc[k][2] as f64 - fa[id][2];
         let err = (dx * dx + dy * dy + dz * dz).sqrt();
-        let mag = (fa[id][0] * fa[id][0] + fa[id][1] * fa[id][1] + fa[id][2] * fa[id][2]).sqrt().max(1e-9);
+        let mag = (fa[id][0] * fa[id][0] + fa[id][1] * fa[id][1] + fa[id][2] * fa[id][2])
+            .sqrt()
+            .max(1e-9);
         max_rel = max_rel.max(err / mag);
         sum_rel += err / mag;
     }
@@ -766,14 +1035,17 @@ fn rel_err_fmm_direct(fa: &[[f64; 3]], da: &[[f64; 3]], n: usize) -> (f64, f64) 
         let dy = fa[id][1] - da[id][1];
         let dz = fa[id][2] - da[id][2];
         let err = (dx * dx + dy * dy + dz * dz).sqrt();
-        let mag = (da[id][0] * da[id][0] + da[id][1] * da[id][1] + da[id][2] * da[id][2]).sqrt().max(1e-9);
+        let mag = (da[id][0] * da[id][0] + da[id][1] * da[id][1] + da[id][2] * da[id][2])
+            .sqrt()
+            .max(1e-9);
         max_rel = max_rel.max(err / mag);
         sum_rel += err / mag;
     }
     (max_rel, sum_rel / n as f64)
 }
 
-fn gpuloop_bench(device: &wgpu::Device, queue: &wgpu::Queue, n: usize, steps: usize) {    let parts = fmm::models::plummer(n, [0.0; 3], 42);
+fn gpuloop_bench(device: &wgpu::Device, queue: &wgpu::Queue, n: usize, steps: usize) {
+    let parts = fmm::models::plummer(n, [0.0; 3], 42);
     let pos: Vec<[f64; 3]> = parts.iter().map(|p| p.pos).collect();
     let mass: Vec<f64> = parts.iter().map(|p| p.mass).collect();
     let mut be = gpufmm::GpuBackend::new(device, queue, 4);
@@ -786,7 +1058,10 @@ fn gpuloop_bench(device: &wgpu::Device, queue: &wgpu::Queue, n: usize, steps: us
         per.push(s.elapsed().as_secs_f64() * 1000.0);
     }
     let ms = t.elapsed().as_secs_f64() * 1000.0 / steps as f64;
-    println!("gpuloop n={n} steps={steps} k=4: {ms:.1} ms/step = {:.1} steps/s", 1000.0 / ms);
+    println!(
+        "gpuloop n={n} steps={steps} k=4: {ms:.1} ms/step = {:.1} steps/s",
+        1000.0 / ms
+    );
     if steps <= 16 {
         let s: Vec<String> = per.iter().map(|v| format!("{v:.0}")).collect();
         println!("  per-step ms: {}", s.join(" "));
@@ -811,7 +1086,9 @@ fn gpusim_run(device: &wgpu::Device, queue: &wgpu::Queue, n: usize, steps: usize
                 }
                 mx = mx.max(sim.vel[i][d].abs());
             }
-            let r2 = sim.pos[i][0] * sim.pos[i][0] + sim.pos[i][1] * sim.pos[i][1] + sim.pos[i][2] * sim.pos[i][2];
+            let r2 = sim.pos[i][0] * sim.pos[i][0]
+                + sim.pos[i][1] * sim.pos[i][1]
+                + sim.pos[i][2] * sim.pos[i][2];
             if r2 > 400.0 {
                 esc += 1;
             }
@@ -830,12 +1107,21 @@ fn gpuprof_bench(device: &wgpu::Device, queue: &wgpu::Queue, n: usize, reps: usi
     let (ncells, total, nleaf, nlevels, nlist) = be.stats();
     let (mcc, avgcc, mt, at, mx) = be.p2p_dist();
     println!("gpuprof n={n}: cells={ncells} leaves={nleaf} levels={nlevels} directed={total} p2pnlist={nlist}");
-    println!("  leaf cc: max={mcc} avg={avgcc:.1} | partners: max={mt} avg={at:.0} | max prod={mx}");
+    println!(
+        "  leaf cc: max={mcc} avg={avgcc:.1} | partners: max={mt} avg={at:.0} | max prod={mx}"
+    );
     let (nl, nb, ni) = be.fat_census();
     println!("  fat-split: leaves={nl} bodies={nb} iters={ni}");
-    println!("f64: {} timestamp: {}", device.features().contains(wgpu::Features::SHADER_F64),
-        device.features().contains(wgpu::Features::TIMESTAMP_QUERY));
-    let mut best: Vec<(&str, f64)> = be.profile_step(&pos, &mass).into_iter().map(|(k, _)| (k, f64::MAX)).collect();
+    println!(
+        "f64: {} timestamp: {}",
+        device.features().contains(wgpu::Features::SHADER_F64),
+        device.features().contains(wgpu::Features::TIMESTAMP_QUERY)
+    );
+    let mut best: Vec<(&str, f64)> = be
+        .profile_step(&pos, &mass)
+        .into_iter()
+        .map(|(k, _)| (k, f64::MAX))
+        .collect();
     for _ in 0..reps {
         for (i, (k, v)) in be.profile_step(&pos, &mass).into_iter().enumerate() {
             if v < best[i].1 {
@@ -876,17 +1162,30 @@ fn gpureuse_check(device: &wgpu::Device, queue: &wgpu::Queue, k: u64) {
     be2.accel_with_refresh(&pos0, &mass, true);
     let a_frozen = be2.accel_with_refresh(&pos, &mass, false);
     let fmm = fmm::fmm::Fmm::new(
-        &pos.iter().zip(mass.iter()).map(|(p, m)| fmm::models::Particle { mass: *m, pos: *p }).collect::<Vec<_>>(),
-        4, 1e-2, 64,
+        &pos.iter()
+            .zip(mass.iter())
+            .map(|(p, m)| fmm::models::Particle { mass: *m, pos: *p })
+            .collect::<Vec<_>>(),
+        4,
+        1e-2,
+        64,
     );
-    let tmp_parts: Vec<fmm::models::Particle> = pos.iter().zip(mass.iter())
-        .map(|(p, m)| fmm::models::Particle { mass: *m, pos: *p }).collect();
+    let tmp_parts: Vec<fmm::models::Particle> = pos
+        .iter()
+        .zip(mass.iter())
+        .map(|(p, m)| fmm::models::Particle { mass: *m, pos: *p })
+        .collect();
     let out = fmm.run_threaded(&tmp_parts, 12);
     let cmp = |name: &str, a: &[[f64; 3]], b: &[[f64; 3]]| {
         let (mut mx, mut sm) = (0.0f64, 0.0f64);
         for i in 0..n {
-            let e = ((a[i][0] - b[i][0]).powi(2) + (a[i][1] - b[i][1]).powi(2) + (a[i][2] - b[i][2]).powi(2)).sqrt();
-            let m = (b[i][0].powi(2) + b[i][1].powi(2) + b[i][2].powi(2)).sqrt().max(1e-9);
+            let e = ((a[i][0] - b[i][0]).powi(2)
+                + (a[i][1] - b[i][1]).powi(2)
+                + (a[i][2] - b[i][2]).powi(2))
+            .sqrt();
+            let m = (b[i][0].powi(2) + b[i][1].powi(2) + b[i][2].powi(2))
+                .sqrt()
+                .max(1e-9);
             mx = mx.max(e / m);
             sm += e / m;
         }
@@ -947,6 +1246,8 @@ fn main() {
     let mut gpuprof_mode: Option<(usize, usize)> = None;
     let mut gpureuse_mode: Option<u64> = None;
     let mut count = 1500usize;
+    let mut exposure = 1.4f32;
+    let mut gas_mode: Option<String> = None;
     let mut point_size = 0.035f32;
     let mut i = 1;
     while i < a.len() {
@@ -995,6 +1296,17 @@ fn main() {
                     .get(i + 1)
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(point_size);
+                i += 2;
+            }
+            "--exposure" => {
+                exposure = a
+                    .get(i + 1)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(exposure);
+                i += 2;
+            }
+            "--gas" => {
+                gas_mode = a.get(i + 1).cloned().or(gas_mode);
                 i += 2;
             }
             "--phys" => {
@@ -1052,8 +1364,6 @@ fn main() {
             _ => i += 1,
         }
     }
-    let exposure = 1.4f32;
-
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::HighPerformance,
@@ -1103,7 +1413,46 @@ fn main() {
 
     let camera = Camera::new();
     let eye = camera.eye();
-    let items = craft_count(&mode, &eye, count);
+    let gas_items: Option<Vec<GpuItem>> = gas_mode.as_ref().map(|g| {
+        let (_, gas, _) = ic::generate(ic::Preset::Spiral, 20000, 42);
+        gas.into_iter()
+            .filter(|x| match g.as_str() {
+                "dust" => false,
+                _ => x.kind <= 2.5,
+            })
+            .map(|x| GpuItem {
+                pos: rebase(&x.pos, &eye),
+                speed: 0.0,
+                misc: [x.seed, x.size, x.kind, 0.0],
+            })
+            .collect()
+    });
+    let dust_scene: Option<(Vec<GpuItem>, Vec<GpuItem>)> =
+        matches!(gas_mode.as_deref(), Some("dust") | Some("stars")).then(|| {
+            let (stars, gas, _) = ic::generate(ic::Preset::Spiral, 20000, 42);
+            let si: Vec<GpuItem> = stars
+                .iter()
+                .map(|st| GpuItem {
+                    pos: rebase(&st.pos, &eye),
+                    speed: 0.0,
+                    misc: [st.temp, st.mag, 0.0, 0.0],
+                })
+                .collect();
+            let di: Vec<GpuItem> = gas
+                .into_iter()
+                .filter(|x| x.kind > 2.5 && gas_mode.as_deref() == Some("dust"))
+                .map(|x| GpuItem {
+                    pos: rebase(&x.pos, &eye),
+                    speed: 0.0,
+                    misc: [x.seed, x.size, x.kind, 0.0],
+                })
+                .collect();
+            (si, di)
+        });
+    let items = match &dust_scene {
+        Some((si, _)) => si.clone(),
+        None => gas_items.unwrap_or_else(|| craft_count(&mode, &eye, count)),
+    };
     let n = items.len();
     println!("items: {n}");
 
@@ -1115,6 +1464,13 @@ fn main() {
     state.n = n;
     let billboard =
         render::billboard_pipeline(&device, state.hdr_format, &uniform_layout, &storage_layout);
+    let emission =
+        render::emission_pipeline(&device, state.hdr_format, &uniform_layout, &storage_layout);
+    let dust = render::dust_pipeline(&device, state.hdr_format, &uniform_layout, &storage_layout);
+    let hdr_pipe: &wgpu::RenderPipeline = match gas_mode.as_deref() {
+        Some("em") => &emission,
+        _ => &billboard,
+    };
     let bright = render::bright_pipeline(&device, state.hdr_format, &tex_layout, &uni_layout);
     let blur = render::blur_pipeline(&device, state.hdr_format, &tex_layout, &uni_layout);
     let final_format = wgpu::TextureFormat::Rgba8UnormSrgb;
@@ -1215,17 +1571,20 @@ fn main() {
     let aspect = w as f32 / h.max(1) as f32;
     let vp = camera.view_proj(aspect);
     let (right, up) = camera.basis();
-    state.upload(
-        &queue,
-        &items,
-        &items,
-        &Uniform {
-            view_proj: vp.to_cols_array_2d(),
-            cam_right: [right.x, right.y, right.z, 0.0],
-            cam_up: [up.x, up.y, up.z, 0.0],
-            params: [point_size, 1.0, exposure, 0.0],
-        },
-    );
+    let uni = Uniform {
+        view_proj: vp.to_cols_array_2d(),
+        cam_right: [right.x, right.y, right.z, 0.0],
+        cam_up: [up.x, up.y, up.z, 0.0],
+        params: [point_size, 1.0, exposure, 0.0],
+    };
+    state.upload(&queue, &items, &items, &uni);
+    let dust_res: Option<(GpuState, usize)> = dust_scene.as_ref().map(|(_, di)| {
+        let mut ds = GpuState::new(&device, &uniform_layout, &storage_layout, di.len(), w, h);
+        ds.n = di.len();
+        ds.upload(&queue, di, di, &uni);
+        let n = di.len();
+        (ds, n)
+    });
     let bw = (w / 4).max(1) as f32;
     let bh = (h / 4).max(1) as f32;
     queue.write_buffer(
@@ -1294,7 +1653,29 @@ fn main() {
             pass.draw(0..3, 0..1);
         }
     };
-    post(&mut enc, "hdr", &state.hdr_view, &billboard, &[]);
+    post(&mut enc, "hdr", &state.hdr_view, hdr_pipe, &[]);
+    if let Some((ds, dn)) = &dust_res {
+        let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("hdr-dust"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &state.hdr_view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(&dust);
+        pass.set_bind_group(0, &state.uniform_bind, &[]);
+        pass.set_bind_group(1, &ds.storage_bind, &[]);
+        pass.draw(0..4, 0..*dn as u32);
+    }
     post(
         &mut enc,
         "bright",

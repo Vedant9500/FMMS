@@ -27,7 +27,7 @@ fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> Out {
         vec2<f32>(-0.5, -0.5), vec2<f32>(0.5, -0.5),
         vec2<f32>(-0.5, 0.5), vec2<f32>(0.5, 0.5));
     let c = corners[vi % 4u];
-    let base = u.params.x * (0.35 + tm.y * tm.y * 2.4);
+    let base = u.params.x * (0.18 + tm.y * tm.y * 3.0);
     let quad = mix(base, tm.z * length(p), step(0.0001, tm.z));
     let size = quad * 2.0;
     let world = p + (u.cam_right.xyz * c.x + u.cam_up.xyz * c.y) * size;
@@ -43,24 +43,151 @@ fn fs(in: Out) -> @location(0) vec4<f32> {
     let centered = in.uv - vec2<f32>(0.5, 0.5);
     let d = length(centered) * 2.0;
     let mag = clamp(in.tm.y, 0.0, 1.0);
-    let ck = mix(6.0, 14.0, smoothstep(0.0, 1.0, mag));
+    let ck = mix(2.0, 12.0, smoothstep(0.1, 0.9, mag));
     let core = exp(-d * d * ck);
-    let halo = pow(max(0.0, 1.0 - d), 3.0) * 0.3 * smoothstep(0.6, 0.95, mag);
+    let halo = pow(max(0.0, 1.0 - d), 3.0) * 0.22 * smoothstep(0.65, 0.95, mag);
     let sx = exp(-abs(centered.x) * 30.0) * exp(-abs(centered.y) * 7.0);
     let sy = exp(-abs(centered.y) * 30.0) * exp(-abs(centered.x) * 7.0);
-    let spike_gate = smoothstep(0.5, 0.9, mag);
+    let spike_gate = smoothstep(0.7, 0.95, mag);
     let spikes = (sx + sy) * spike_gate * 0.55;
     let total = core + halo + spikes;
     let edge = smoothstep(0.003, 0.03, total);
     let t = clamp(in.tm.x, 0.0, 1.0);
-    var col = mix(vec3<f32>(0.45, 0.62, 1.0), vec3<f32>(0.9, 0.93, 1.0), smoothstep(0.05, 0.45, t));
-    col = mix(col, vec3<f32>(1.0, 0.85, 0.65), smoothstep(0.55, 0.8, t));
-    col = mix(col, vec3<f32>(1.0, 0.45, 0.25), smoothstep(0.85, 1.0, t));
-    let core_col = mix(col, vec3<f32>(1.0), 0.55);
+    var col = mix(vec3<f32>(0.62, 0.70, 1.0), vec3<f32>(0.70, 0.78, 1.0), smoothstep(0.0, 0.15, t));
+    col = mix(col, vec3<f32>(0.82, 0.87, 1.0), smoothstep(0.15, 0.30, t));
+    col = mix(col, vec3<f32>(0.97, 0.97, 1.0), smoothstep(0.30, 0.45, t));
+    col = mix(col, vec3<f32>(1.0, 0.94, 0.84), smoothstep(0.45, 0.60, t));
+    col = mix(col, vec3<f32>(1.0, 0.78, 0.55), smoothstep(0.60, 0.78, t));
+    col = mix(col, vec3<f32>(1.0, 0.47, 0.16), smoothstep(0.78, 1.0, t));
+    let core_col = mix(col, vec3<f32>(1.0), mix(0.22, 0.0, smoothstep(0.4, 0.9, t)));
     let exposure = u.params.z;
-    let bright = 0.35 + mag * 2.2;
-    let hdr = (core * core_col * 2.2 + halo * col * 1.4 + spikes * mix(col, vec3<f32>(1.0), 0.5) * 2.4) * (exposure * bright);
+    let bright = 0.45 + 0.55 * mag;
+    let hdr = (core * core_col * 1.15 + halo * col * 1.2 + spikes * mix(col, vec3<f32>(1.0), 0.5) * 2.0) * (exposure * bright);
     return vec4<f32>(hdr * edge, 1.0);
+}
+"#;
+
+pub const GAS_NOISE: &str = r#"
+fn hash(p: vec2<f32>) -> f32 {
+    return fract(sin(dot(p, vec2<f32>(127.1, 311.7))) * 43758.5453);
+}
+fn vnoise(p: vec2<f32>) -> f32 {
+    let i = floor(p);
+    let f = fract(p);
+    let u = f * f * (3.0 - 2.0 * f);
+    return mix(mix(hash(i), hash(i + vec2<f32>(1.0, 0.0)), u.x),
+        mix(hash(i + vec2<f32>(0.0, 1.0)), hash(i + vec2<f32>(1.0, 1.0)), u.x), u.y);
+}
+fn fbm(p: vec2<f32>) -> f32 {
+    var v = 0.0;
+    var a = 0.5;
+    var q = p;
+    for (var i = 0; i < 4; i++) {
+        v += a * vnoise(q);
+        q *= 2.03;
+        a *= 0.5;
+    }
+    return v;
+}
+"#;
+
+pub const GAS_EMISSION: &str = r#"
+struct Uniform {
+    view_proj: mat4x4<f32>,
+    cam_right: vec4<f32>,
+    cam_up: vec4<f32>,
+    params: vec4<f32>,
+};
+@group(0) @binding(0) var<uniform> u: Uniform;
+struct Item { pos: vec3<f32>, speed: f32, misc: vec4<f32> };
+@group(1) @binding(0) var<storage, read> prev: array<Item>;
+@group(1) @binding(1) var<storage, read> curr: array<Item>;
+
+struct Out {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) tm: vec3<f32>,
+};
+
+@vertex
+fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> Out {
+    let p = curr[ii].pos;
+    let tm = curr[ii].misc.xyz;
+    let corners = array<vec2<f32>, 4>(
+        vec2<f32>(-0.5, -0.5), vec2<f32>(0.5, -0.5),
+        vec2<f32>(-0.5, 0.5), vec2<f32>(0.5, 0.5));
+    let c = corners[vi % 4u];
+    let world = p + (u.cam_right.xyz * c.x + u.cam_up.xyz * c.y) * tm.y * 2.0;
+    var o: Out;
+    o.clip = u.view_proj * vec4<f32>(world, 1.0);
+    o.uv = c + vec2<f32>(0.5, 0.5);
+    o.tm = tm;
+    return o;
+}
+
+@fragment
+fn fs(in: Out) -> @location(0) vec4<f32> {
+    let centered = in.uv - vec2<f32>(0.5, 0.5);
+    let r = length(centered) * 2.0;
+    let q0 = in.uv * 3.0 + in.tm.x * 17.0;
+    let q = q0 + u.params.w * vec2<f32>(0.02, 0.013);
+    let w = vec2<f32>(fbm(q), fbm(q + vec2<f32>(5.2, 1.3)));
+    let d = fbm(q + 1.4 * w);
+    let body = smoothstep(1.0, 0.2, r) * smoothstep(0.32, 0.72, d);
+    var col = vec3<f32>(1.0, 0.28, 0.36);
+    if (in.tm.z > 0.5 && in.tm.z < 1.5) {
+        col = mix(vec3<f32>(0.35, 0.85, 0.78), vec3<f32>(1.0, 0.32, 0.42), smoothstep(0.0, 0.7, r));
+    } else if (in.tm.z > 1.5) {
+        col = vec3<f32>(0.45, 0.60, 1.0);
+    }
+    return vec4<f32>(col * body * 1.1 * u.params.z, 1.0);
+}
+"#;
+
+pub const GAS_DUST: &str = r#"
+struct Uniform {
+    view_proj: mat4x4<f32>,
+    cam_right: vec4<f32>,
+    cam_up: vec4<f32>,
+    params: vec4<f32>,
+};
+@group(0) @binding(0) var<uniform> u: Uniform;
+struct Item { pos: vec3<f32>, speed: f32, misc: vec4<f32> };
+@group(1) @binding(0) var<storage, read> prev: array<Item>;
+@group(1) @binding(1) var<storage, read> curr: array<Item>;
+
+struct Out {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) tm: vec3<f32>,
+};
+
+@vertex
+fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> Out {
+    let p = curr[ii].pos;
+    let tm = curr[ii].misc.xyz;
+    let corners = array<vec2<f32>, 4>(
+        vec2<f32>(-0.5, -0.5), vec2<f32>(0.5, -0.5),
+        vec2<f32>(-0.5, 0.5), vec2<f32>(0.5, 0.5));
+    let c = corners[vi % 4u];
+    let world = p + (u.cam_right.xyz * c.x + u.cam_up.xyz * c.y) * tm.y * 2.0;
+    var o: Out;
+    o.clip = u.view_proj * vec4<f32>(world, 1.0);
+    o.uv = c + vec2<f32>(0.5, 0.5);
+    o.tm = tm;
+    return o;
+}
+
+@fragment
+fn fs(in: Out) -> @location(0) vec4<f32> {
+    let centered = in.uv - vec2<f32>(0.5, 0.5);
+    let r = length(centered) * 2.0;
+    let q0 = in.uv * 3.0 + in.tm.x * 17.0;
+    let q = q0 + u.params.w * vec2<f32>(0.02, 0.013);
+    let w = vec2<f32>(fbm(q), fbm(q + vec2<f32>(5.2, 1.3)));
+    let d = fbm(q + 1.4 * w);
+    let alpha = smoothstep(0.38, 0.8, d) * smoothstep(1.0, 0.35, r) * 0.62;
+    return vec4<f32>(vec3<f32>(0.012, 0.009, 0.007), alpha);
 }
 "#;
 
@@ -196,6 +323,103 @@ pub fn billboard_pipeline(
         multiview_mask: None,
         cache: None,
     })
+}
+
+fn gas_pipeline(
+    device: &wgpu::Device,
+    label: &str,
+    src: String,
+    hdr_format: wgpu::TextureFormat,
+    uniform_layout: &wgpu::BindGroupLayout,
+    storage_layout: &wgpu::BindGroupLayout,
+    blend: wgpu::BlendState,
+) -> wgpu::RenderPipeline {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some(label),
+        source: wgpu::ShaderSource::Wgsl(src.into()),
+    });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some(label),
+        bind_group_layouts: &[Some(uniform_layout), Some(storage_layout)],
+        immediate_size: 0,
+    });
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(label),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs"),
+            buffers: &[],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: hdr_format,
+                blend: Some(blend),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleStrip,
+            strip_index_format: None,
+            ..Default::default()
+        },
+        depth_stencil: None,
+        multisample: Default::default(),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+pub fn emission_pipeline(
+    device: &wgpu::Device,
+    hdr_format: wgpu::TextureFormat,
+    uniform_layout: &wgpu::BindGroupLayout,
+    storage_layout: &wgpu::BindGroupLayout,
+) -> wgpu::RenderPipeline {
+    gas_pipeline(
+        device,
+        "emission",
+        format!("{GAS_NOISE}{GAS_EMISSION}"),
+        hdr_format,
+        uniform_layout,
+        storage_layout,
+        wgpu::BlendState {
+            color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::One,
+                operation: wgpu::BlendOperation::Add,
+            },
+            alpha: wgpu::BlendComponent::REPLACE,
+        },
+    )
+}
+
+pub fn dust_pipeline(
+    device: &wgpu::Device,
+    hdr_format: wgpu::TextureFormat,
+    uniform_layout: &wgpu::BindGroupLayout,
+    storage_layout: &wgpu::BindGroupLayout,
+) -> wgpu::RenderPipeline {
+    gas_pipeline(
+        device,
+        "dust",
+        format!("{GAS_NOISE}{GAS_DUST}"),
+        hdr_format,
+        uniform_layout,
+        storage_layout,
+        wgpu::BlendState {
+            color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::SrcAlpha,
+                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                operation: wgpu::BlendOperation::Add,
+            },
+            alpha: wgpu::BlendComponent::REPLACE,
+        },
+    )
 }
 
 pub fn tonemap_pipeline(
@@ -427,6 +651,12 @@ mod tests {
             ("blur", BLUR),
         ] {
             naga::front::wgsl::parse_str(src).unwrap_or_else(|e| panic!("{name}: {e:?}"));
+        }
+        for (name, src) in [
+            ("emission", format!("{GAS_NOISE}{GAS_EMISSION}")),
+            ("dust", format!("{GAS_NOISE}{GAS_DUST}")),
+        ] {
+            naga::front::wgsl::parse_str(&src).unwrap_or_else(|e| panic!("{name}: {e:?}"));
         }
     }
 }

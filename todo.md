@@ -2,6 +2,62 @@
 
 Source of truth for exit gates: `ROADMAP.md` Phase 1 (lines 34-48).
 
+## Session log — 2026-09-07: gas G1 motion + scale fix
+
+Complaint: gas looked pasted-on (frozen while stars orbit; giant
+black center blob; sticker knots). Fixes: gas corotates rigidly at
+pattern speed (`pattern_speed`: spiral 0.35 / bh 0.5 / merger 0.2,
+angle=Ω·t applied at render, plus slow noise scroll via params.w);
+knots 0.06–0.26→0.04–0.14, lanes 0.15–0.5→0.08–0.28 with clear
+nucleus (lane r_min 0.35) and alpha 0.88→0.62; merger gas now
+generated per half and transformed with its stars (was stuck at
+origin); `generate()` returns (stars, gas, halo). Probe: dust dims
+12% of lit >20% (was 32%, no more black hole), knots 96% colored.
+34 tests green, warning-free, workspace green.
+
+## Session log — 2026-09-07: crisp-star pass (no more blobs)
+
+Complaint: stars render as big fuzzy balls; real galaxies show tiny
+crisp points. Causes: halo on top 40% of stars, spikes from mag 0.5,
+bloom 0.35/threshold 1.5/2 pairs spreading every hero into cotton.
+Fix (`render.rs` + app defaults): halo gated to top ~8%
+(0.22×smoothstep(0.65,0.95)), spikes to top ~2% (0.7–0.95), quad
+`0.18+3.0mag²` (stronger hero/field hierarchy, smaller field dots),
+defaults bloom 0.12 / threshold 1.5 / size 1 pair. Probe-measured:
+lit pixels −16%, mean blob 80→60px, ramp hues intact (M orange sat
+.53, K .86). Sliders still allow old look. 29 tests green,
+warning-free.
+
+## Session log — 2026-09-07: white-wash fix (shader levels, not data)
+
+Complaint: all stars white/off-white despite correct census (1/92/518/
+2711/7069/13660/75065/883). Probe ramp rig (`--mode ramp --count K`,
+new `--exposure` flag) proved it: O–G cores sat 1.00. Three stacked
+causes in `render.rs`: 55–30% core whitening, `bright=0.35+2.2mag`
+(+2.2 core heat ×1.4 exposure → every core ≥1.3 HDR → ACES clips to
+white), tight `ck 6–14` cores that sub-pixel dots never sample. Fix:
+whitening 22→0%, `bright=0.45+0.55mag` (size, not peak, carries rank),
+core heat 1.15, `ck 2–12` (dim dots filled, heroes structured),
+quad floor 0.35→0.22, app exposure default 1.4→1.0. Measured @1.0:
+M (144,104,76) sat .53, K sat .86, B blue envelope from +6px, sparse
+field 34% colored / 20% white (was ~100% white). 29 tests green,
+build warning-free.
+
+## Session log — 2026-09-06: physical Harvard star system (V1 look)
+
+Replaced fake `look()` (mass-linear temp, 0.4% hero hack) with cosmic
+OBAFGKM sampling: `SpecClass` + young/old abundance tables (M ~76%,
+O ~0 @100k), log-uniform Teff/L per class, `L` via class bounds,
+`temp` from log-Teff, `mag` from log-L (Sun ~0.5, M ~0-0.3, O/B ~1).
+Dyn masses untouched (10:1 stable); display rank-matched to mass so
+heavy bodies skew blue with zero physics change. Disk=young,
+bulge/halo/cluster=old + 3% giants; BH rim keeps hot-blue override.
+Shader: 7-stop blackbody ramp, M anchor orange (1.0,0.51,0.20) per
+PHOENIX, whitening fades red-ward. `teff`/`lum` ride Sim→Static→App;
+overlay shows live OBAFGKM+G census. Tests: 29 green (4 new:
+abundance young/old, rank-match, heroes<1.5%); build warning-free;
+workspace green; 20k spiral headless 6 steps, 0 escapers, max|v| ~1.3.
+
 ## Session log — 2026-09-06: visual presets (IC overhaul)
 
 Complaint: 100k default looked chaotic + white — Plummer blob, random
