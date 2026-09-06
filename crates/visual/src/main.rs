@@ -80,7 +80,9 @@ fn post_binds(
     state: &GpuState,
     uni_h: &wgpu::Buffer,
     uni_v: &wgpu::Buffer,
+    gas_uni: &wgpu::Buffer,
 ) -> (
+    wgpu::BindGroup,
     wgpu::BindGroup,
     wgpu::BindGroup,
     wgpu::BindGroup,
@@ -105,7 +107,6 @@ fn post_binds(
             ],
         })
     };
-    let bind_bright = tex("bind-bright", &state.hdr_view);
     let bind_blur_h = tex("bind-blur-h", &state.bright_view);
     let bind_blur_v = tex("bind-blur-v", &state.blur_a);
     let bind_blur_h2 = tex("bind-blur-h2", &state.blur_b);
@@ -139,16 +140,33 @@ fn post_binds(
                 binding: 3,
                 resource: wgpu::BindingResource::Sampler(sampler),
             },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: wgpu::BindingResource::TextureView(&state.gas_em_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 6,
+                resource: wgpu::BindingResource::TextureView(&state.gas_dust_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 7,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
         ],
     });
     (
-        bind_bright,
         bind_blur_h,
         uni(&"bind-blur-uh", uni_h),
         bind_blur_v,
         uni(&"bind-blur-uv", uni_v),
         bind_blur_h2,
         bind_composite,
+        tex("bind-dust-mask", &state.gas_dust_view),
+        uni(&"bind-gas-uni", gas_uni),
     )
 }
 
@@ -217,7 +235,6 @@ struct Graphics {
     tex_layout: wgpu::BindGroupLayout,
     composite_layout: wgpu::BindGroupLayout,
     uni_layout: wgpu::BindGroupLayout,
-    bind_bright: wgpu::BindGroup,
     bind_bright_uni: wgpu::BindGroup,
     bind_blur_h: wgpu::BindGroup,
     bind_blur_uh: wgpu::BindGroup,
@@ -226,6 +243,9 @@ struct Graphics {
     bind_blur_h2: wgpu::BindGroup,
     bind_composite: wgpu::BindGroup,
     bind_bloom_uni: wgpu::BindGroup,
+    bind_dust_mask: wgpu::BindGroup,
+    bind_gas_uni: wgpu::BindGroup,
+    gas_uni: wgpu::Buffer,
     blur_uni_h: wgpu::Buffer,
     blur_uni_v: wgpu::Buffer,
     bright_uni: wgpu::Buffer,
@@ -406,9 +426,15 @@ impl App {
             gpu_state.hdr_format,
             &uniform_layout,
             &storage_layout,
+            &tex_layout,
+            &uni_layout,
         );
-        let bright =
-            render::bright_pipeline(&device, gpu_state.hdr_format, &tex_layout, &uni_layout);
+        let bright = render::bright_pipeline(
+            &device,
+            gpu_state.hdr_format,
+            &composite_layout,
+            &uni_layout,
+        );
         let blur = render::blur_pipeline(&device, gpu_state.hdr_format, &tex_layout, &uni_layout);
         let tonemap = render::tonemap_pipeline(&device, format, &composite_layout, &uni_layout);
         let emission = render::emission_pipeline(
@@ -456,6 +482,13 @@ impl App {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        // G2 gas params: [redden strength, full/mask res scale, 0, 0].
+        let gas_uni = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("gas-uni"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let uni_bind = |label: &str, buf: &wgpu::Buffer| {
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some(label),
@@ -496,8 +529,9 @@ impl App {
             .spawn(move || physics_loop(sim, tx, ctl_thread))
             .expect("physics thread");
         let bg_n = 2200usize;
-        let (gas_em_prev, gas_em_curr, gas_em_bind) = gas_pair(&device, &storage_layout, 512);
-        let (gas_dust_prev, gas_dust_curr, gas_dust_bind) = gas_pair(&device, &storage_layout, 832);
+        let (gas_em_prev, gas_em_curr, gas_em_bind) = gas_pair(&device, &storage_layout, 1024);
+        let (gas_dust_prev, gas_dust_curr, gas_dust_bind) =
+            gas_pair(&device, &storage_layout, 1024);
         let bg_size = (bg_n * std::mem::size_of::<GpuItem>()) as u64;
         let bg_prev = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("bg-prev"),
@@ -526,13 +560,14 @@ impl App {
             ],
         });
         let (
-            bind_bright,
             bind_blur_h,
             bind_blur_uh,
             bind_blur_v,
             bind_blur_uv,
             bind_blur_h2,
             bind_composite,
+            bind_dust_mask,
+            bind_gas_uni,
         ) = post_binds(
             &device,
             &tex_layout,
@@ -542,6 +577,7 @@ impl App {
             &gpu_state,
             &blur_uni_h,
             &blur_uni_v,
+            &gas_uni,
         );
         write_post_uniforms(
             &queue,
@@ -569,7 +605,6 @@ impl App {
             tex_layout,
             composite_layout,
             uni_layout,
-            bind_bright,
             bind_bright_uni,
             bind_blur_h,
             bind_blur_uh,
@@ -578,6 +613,9 @@ impl App {
             bind_blur_h2,
             bind_composite,
             bind_bloom_uni,
+            bind_dust_mask,
+            bind_gas_uni,
+            gas_uni,
             blur_uni_h,
             blur_uni_v,
             bright_uni,
@@ -608,13 +646,14 @@ impl App {
     fn rebuild_hdr_bind(&mut self) {
         let gfx = self.gfx.as_mut().unwrap();
         let (
-            bind_bright,
             bind_blur_h,
             bind_blur_uh,
             bind_blur_v,
             bind_blur_uv,
             bind_blur_h2,
             bind_composite,
+            bind_dust_mask,
+            bind_gas_uni,
         ) = post_binds(
             &gfx.device,
             &gfx.tex_layout,
@@ -624,14 +663,16 @@ impl App {
             &gfx.gpu_state,
             &gfx.blur_uni_h,
             &gfx.blur_uni_v,
+            &gfx.gas_uni,
         );
-        gfx.bind_bright = bind_bright;
         gfx.bind_blur_h = bind_blur_h;
         gfx.bind_blur_uh = bind_blur_uh;
         gfx.bind_blur_v = bind_blur_v;
         gfx.bind_blur_uv = bind_blur_uv;
         gfx.bind_blur_h2 = bind_blur_h2;
         gfx.bind_composite = bind_composite;
+        gfx.bind_dust_mask = bind_dust_mask;
+        gfx.bind_gas_uni = bind_gas_uni;
         let exposure = self.exposure;
         let threshold = self.threshold;
         let bloom = self.bloom;
@@ -680,6 +721,8 @@ impl App {
                         self.hist.push_back(HistSnap {
                             pos: s.pos,
                             vel: s.vel,
+                            gas: s.gas,
+                            gas_size: s.gas_size,
                             time: s.time,
                             steps: s.steps,
                             arrival,
@@ -807,24 +850,57 @@ impl App {
             .write_buffer(&gfx.bg_curr, 0, bytemuck::cast_slice(&self.stage_bg));
         self.stage_gas_em.clear();
         self.stage_gas_dust.clear();
-        let gang = self.gas_om as f64 * self.render_t.unwrap_or(0.0);
-        let (gca, gsa) = (gang.cos(), gang.sin());
-        for g in self.gas.iter() {
-            let rx = g.pos[0] * gca - g.pos[1] * gsa;
-            let ry = g.pos[0] * gsa + g.pos[1] * gca;
+        // M1: gas rides live snaps (interpolated like stars), not the old
+        // rigid pattern carousel. Meta (size/kind/seed) stays static.
+        let (g0, g1) = match (self.hist.get(lo), self.hist.get(lo + 1)) {
+            (Some(a), Some(b)) => (&a.gas[..], &b.gas[..]),
+            (Some(a), None) => (&a.gas[..], &a.gas[..]),
+            _ => (&[][..], &[][..]),
+        };
+        let (s0, s1) = match (self.hist.get(lo), self.hist.get(lo + 1)) {
+            (Some(a), Some(b)) => (&a.gas_size[..], &b.gas_size[..]),
+            (Some(a), None) => (&a.gas_size[..], &a.gas_size[..]),
+            _ => (&[][..], &[][..]),
+        };
+        let gn = self
+            .gas
+            .len()
+            .min(g0.len().min(g1.len()).min(s0.len().min(s1.len())));
+        for i in 0..gn {
+            let g = &self.gas[i];
+            // Live size rides the snaps: merged-away knots read 0 here
+            // (init meta would resurrect them as frozen statues).
+            let size = s0[i] + (s1[i] - s0[i]) * alpha as f32;
+            if size <= 0.0 {
+                continue;
+            }
+            let (a, b) = (g0[i], g1[i]);
+            let w = [
+                a[0] + (b[0] - a[0]) * alpha,
+                a[1] + (b[1] - a[1]) * alpha,
+                a[2] + (b[2] - a[2]) * alpha,
+            ];
             let item = GpuItem {
-                pos: rebase(&[rx, ry, g.pos[2]], &eye),
+                pos: rebase(&w, &eye),
                 speed: 0.0,
-                misc: [g.seed, g.size, g.kind, 0.0],
+                misc: [g.seed, size, g.kind, 0.0],
             };
             if g.kind < 2.5 {
-                if self.stage_gas_em.len() < 512 {
+                if self.stage_gas_em.len() < 1024 {
                     self.stage_gas_em.push(item);
                 }
-            } else if self.stage_gas_dust.len() < 832 {
+            } else if self.stage_gas_dust.len() < 1024 {
                 self.stage_gas_dust.push(item);
             }
         }
+        // Back-to-front blend order: far quads first so near translucent
+        // dust/emission composites correctly (~2k items, sort is trivial).
+        let fwd = self.camera.forward();
+        let depth = |it: &GpuItem| it.pos[0] * fwd.x + it.pos[1] * fwd.y + it.pos[2] * fwd.z;
+        self.stage_gas_em
+            .sort_by(|a, b| depth(b).partial_cmp(&depth(a)).unwrap());
+        self.stage_gas_dust
+            .sort_by(|a, b| depth(b).partial_cmp(&depth(a)).unwrap());
         gfx.queue.write_buffer(
             &gfx.gas_em_prev,
             0,
@@ -852,8 +928,10 @@ impl App {
         let (right, up) = self.camera.basis();
         let uni = Uniform {
             view_proj: vp.to_cols_array_2d(),
-            cam_right: [right.x, right.y, right.z, 0.0],
-            cam_up: [up.x, up.y, up.z, 0.0],
+            // .w carries eye XZ so gas shaders can anchor noise in true
+            // world space (staging holds rebased world-eye positions).
+            cam_right: [right.x, right.y, right.z, eye[0] as f32],
+            cam_up: [up.x, up.y, up.z, eye[2] as f32],
             // Staging buffers already hold the interpolated state; the
             // shader must not interpolate a second time (that would square
             // the blend into an easing curve).
@@ -866,6 +944,11 @@ impl App {
         };
         gfx.gpu_state
             .upload(&gfx.queue, &self.stage_prev, &self.stage_curr, &uni);
+        gfx.queue.write_buffer(
+            &gfx.gas_uni,
+            0,
+            bytemuck::bytes_of(&[1.0f32, 4.0, 0.0, 0.0]),
+        );
         write_post_uniforms(
             &gfx.queue,
             &gfx.config,
@@ -956,6 +1039,57 @@ impl App {
                 label: Some("frame"),
             });
         {
+            // G2 split-res gas pass: emission HDR + dust mask at quarter res.
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("gas-em"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &gfx.gpu_state.gas_em_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&gfx.emission);
+            pass.set_bind_group(0, &gfx.gpu_state.uniform_bind, &[]);
+            pass.set_bind_group(1, &gfx.gas_em_bind, &[]);
+            pass.draw(0..52, 0..em_n as u32);
+        }
+        {
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("gas-dust"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &gfx.gpu_state.gas_dust_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        // rgb = 0 tau, alpha = far (Min blend keeps nearest).
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.0,
+                            g: 0.0,
+                            b: 0.0,
+                            a: 10000.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&gfx.dust);
+            pass.set_bind_group(0, &gfx.gpu_state.uniform_bind, &[]);
+            pass.set_bind_group(1, &gfx.gas_dust_bind, &[]);
+            pass.draw(0..52, 0..dust_n as u32);
+        }
+        {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("hdr"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -980,22 +1114,18 @@ impl App {
             pass.set_pipeline(&gfx.billboard);
             pass.set_bind_group(0, &gfx.gpu_state.uniform_bind, &[]);
             pass.set_bind_group(1, &gfx.gpu_state.storage_bind, &[]);
+            pass.set_bind_group(2, &gfx.bind_dust_mask, &[]);
+            pass.set_bind_group(3, &gfx.bind_gas_uni, &[]);
             pass.draw(0..4, 0..n as u32);
             pass.set_bind_group(1, &gfx.bg_bind, &[]);
             pass.draw(0..4, 0..bg_n as u32);
-            pass.set_pipeline(&gfx.emission);
-            pass.set_bind_group(1, &gfx.gas_em_bind, &[]);
-            pass.draw(0..4, 0..em_n as u32);
-            pass.set_pipeline(&gfx.dust);
-            pass.set_bind_group(1, &gfx.gas_dust_bind, &[]);
-            pass.draw(0..4, 0..dust_n as u32);
         }
         post_pass(
             &mut enc,
             "bright",
             &gfx.gpu_state.bright_view,
             &gfx.bright,
-            &[&gfx.bind_bright, &gfx.bind_bright_uni],
+            &[&gfx.bind_composite, &gfx.bind_bright_uni],
         );
         let pairs = self.radius.round().clamp(1.0, 3.0) as u32;
         for i in 0..pairs {

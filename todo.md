@@ -2,6 +2,107 @@
 
 Source of truth for exit gates: `ROADMAP.md` Phase 1 (lines 34-48).
 
+## Session log — 2026-09-07: merged-cloud freeze bug (dead knots rendered)
+
+Report: some clouds move, some parked forever; user nailed it — merged
+losers froze. Root cause: app staged from init-time meta (Static sent once),
+so size-0 dead knots rendered at frozen merge points as statues, piling up
+over time. Fix: Snap/HistSnap carry live `gas_size`, staging lerps size and
+skips dead; `snap_of` helper shared by loop + test. Regression test
+`dead_knots_flagged_in_snap`. Also tuned MERGE_F 0.5->0.3 (was eating lanes:
+92 dead/sweep) + alive-frac>0.5 long-run guard. 48 visual + workspace green,
+zero warnings.
+
+## Session log — 2026-09-07: gas coalescence (no more pile-up blob)
+
+Request: overlapping clouds should merge with diameters adding (1ly+2ly=3ly),
+no long-run glitchy accumulation. Fix (`sim.rs`/`main.rs`): `merge_gas` sweep
+every 8 steps — same-class pairs with overlapping cores merge, size adds
+capped (0.30 em / 0.25 dust), pos/vel volume-weighted, loser keeps dead slot
+(size 0, skipped in advect + staging) so snap indices stay interpolation-safe.
+Future gas-amount slider noted (dead slots are the reuse pool). Debugging
+wins: brake tails dragged whole disk (narrowed 0.3->0.15 to lane scale);
+shear test assumed dt (clamp shrinks it — rate-based asserts now).
+47 visual + workspace green, zero warnings, probe clean.
+
+## Session log — 2026-09-07: ring fix (no more detached annulus)
+
+Complaint with screenshot: gas formed hard detached ring + moat, unlike
+reference (lanes spiral inward, fuzzy fed ring, no void). Cause: ring_frac
+0.45 crammed inner knots onto ±8% circle, cavity 0.12 + wind 3.0 cut a moat.
+Fix: ring_frac 0.18, width 18%, r_ring 0.30, cavity 0.07, wind 2.0 (gas leaks
+through -> nuclear spirals visible); BH preset likewise softer
+(0.15/0.40/0.25), lanes inward to 0.2. Tests recalibrated to new bands,
+still proving contrast (IC ring >2x, 300-step >1.3x, cavity <3%).
+44 visual + workspace green, zero warnings, probe clean.
+
+## Session log — 2026-09-07: gas M3 cavity+ring + M4 turbulence
+
+M3 (`ic.rs`/`sim.rs`): cleared central cavity (spiral 0.12, BH 0.25) via
+IC push-out + live wind inside (fountain: relax recaptures outside) +
+circumnuclear ring at 2.2x clear for inner knots. M4: random-walk kicks
+(~8% circular equilibrium vs relaxation) + thin-disk vertical restoring.
+Recalibrated M1/M2 thresholds (wind slows innermost whirl 0.3->0.2 bar,
+turbulence diffuses jam 0.15->0.10 gap — effects intact). Tests:
+cavity_empty/ring IC, cavity_stays_open+ring_persists,
+gas_thin_and_stirred (lower-bound dispersion proves stirring alive).
+44 visual + workspace green, zero warnings, probe dust clean.
+
+## Session log — 2026-09-07: gas M2 shock + traffic jam
+
+M2 (`sim.rs`/`ic.rs`): arm trough attraction (π-folded lane phase, ARM_A
+0.15) + brake toward pattern speed in lane (0.85 core) + shock dissipation
+(20x relax in lane, kills libration so knots settle). Proved by A/B test
+`gas_jams_in_lanes` (45% jammed vs 29% control inside CR). Fixed two real
+bugs on the way: trough blind to 2nd arm (2π wrap vs π-periodic lanes),
+mean-metric drowned by window churn + outskirts (use jammed tail inside
+CR). HII init offset downstream +0.1 rad (CR-flipped sign), test
+`hii_sits_downstream_of_lane`. 41 visual + workspace green, zero warnings,
+probe em/dust clean ~2ms.
+
+## Session log — 2026-09-07: gas M1 live advection (no more carousel)
+
+Complaint: gas/dust frozen while stars orbit; calm center near BH. Research:
+differential Ω(r) rules (pattern rigid, gas flows through), gas out-rotates
+stars ~11% (asymmetric drift), spiral shocks upstream + HII downstream
+250-300pc, inflow inside CR, Keplerian + cleared cavity inside BH SOI. Fix
+(`ic.rs`/`sim.rs`/`main.rs`): knots carry vel (circular init + tight disp,
+merger bulk transform), `Sim::step_gas` advects test particles (live halo +
+live BH point masses + frozen disk table, relax-to-circular 0.3 orbits,
+accel/speed caps), snaps stream gas positions, app interpolates like stars,
+rigid `gang` rotation deleted. Tests: shear (inner laps outer 3x), bounded
+200 steps all presets, BH whirl; 39 visual + workspace green, zero warnings.
+
+## Session log — 2026-09-07: gas G2 (split-res + reddening + impostors)
+
+G2 render items landed (`gpu.rs`/`render.rs`/`main.rs`/`probe.rs`): quarter-res
+split gas pass (emission HDR + dust mask targets in `GpuState`), dust mask
+packs CCM-tinted tau in rgb + nearest depth in alpha (Min blend, cleared far),
+tonemap/bright composite `(hdr+em)*transmit + bloom`, per-star depth-tested
+reddening in billboard shader (only stars behind dust extinguish, blue hardest),
+13-plane gas impostors (3 axial + 6 edge + 4 corner normals, world-anchored
+noise per slice, EM_NORM 0.15 / DUST_NORM 0.12). Probe RTX 4060: all modes
+~2ms, em/dust/stars clean; pixel-diff stars-vs-dust proves reddening (2481 px
+extinguished, transmit R/G/B 0.81/0.76/0.76 mid, 0.80/0.65/0.47 cores).
+Workspace green, zero warnings, clippy clean in visual. Deferred: SNR hook
+(needs S2 evolution clock).
+
+## Session log — 2026-09-07: gas G1.1 rework (world-space noise + small knots)
+
+Complaint: gas/dust looked pasted-on (repeating round pink stickers, blocky
+quad edges on zoom, opaque black dust blobs, white-out center). Root causes:
+UV-space FBM (`uv*3+seed*17` identical per quad), 10x oversize knots
+(0.08-0.56 world vs real HII 10-80pc), filled-disc profile, black opaque dust
+(alpha 0.62), unsorted blends. Fixes (`render.rs` + `ic.rs` + `main.rs`):
+world-anchored domain-warped FBM with arm-tangent stretch + multiplicative
+porosity (true holes), HII shell profile (rim + faint core), salmon/teal/blue
+palette by kind, dust warm brown (0.05,0.03,0.02) alpha ≤0.32, knot sizes
+0.015-0.05 / dust 0.03-0.10, counts 300+n/100 + 200+n/150 (caps 1024/1024),
+back-to-front sort per frame, eye XZ packed in cam uniform .w (no layout
+change). Probe on RTX 4060: em + dust paths render clean, no panic.
+34 visual + full workspace tests green, build zero warnings, clippy clean in
+crates/visual (only pre-existing rotation.rs erasing_op deny remains).
+
 ## Session log — 2026-09-07: gas G1 motion + scale fix
 
 Complaint: gas looked pasted-on (frozen while stars orbit; giant

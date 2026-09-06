@@ -1449,12 +1449,24 @@ fn main() {
                 .collect();
             (si, di)
         });
-    let items = match &dust_scene {
-        Some((si, _)) => si.clone(),
-        None => gas_items.unwrap_or_else(|| craft_count(&mode, &eye, count)),
-    };
-    let n = items.len();
-    println!("items: {n}");
+    let craft = || craft_count(&mode, &eye, count);
+    let (star_items, em_items, dust_items): (Vec<GpuItem>, Vec<GpuItem>, Vec<GpuItem>) =
+        match gas_mode.as_deref() {
+            Some("em") => (Vec::new(), gas_items.unwrap_or_else(&craft), Vec::new()),
+            Some("dust") => {
+                let (si, di) = dust_scene.unwrap_or_else(|| (craft(), Vec::new()));
+                (si, Vec::new(), di)
+            }
+            _ => (
+                dust_scene.map(|(si, _)| si).unwrap_or_else(&craft),
+                Vec::new(),
+                Vec::new(),
+            ),
+        };
+    let n = star_items.len();
+    let em_n = em_items.len();
+    let dust_n = dust_items.len();
+    println!("items: {n} em: {em_n} dust: {dust_n}");
 
     let (uniform_layout, storage_layout) = render::layouts(&device);
     let tex_layout = render::tex_layout(&device, "tex-layout");
@@ -1462,16 +1474,49 @@ fn main() {
     let uni_layout = render::blur_uni_layout(&device);
     let mut state = GpuState::new(&device, &uniform_layout, &storage_layout, n, w, h);
     state.n = n;
-    let billboard =
-        render::billboard_pipeline(&device, state.hdr_format, &uniform_layout, &storage_layout);
+    let billboard = render::billboard_pipeline(
+        &device,
+        state.hdr_format,
+        &uniform_layout,
+        &storage_layout,
+        &tex_layout,
+        &uni_layout,
+    );
     let emission =
         render::emission_pipeline(&device, state.hdr_format, &uniform_layout, &storage_layout);
     let dust = render::dust_pipeline(&device, state.hdr_format, &uniform_layout, &storage_layout);
-    let hdr_pipe: &wgpu::RenderPipeline = match gas_mode.as_deref() {
-        Some("em") => &emission,
-        _ => &billboard,
+    let mk_gas = |label: &str, v: &[GpuItem]| {
+        let size = (v.len().max(1) * std::mem::size_of::<GpuItem>()) as u64;
+        let mk = |l: &str| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(l),
+                size,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        };
+        let prev = mk(label);
+        let curr = mk(label);
+        queue.write_buffer(&prev, 0, bytemuck::cast_slice(v));
+        queue.write_buffer(&curr, 0, bytemuck::cast_slice(v));
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(label),
+            layout: &storage_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: prev.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: curr.as_entire_binding(),
+                },
+            ],
+        })
     };
-    let bright = render::bright_pipeline(&device, state.hdr_format, &tex_layout, &uni_layout);
+    let em_bind = mk_gas("probe-gas-em", &em_items);
+    let dust_bind = mk_gas("probe-gas-dust", &dust_items);
+    let bright = render::bright_pipeline(&device, state.hdr_format, &composite_layout, &uni_layout);
     let blur = render::blur_pipeline(&device, state.hdr_format, &tex_layout, &uni_layout);
     let final_format = wgpu::TextureFormat::Rgba8UnormSrgb;
     let tonemap = render::tonemap_pipeline(&device, final_format, &composite_layout, &uni_layout);
@@ -1537,7 +1582,6 @@ fn main() {
         view_formats: &[],
     });
     let final_view = final_tex.create_view(&wgpu::TextureViewDescriptor::default());
-    let bind_bright = tex_bind("bind-bright", &state.hdr_view);
     let bind_blur_h = tex_bind("bind-blur-h", &state.bright_view);
     let bind_blur_v = tex_bind("bind-blur-v", &state.blur_a);
     let bind_blur_h2 = tex_bind("bind-blur-h2", &state.blur_b);
@@ -1561,8 +1605,58 @@ fn main() {
                 binding: 3,
                 resource: wgpu::BindingResource::Sampler(&sampler),
             },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: wgpu::BindingResource::TextureView(&state.gas_em_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: wgpu::BindingResource::Sampler(&sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 6,
+                resource: wgpu::BindingResource::TextureView(&state.gas_dust_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 7,
+                resource: wgpu::BindingResource::Sampler(&sampler),
+            },
         ],
     });
+    // G2: dust-mask + gas params for the billboard reddening path.
+    let dust_mask_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("dust-mask"),
+        layout: &tex_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&state.gas_dust_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(&sampler),
+            },
+        ],
+    });
+    let gas_uni_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("gas-uni"),
+        size: 16,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let gas_uni_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("gas-uni-bind"),
+        layout: &uni_layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: gas_uni_buf.as_entire_binding(),
+        }],
+    });
+    queue.write_buffer(
+        &gas_uni_buf,
+        0,
+        bytemuck::bytes_of(&[1.0f32, 4.0, 0.0, 0.0]),
+    );
     let bind_bright_uni = uni_bind("bind-bright-uni", &bright_uni);
     let bind_bloom_uni = uni_bind("bind-bloom-uni", &bloom_uni);
     let bind_blur_uh = uni_bind("bind-blur-uh", &blur_uni_h);
@@ -1573,18 +1667,11 @@ fn main() {
     let (right, up) = camera.basis();
     let uni = Uniform {
         view_proj: vp.to_cols_array_2d(),
-        cam_right: [right.x, right.y, right.z, 0.0],
-        cam_up: [up.x, up.y, up.z, 0.0],
+        cam_right: [right.x, right.y, right.z, eye[0] as f32],
+        cam_up: [up.x, up.y, up.z, eye[2] as f32],
         params: [point_size, 1.0, exposure, 0.0],
     };
-    state.upload(&queue, &items, &items, &uni);
-    let dust_res: Option<(GpuState, usize)> = dust_scene.as_ref().map(|(_, di)| {
-        let mut ds = GpuState::new(&device, &uniform_layout, &storage_layout, di.len(), w, h);
-        ds.n = di.len();
-        ds.upload(&queue, di, di, &uni);
-        let n = di.len();
-        (ds, n)
-    });
+    state.upload(&queue, &star_items, &star_items, &uni);
     let bw = (w / 4).max(1) as f32;
     let bh = (h / 4).max(1) as f32;
     queue.write_buffer(
@@ -1653,16 +1740,21 @@ fn main() {
             pass.draw(0..3, 0..1);
         }
     };
-    post(&mut enc, "hdr", &state.hdr_view, hdr_pipe, &[]);
-    if let Some((ds, dn)) = &dust_res {
+    // G2 split-res gas passes, then stars with dust-mask reddening.
+    let mut gas_pass = |label: &str,
+                        view: &wgpu::TextureView,
+                        clear: wgpu::Color,
+                        pipeline: &wgpu::RenderPipeline,
+                        bind: &wgpu::BindGroup,
+                        count: usize| {
         let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("hdr-dust"),
+            label: Some(label),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &state.hdr_view,
+                view,
                 depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Load,
+                    load: wgpu::LoadOp::Clear(clear),
                     store: wgpu::StoreOp::Store,
                 },
             })],
@@ -1671,17 +1763,67 @@ fn main() {
             occlusion_query_set: None,
             multiview_mask: None,
         });
-        pass.set_pipeline(&dust);
+        pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &state.uniform_bind, &[]);
-        pass.set_bind_group(1, &ds.storage_bind, &[]);
-        pass.draw(0..4, 0..*dn as u32);
+        pass.set_bind_group(1, bind, &[]);
+        pass.draw(0..52, 0..count as u32);
+    };
+    gas_pass(
+        "gas-em",
+        &state.gas_em_view,
+        wgpu::Color::BLACK,
+        &emission,
+        &em_bind,
+        em_n,
+    );
+    gas_pass(
+        "gas-dust",
+        &state.gas_dust_view,
+        wgpu::Color {
+            r: 0.0,
+            g: 0.0,
+            b: 0.0,
+            a: 10000.0,
+        },
+        &dust,
+        &dust_bind,
+        dust_n,
+    );
+    {
+        let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("hdr"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &state.hdr_view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                        r: render::SPACE_BG[0] as f64,
+                        g: render::SPACE_BG[1] as f64,
+                        b: render::SPACE_BG[2] as f64,
+                        a: 1.0,
+                    }),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(&billboard);
+        pass.set_bind_group(0, &state.uniform_bind, &[]);
+        pass.set_bind_group(1, &state.storage_bind, &[]);
+        pass.set_bind_group(2, &dust_mask_bind, &[]);
+        pass.set_bind_group(3, &gas_uni_bind, &[]);
+        pass.draw(0..4, 0..n as u32);
     }
     post(
         &mut enc,
         "bright",
         &state.bright_view,
         &bright,
-        &[&bind_bright, &bind_bright_uni],
+        &[&bind_composite, &bind_bright_uni],
     );
     for k in 0..pairs {
         let hb = if k == 0 { &bind_blur_h } else { &bind_blur_h2 };

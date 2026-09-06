@@ -33,6 +33,13 @@ pub struct GpuState {
     pub blur_a: wgpu::TextureView,
     pub blur_b_tex: wgpu::Texture,
     pub blur_b: wgpu::TextureView,
+    /// Quarter-res split gas pass (G2): emission HDR + dust extinction mask.
+    /// Dust mask rgb = accumulated optical depth (CCM-tinted), alpha =
+    /// nearest dust view-depth (Min blend, cleared to far).
+    pub gas_em_tex: wgpu::Texture,
+    pub gas_em_view: wgpu::TextureView,
+    pub gas_dust_tex: wgpu::Texture,
+    pub gas_dust_view: wgpu::TextureView,
     pub n: usize,
     pub bytes_per_frame: usize,
 }
@@ -125,6 +132,8 @@ impl GpuState {
         let (bright_tex, bright_view) = target(device, "bright", bw, bh, hdr_format);
         let (blur_a_tex, blur_a) = target(device, "blur-a", bw, bh, hdr_format);
         let (blur_b_tex, blur_b) = target(device, "blur-b", bw, bh, hdr_format);
+        let (gas_em_tex, gas_em_view) = target(device, "gas-em", bw, bh, hdr_format);
+        let (gas_dust_tex, gas_dust_view) = target(device, "gas-dust", bw, bh, hdr_format);
         Self {
             prev_buf,
             curr_buf,
@@ -140,6 +149,10 @@ impl GpuState {
             blur_a,
             blur_b_tex,
             blur_b,
+            gas_em_tex,
+            gas_em_view,
+            gas_dust_tex,
+            gas_dust_view,
             n,
             bytes_per_frame: 0,
         }
@@ -160,6 +173,12 @@ impl GpuState {
         let (blur_b_tex, blur_b) = target(device, "blur-b", bw, bh, self.hdr_format);
         self.blur_b_tex = blur_b_tex;
         self.blur_b = blur_b;
+        let (gas_em_tex, gas_em_view) = target(device, "gas-em", bw, bh, self.hdr_format);
+        self.gas_em_tex = gas_em_tex;
+        self.gas_em_view = gas_em_view;
+        let (gas_dust_tex, gas_dust_view) = target(device, "gas-dust", bw, bh, self.hdr_format);
+        self.gas_dust_tex = gas_dust_tex;
+        self.gas_dust_view = gas_dust_view;
     }
 
     pub fn upload(

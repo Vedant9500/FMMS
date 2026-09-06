@@ -69,9 +69,9 @@ G1 build (cheap, fits current pipeline):
 - Probe: reuse ramp rig pattern — knot color frames + lane
   occlusion frames.
 
-G2 (later): 13-quad impostors for fly-through, screen-space dust
-mask sampled in billboard shader for true per-star reddening,
-split-res gas pass, SNR hook into S2 evolution clock.
+G2 (landed 2026-09-07): 13-plane impostors for fly-through, screen-space dust
+mask sampled in billboard shader for true per-star reddening (depth-tested),
+split-res gas pass, SNR hook into S2 evolution clock (deferred: needs S2).
 
 ## S4 — Later (see ROADMAP.md Part 2)
 

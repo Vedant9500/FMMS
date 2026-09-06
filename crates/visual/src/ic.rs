@@ -175,7 +175,7 @@ fn assign_looks(rng: &mut Rng, masses: &[f64], young: bool) -> Vec<(f32, f32, f3
     out
 }
 
-fn gauss(rng: &mut Rng) -> f64 {
+pub(crate) fn gauss(rng: &mut Rng) -> f64 {
     let u1 = rng.unit().max(1e-12);
     let u2 = rng.unit();
     (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
@@ -200,7 +200,9 @@ pub struct Halo {
 
 /// Halo acceleration: a = -M r_vec / (r (r + a)^2).
 pub fn halo_accel(h: &Halo, pos: &[f64; 3]) -> [f64; 3] {
-    let r = (pos[0] * pos[0] + pos[1] * pos[1] + pos[2] * pos[2]).sqrt().max(1e-9);
+    let r = (pos[0] * pos[0] + pos[1] * pos[1] + pos[2] * pos[2])
+        .sqrt()
+        .max(1e-9);
     let s = -h.m / (r * (r + h.a) * (r + h.a));
     [s * pos[0], s * pos[1], s * pos[2]]
 }
@@ -282,7 +284,13 @@ fn vc2(spec: &DiskSpec, r: f64) -> f64 {
     v2
 }
 
-fn spiral_with(n: usize, rng: &mut Rng, spec: &DiskSpec) -> (Vec<Star>, Vec<Gas>) {
+fn spiral_with(
+    n: usize,
+    rng: &mut Rng,
+    spec: &DiskSpec,
+    omp: f32,
+    nuc: (f64, f64, f64),
+) -> (Vec<Star>, Vec<Gas>) {
     let bh_n = if n > 8 { 1 } else { 0 };
     let disk_n = (n - bh_n) * 70 / 100;
     let bulge_n = n - bh_n - disk_n;
@@ -303,7 +311,15 @@ fn spiral_with(n: usize, rng: &mut Rng, spec: &DiskSpec) -> (Vec<Star>, Vec<Gas>
             sv * gauss(rng),
         ];
         let (temp, mag, teff, lum) = disk_looks[i];
-        out.push(Star { pos, vel, mass: w[i] * total, temp, mag, teff, lum });
+        out.push(Star {
+            pos,
+            vel,
+            mass: w[i] * total,
+            temp,
+            mag,
+            teff,
+            lum,
+        });
     }
     for i in 0..bulge_n {
         let s = rng.unit().sqrt().max(1e-9);
@@ -320,7 +336,15 @@ fn spiral_with(n: usize, rng: &mut Rng, spec: &DiskSpec) -> (Vec<Star>, Vec<Gas>
             sb * gauss(rng),
         ];
         let (temp, mag, teff, lum) = bulge_looks[i];
-        out.push(Star { pos, vel, mass: w[disk_n + i] * total, temp, mag, teff, lum });
+        out.push(Star {
+            pos,
+            vel,
+            mass: w[disk_n + i] * total,
+            temp,
+            mag,
+            teff,
+            lum,
+        });
     }
     if bh_n == 1 {
         out.push(Star {
@@ -334,7 +358,19 @@ fn spiral_with(n: usize, rng: &mut Rng, spec: &DiskSpec) -> (Vec<Star>, Vec<Gas>
         });
     }
     let disk = &out[..disk_n];
-    let gas = gas_for_disk(rng, disk, spec.rd, spec.r_max, 0.1, true);
+    let gas = gas_for_disk(
+        rng,
+        disk,
+        spec.rd,
+        spec.r_max,
+        0.1,
+        true,
+        &|r| vc2(spec, r).sqrt(),
+        omp as f64,
+        nuc.0,
+        nuc.1,
+        nuc.2,
+    );
     (out, gas)
 }
 
@@ -397,7 +433,7 @@ pub fn generate(preset: Preset, n: usize, seed: u64) -> (Vec<Star>, Vec<Gas>, Op
                 Vec::new(),
             )
         }
-        Preset::Spiral => spiral_with(n, &mut rng, &spiral_spec()),
+        Preset::Spiral => spiral_with(n, &mut rng, &spiral_spec(), 0.35, (0.07, 0.30, 0.18)),
         Preset::BlackHole => {
             let bh_halo = Halo { m: 1.5, a: 2.0 };
             let bh_n = if n > 8 { 1 } else { 0 };
@@ -427,7 +463,15 @@ pub fn generate(preset: Preset, n: usize, seed: u64) -> (Vec<Star>, Vec<Gas>, Op
                     teff = 12000.0 + 8000.0 * rng.unit() as f32;
                     lum = (lum * 2.0).min(500.0);
                 }
-                out.push(Star { pos, vel, mass: w[i] * (m_disk + m_halo), temp, mag, teff, lum });
+                out.push(Star {
+                    pos,
+                    vel,
+                    mass: w[i] * (m_disk + m_halo),
+                    temp,
+                    mag,
+                    teff,
+                    lum,
+                });
             }
             for i in 0..halo_n {
                 let s = rng.unit().sqrt().max(1e-9);
@@ -439,7 +483,11 @@ pub fn generate(preset: Preset, n: usize, seed: u64) -> (Vec<Star>, Vec<Gas>, Op
                 let (temp, mag, teff, lum) = halo_looks[i];
                 out.push(Star {
                     pos: [r * sp * phi.cos(), r * sp * phi.sin(), r * z],
-                    vel: [sb * gauss(&mut rng), sb * gauss(&mut rng), sb * gauss(&mut rng)],
+                    vel: [
+                        sb * gauss(&mut rng),
+                        sb * gauss(&mut rng),
+                        sb * gauss(&mut rng),
+                    ],
                     mass: w[disk_n + i] * (m_disk + m_halo),
                     temp,
                     mag,
@@ -458,7 +506,24 @@ pub fn generate(preset: Preset, n: usize, seed: u64) -> (Vec<Star>, Vec<Gas>, Op
                     lum: 0.0,
                 });
             }
-            let gas = gas_for_disk(&mut rng, &out, 0.6, 2.5, 0.3, true);
+            let gas = gas_for_disk(
+                &mut rng,
+                &out,
+                0.6,
+                2.5,
+                0.2,
+                true,
+                &|r| {
+                    let rr = r.max(1e-6);
+                    ((m_bh + m_disk * (1.0 - (1.0 + rr / 0.6) * (-rr / 0.6).exp())) / rr
+                        + halo_v2(&bh_halo, rr))
+                    .sqrt()
+                },
+                0.5,
+                0.15,
+                0.40,
+                0.25,
+            );
             (out, gas)
         }
         Preset::Merger => {
@@ -471,8 +536,8 @@ pub fn generate(preset: Preset, n: usize, seed: u64) -> (Vec<Star>, Vec<Gas>, Op
                 r_max: 3.0,
                 halo: None,
             };
-            let (mut a, mut ga) = spiral_with(n / 2, &mut rng, &spec);
-            let (mut b, mut gb) = spiral_with(n - n / 2, &mut rng, &spec);
+            let (mut a, mut ga) = spiral_with(n / 2, &mut rng, &spec, 0.2, (0.0, 0.0, 0.0));
+            let (mut b, mut gb) = spiral_with(n - n / 2, &mut rng, &spec, 0.2, (0.0, 0.0, 0.0));
             for st in a.iter_mut() {
                 st.pos = rot_xz(st.pos, 0.3, 0.0);
                 st.vel = rot_xz(st.vel, 0.3, 0.0);
@@ -487,6 +552,10 @@ pub fn generate(preset: Preset, n: usize, seed: u64) -> (Vec<Star>, Vec<Gas>, Op
                 g.pos = rot_xz(g.pos, 0.3, 0.0);
                 g.pos[0] -= 2.6;
                 g.pos[1] += 0.2;
+                g.vel = rot_xz(g.vel, 0.3, 0.0);
+                g.vel[0] += 0.16;
+                g.vel[1] += 0.10;
+                g.vel[2] += 0.03;
             }
             for st in b.iter_mut() {
                 st.pos = rot_xz(st.pos, -1.1, 0.5);
@@ -502,6 +571,10 @@ pub fn generate(preset: Preset, n: usize, seed: u64) -> (Vec<Star>, Vec<Gas>, Op
                 g.pos = rot_xz(g.pos, -1.1, 0.5);
                 g.pos[0] += 2.6;
                 g.pos[1] -= 0.2;
+                g.vel = rot_xz(g.vel, -1.1, 0.5);
+                g.vel[0] -= 0.16;
+                g.vel[1] -= 0.10;
+                g.vel[2] -= 0.03;
             }
             a.extend(b);
             ga.extend(gb);
@@ -519,9 +592,54 @@ pub fn generate(preset: Preset, n: usize, seed: u64) -> (Vec<Star>, Vec<Gas>, Op
 #[derive(Clone)]
 pub struct Gas {
     pub pos: [f64; 3],
+    pub vel: [f64; 3],
     pub size: f32,
     pub kind: f32,
     pub seed: f32,
+}
+
+/// M3 nuclear structure: cleared cavity (feedback blows out the center)
+/// + circumnuclear ring outside it. Returns repositioned pos.
+fn nuclear_pos(
+    rng: &mut Rng,
+    pos: [f64; 3],
+    r_clear: f64,
+    r_ring: f64,
+    ring_frac: f64,
+    ring: bool,
+) -> [f64; 3] {
+    if r_clear <= 0.0 {
+        return pos;
+    }
+    let r = (pos[0] * pos[0] + pos[1] * pos[1]).sqrt();
+    let mut p = pos;
+    if ring && r < r_ring * 1.5 && rng.unit() < ring_frac {
+        let nr = r_ring * (1.0 + 0.18 * gauss(rng));
+        let s = nr / r.max(1e-9);
+        p[0] *= s;
+        p[1] *= s;
+        p[2] *= 0.3;
+    } else if r < r_clear {
+        let nr = r_clear * (1.1 + 0.2 * rng.unit());
+        let s = nr / r.max(1e-9);
+        p[0] *= s;
+        p[1] *= s;
+    }
+    p
+}
+fn gas_vel(rng: &mut Rng, pos: [f64; 3], vcirc: &dyn Fn(f64) -> f64, disp: f64) -> [f64; 3] {
+    // Circular velocity for a fresh knot: prograde around +Z plus a small
+    // collisional dispersion (cold gas rides near-circular, ~11% faster
+    // than lagging stars). Tight for lanes, looser for knots.
+    let r0 = (pos[0] * pos[0] + pos[1] * pos[1]).sqrt();
+    let r = r0.max(0.05);
+    let v = vcirc(r);
+    let (s, c) = (pos[1] / r.max(1e-9), pos[0] / r.max(1e-9));
+    [
+        -s * v + disp * v * gauss(rng),
+        c * v + disp * v * gauss(rng),
+        0.5 * disp * v * gauss(rng),
+    ]
 }
 
 fn arm_lane_phi(rng: &mut Rng, rd: f64, r_min: f64, r_max: f64) -> ([f64; 3], f64, f64) {
@@ -533,7 +651,11 @@ fn arm_lane_phi(rng: &mut Rng, rd: f64, r_min: f64, r_max: f64) -> ([f64; 3], f6
         }
     }
     r = r.clamp(r_min, r_max);
-    let k = if rng.unit() < 0.5 { 0.0 } else { std::f64::consts::PI };
+    let k = if rng.unit() < 0.5 {
+        0.0
+    } else {
+        std::f64::consts::PI
+    };
     let phi = (k - 0.55 + 3.0 * (r + 0.15).ln()) / 2.0 + 0.08 * gauss(rng);
     let sig = 0.04 + 0.015 * r;
     ([r * phi.cos(), r * phi.sin(), sig * gauss(rng)], r, phi)
@@ -546,21 +668,40 @@ fn gas_for_disk(
     r_max: f64,
     lane_r_min: f64,
     lanes: bool,
+    vcirc: &dyn Fn(f64) -> f64,
+    omp: f64,
+    r_clear: f64,
+    r_ring: f64,
+    ring_frac: f64,
 ) -> Vec<Gas> {
     let n = stars.len();
     let mut out = Vec::new();
     let anchors: Vec<&Star> = stars.iter().filter(|st| st.teff >= 7300.0).collect();
-    let nk = (80 + n / 500).min(500);
+    let nk = (300 + n / 100).min(900);
     for _ in 0..nk {
         let (pos, hot) = if !anchors.is_empty() && rng.unit() < 0.6 {
             let st = anchors[(rng.unit() * anchors.len() as f64) as usize % anchors.len()];
-            let j = 0.05 * gauss(&mut rng);
-            let j2 = 0.05 * gauss(&mut rng);
+            let j = 0.03 * gauss(&mut rng);
+            let j2 = 0.03 * gauss(&mut rng);
             ([st.pos[0] + j, st.pos[1] + j2, st.pos[2] * 0.7], st.teff)
         } else {
             let (p, _, _) = disk_pos(&mut rng, rd, 0.1, r_max, true);
             (p, 0.0)
         };
+        let pos = nuclear_pos(&mut rng, pos, r_clear, r_ring, ring_frac, true);
+        // M2 downstream offset: HII ignites after the shock, so anchored
+        // knots sit ahead of the lane inside CR, behind it outside.
+        let mut pos = pos;
+        if hot >= 7300.0 {
+            let r = (pos[0] * pos[0] + pos[1] * pos[1]).sqrt().max(0.05);
+            let dphi = 0.1 * (vcirc(r) / r - omp).signum();
+            if dphi != 0.0 {
+                let (s, c) = dphi.sin_cos();
+                let (x, y) = (pos[0], pos[1]);
+                pos[0] = x * c - y * s;
+                pos[1] = x * s + y * c;
+            }
+        }
         let kind = if hot >= 33000.0 {
             1.0
         } else if rng.unit() < 0.1 {
@@ -570,18 +711,21 @@ fn gas_for_disk(
         };
         out.push(Gas {
             pos,
-            size: (0.04 + 0.10 * rng.unit().powi(2)) as f32,
+            vel: gas_vel(&mut rng, pos, vcirc, 0.04),
+            size: (0.015 + 0.035 * rng.unit().powi(2)) as f32,
             kind,
             seed: rng.unit() as f32,
         });
     }
     if lanes {
-        let nl = (150 + n / 250).min(800);
+        let nl = (200 + n / 150).min(900);
         for _ in 0..nl {
             let (pos, _, _) = arm_lane_phi(&mut rng, rd, lane_r_min, r_max);
+            let pos = nuclear_pos(&mut rng, pos, r_clear, r_ring, ring_frac, false);
             out.push(Gas {
                 pos,
-                size: (0.08 + 0.20 * rng.unit()) as f32,
+                vel: gas_vel(&mut rng, pos, vcirc, 0.02),
+                size: (0.03 + 0.07 * rng.unit()) as f32,
                 kind: 3.0,
                 seed: rng.unit() as f32,
             });
@@ -599,13 +743,161 @@ pub fn pattern_speed(preset: Preset) -> f32 {
     }
 }
 
+/// Frozen disk+bulge curve for M1 gas advection: total circular v² minus
+/// the live components (analytic halo + BH point masses), log-sampled.
+/// Gas feels live halo/BHs plus this table; zero back-reaction on stars.
+pub struct GasTable {
+    pub tab: Vec<f32>,
+    pub rmin: f64,
+    pub rmax: f64,
+}
+
+impl GasTable {
+    pub fn empty() -> Self {
+        Self {
+            tab: Vec::new(),
+            rmin: 1.0,
+            rmax: 1.0,
+        }
+    }
+
+    pub fn v2(&self, r: f64) -> f64 {
+        if self.tab.is_empty() {
+            return 0.0;
+        }
+        let n = self.tab.len();
+        let f = (r.clamp(self.rmin, self.rmax) / self.rmin).ln() / (self.rmax / self.rmin).ln()
+            * (n - 1) as f64;
+        let f = f.clamp(0.0, (n - 1) as f64);
+        let i = (f as usize).min(n - 2);
+        let t = f - i as f64;
+        self.tab[i] as f64 * (1.0 - t) + self.tab[i + 1] as f64 * t
+    }
+}
+
+pub fn gas_disk_table(preset: Preset) -> GasTable {
+    const N: usize = 96;
+    const RMIN: f64 = 0.02;
+    let (total, halo, mbh, rmax): (Box<dyn Fn(f64) -> f64>, Option<Halo>, f64, f64) = match preset {
+        Preset::Spiral => {
+            let spec = spiral_spec();
+            (
+                Box::new(move |r| vc2(&spec, r)),
+                Some(Halo { m: 3.0, a: 3.0 }),
+                0.02,
+                6.0,
+            )
+        }
+        Preset::BlackHole => {
+            let h = Halo { m: 1.5, a: 2.0 };
+            (
+                Box::new(move |r| {
+                    let rr = r.max(1e-6);
+                    (0.12 + 0.78 * (1.0 - (1.0 + rr / 0.6) * (-rr / 0.6).exp())) / rr
+                        + halo_v2(&h, rr)
+                }),
+                Some(Halo { m: 1.5, a: 2.0 }),
+                0.12,
+                4.5,
+            )
+        }
+        Preset::Merger => {
+            let spec = DiskSpec {
+                rd: 0.8,
+                m_disk: 0.34,
+                m_bulge: 0.15,
+                m_bh: 0.01,
+                bulge_a: 0.2,
+                r_max: 3.0,
+                halo: None,
+            };
+            (
+                Box::new(move |r| vc2(&spec, r)),
+                Some(Halo { m: 6.0, a: 5.0 }),
+                0.01,
+                7.0,
+            )
+        }
+        Preset::Cluster => return GasTable::empty(),
+    };
+    let mut tab = Vec::with_capacity(N);
+    for i in 0..N {
+        let r = RMIN * (rmax / RMIN).powf(i as f64 / (N - 1) as f64);
+        let live = halo.map(|h| halo_v2(&h, r)).unwrap_or(0.0) + mbh / r.max(1e-6);
+        tab.push((total(r) - live).max(0.0) as f32);
+    }
+    GasTable {
+        tab,
+        rmin: RMIN,
+        rmax,
+    }
+}
+
 #[allow(dead_code)]
 pub fn generate_gas(preset: Preset, stars: &[Star], seed: u64) -> Vec<Gas> {
     let mut rng = Rng::new(seed.wrapping_add(7919));
     match preset {
-        Preset::Spiral => gas_for_disk(&mut rng, stars, 1.0, 4.0, 0.35, true),
-        Preset::BlackHole => gas_for_disk(&mut rng, stars, 0.6, 2.5, 0.3, true),
-        Preset::Merger => gas_for_disk(&mut rng, stars, 0.8, 3.0, 0.3, false),
+        Preset::Spiral => {
+            let spec = spiral_spec();
+            gas_for_disk(
+                &mut rng,
+                stars,
+                1.0,
+                4.0,
+                0.35,
+                true,
+                &|r| vc2(&spec, r).sqrt(),
+                0.35,
+                0.07,
+                0.30,
+                0.18,
+            )
+        }
+        Preset::BlackHole => {
+            let h = Halo { m: 1.5, a: 2.0 };
+            gas_for_disk(
+                &mut rng,
+                stars,
+                0.6,
+                2.5,
+                0.3,
+                true,
+                &|r| {
+                    let rr = r.max(1e-6);
+                    ((0.12 + 0.78 * (1.0 - (1.0 + rr / 0.6) * (-rr / 0.6).exp())) / rr
+                        + halo_v2(&h, rr))
+                    .sqrt()
+                },
+                0.5,
+                0.15,
+                0.40,
+                0.25,
+            )
+        }
+        Preset::Merger => {
+            let spec = DiskSpec {
+                rd: 0.8,
+                m_disk: 0.34,
+                m_bulge: 0.15,
+                m_bh: 0.01,
+                bulge_a: 0.2,
+                r_max: 3.0,
+                halo: None,
+            };
+            gas_for_disk(
+                &mut rng,
+                stars,
+                0.8,
+                3.0,
+                0.3,
+                false,
+                &|r| vc2(&spec, r).sqrt(),
+                0.2,
+                0.0,
+                0.0,
+                0.0,
+            )
+        }
         Preset::Cluster => Vec::new(),
     }
 }
@@ -643,7 +935,12 @@ mod tests {
 
     #[test]
     fn presets_conserve_mass_and_com() {
-        for preset in [Preset::Cluster, Preset::Spiral, Preset::Merger, Preset::BlackHole] {
+        for preset in [
+            Preset::Cluster,
+            Preset::Spiral,
+            Preset::Merger,
+            Preset::BlackHole,
+        ] {
             let (s, _, _) = generate(preset, 512, 11);
             assert_eq!(s.len(), 512);
             let (m, p, v, _) = stats(&s);
@@ -673,7 +970,10 @@ mod tests {
         let (s, _, _) = generate(Preset::Spiral, 100_000, 42);
         let parts: Vec<fmm::models::Particle> = s
             .iter()
-            .map(|st| fmm::models::Particle { mass: st.mass, pos: st.pos })
+            .map(|st| fmm::models::Particle {
+                mass: st.mass,
+                pos: st.pos,
+            })
             .collect();
         let tree = fmm::tree::Octree::build(&parts, 64);
         let mut maxc = 0;
@@ -711,7 +1011,12 @@ mod tests {
 
     #[test]
     fn presets_deterministic() {
-        for preset in [Preset::Cluster, Preset::Spiral, Preset::Merger, Preset::BlackHole] {
+        for preset in [
+            Preset::Cluster,
+            Preset::Spiral,
+            Preset::Merger,
+            Preset::BlackHole,
+        ] {
             let (a, _, _) = generate(preset, 128, 7);
             let (b, _, _) = generate(preset, 128, 7);
             for (x, y) in a.iter().zip(b.iter()) {
@@ -794,13 +1099,16 @@ mod tests {
         assert!(heroes < 0.015, "heroes={heroes}");
         let blue = stars.iter().filter(|st| st.temp < 0.2).count() as f64 / stars.len() as f64;
         assert!(blue < 0.02, "blue={blue}");
-        let mfrac =
-            stars.iter().filter(|st| st.teff < 3900.0).count() as f64 / stars.len() as f64;
+        let mfrac = stars.iter().filter(|st| st.teff < 3900.0).count() as f64 / stars.len() as f64;
         assert!(mfrac > 0.55 && mfrac < 0.85, "mfrac={mfrac}");
         for st in stars {
-            let t = 1.0 - ((st.teff as f64).ln() - 2300.0f64.ln())
-                / (50000.0f64.ln() - 2300.0f64.ln());
-            assert!((st.temp as f64 - t.clamp(0.02, 1.0)).abs() < 1e-5, "t={}", st.temp);
+            let t =
+                1.0 - ((st.teff as f64).ln() - 2300.0f64.ln()) / (50000.0f64.ln() - 2300.0f64.ln());
+            assert!(
+                (st.temp as f64 - t.clamp(0.02, 1.0)).abs() < 1e-5,
+                "t={}",
+                st.temp
+            );
         }
     }
 
@@ -808,8 +1116,8 @@ mod tests {
     fn gas_counts_and_kinds() {
         let (s, _, _) = generate(Preset::Spiral, 2000, 42);
         let g = generate_gas(Preset::Spiral, &s, 42);
-        assert_eq!(g.iter().filter(|x| x.kind < 2.5).count(), 84);
-        assert_eq!(g.iter().filter(|x| x.kind > 2.5).count(), 158);
+        assert_eq!(g.iter().filter(|x| x.kind < 2.5).count(), 320);
+        assert_eq!(g.iter().filter(|x| x.kind > 2.5).count(), 213);
         let (c, _, _) = generate(Preset::Cluster, 512, 42);
         assert_eq!(generate_gas(Preset::Cluster, &c, 42).len(), 0);
         let (m, _, _) = generate(Preset::Merger, 512, 42);
@@ -817,7 +1125,7 @@ mod tests {
         assert!(gm.iter().all(|x| x.kind < 2.5));
         for x in &g {
             assert!(x.pos.iter().all(|v| v.is_finite()));
-            assert!((0.03..=0.55).contains(&x.size), "size={}", x.size);
+            assert!((0.014..=0.11).contains(&x.size), "size={}", x.size);
             assert!((0.0..=1.0).contains(&x.seed));
         }
     }
@@ -845,6 +1153,74 @@ mod tests {
     }
 
     #[test]
+    fn cavity_empty_and_ring_present() {
+        let (_, g, _) = generate(Preset::Spiral, 2000, 42);
+        let r = |x: &Gas| (x.pos[0] * x.pos[0] + x.pos[1] * x.pos[1]).sqrt();
+        assert_eq!(g.iter().filter(|x| r(x) < 0.07).count(), 0);
+        let ring = g.iter().filter(|x| (0.25..=0.35).contains(&r(x))).count() as f64
+            / (std::f64::consts::PI * (0.35 * 0.35 - 0.25 * 0.25));
+        let ctrl = g.iter().filter(|x| (0.50..=0.70).contains(&r(x))).count() as f64
+            / (std::f64::consts::PI * (0.70 * 0.70 - 0.50 * 0.50));
+        assert!(ring > 2.0 * ctrl, "ring={ring} ctrl={ctrl}");
+    }
+
+    #[test]
+    fn hii_sits_downstream_of_lane() {
+        let (s, _, _) = generate(Preset::Spiral, 2000, 42);
+        let g = generate_gas(Preset::Spiral, &s, 42);
+        let mut sum = 0.0;
+        let mut n = 0;
+        for x in g.iter().filter(|x| x.kind < 1.5) {
+            let r = (x.pos[0] * x.pos[0] + x.pos[1] * x.pos[1]).sqrt();
+            if !(0.8..=2.6).contains(&r) {
+                continue;
+            }
+            let psi = 2.0 * x.pos[1].atan2(x.pos[0]) - 3.0 * (r + 0.15).ln();
+            // Fold to [-π/2, π/2] centered on the lane: downstream reads +.
+            let mut d = (psi + 0.55 + std::f64::consts::PI / 2.0) % std::f64::consts::PI;
+            if d < 0.0 {
+                d += std::f64::consts::PI;
+            }
+            d -= std::f64::consts::PI / 2.0;
+            sum += d;
+            n += 1;
+        }
+        assert!(n > 50, "n={n}");
+        assert!(sum / n as f64 > 0.03, "mean={}", sum / n as f64);
+    }
+
+    #[test]
+    fn gas_init_near_circular() {
+        let spec = spiral_spec();
+        let (s, _, _) = generate(Preset::Spiral, 512, 42);
+        let g = generate_gas(Preset::Spiral, &s, 42);
+        assert!(!g.is_empty());
+        for x in &g {
+            let r = (x.pos[0] * x.pos[0] + x.pos[1] * x.pos[1]).sqrt().max(0.05);
+            let sp = (x.vel[0] * x.vel[0] + x.vel[1] * x.vel[1] + x.vel[2] * x.vel[2]).sqrt();
+            let vc = vc2(&spec, r).sqrt();
+            assert!((0.7..=1.35).contains(&(sp / vc)), "r={r} sp={sp} vc={vc}");
+            let lz = x.pos[0] * x.vel[1] - x.pos[1] * x.vel[0];
+            assert!(lz > 0.0, "prograde lz={lz}");
+        }
+    }
+
+    #[test]
+    fn gas_table_matches_curve() {
+        let t = gas_disk_table(Preset::Spiral);
+        let spec = spiral_spec();
+        for r in [0.05, 0.3, 1.0, 2.5, 4.0] {
+            let want = (vc2(&spec, r) - halo_v2(&Halo { m: 3.0, a: 3.0 }, r) - 0.02 / r).max(0.0);
+            assert!(
+                (t.v2(r) - want).abs() < 1e-4,
+                "r={r} got={} want={want}",
+                t.v2(r)
+            );
+        }
+        assert_eq!(gas_disk_table(Preset::Cluster).v2(1.0), 0.0);
+    }
+
+    #[test]
     fn gas_deterministic() {
         let (a, _, _) = generate(Preset::Spiral, 256, 7);
         let (b, _, _) = generate(Preset::Spiral, 256, 7);
@@ -853,6 +1229,7 @@ mod tests {
         assert_eq!(ga.len(), gb.len());
         for (x, y) in ga.iter().zip(gb.iter()) {
             assert_eq!(x.pos, y.pos);
+            assert_eq!(x.vel, y.vel);
             assert_eq!(x.kind, y.kind);
         }
     }
@@ -869,8 +1246,8 @@ mod tests {
     #[test]
     fn spiral_generate_returns_gas() {
         let (_, g, _) = generate(Preset::Spiral, 2000, 42);
-        assert_eq!(g.iter().filter(|x| x.kind < 2.5).count(), 82);
-        assert_eq!(g.iter().filter(|x| x.kind > 2.5).count(), 155);
+        assert_eq!(g.iter().filter(|x| x.kind < 2.5).count(), 313);
+        assert_eq!(g.iter().filter(|x| x.kind > 2.5).count(), 209);
         let (_, gc, _) = generate(Preset::Cluster, 256, 42);
         assert!(gc.is_empty());
         assert!((pattern_speed(Preset::Spiral) - 0.35).abs() < 1e-6);

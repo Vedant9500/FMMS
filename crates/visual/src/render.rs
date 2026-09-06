@@ -11,11 +11,17 @@ struct Uniform {
 struct Item { pos: vec3<f32>, speed: f32, misc: vec4<f32> };
 @group(1) @binding(0) var<storage, read> prev: array<Item>;
 @group(1) @binding(1) var<storage, read> curr: array<Item>;
+// G2 dust mask (quarter-res): rgb = optical depth, a = nearest dust depth.
+@group(2) @binding(0) var dust_tex: texture_2d<f32>;
+@group(2) @binding(1) var dust_smp: sampler;
+// G2 gas params: x = redden strength, y = full/mask resolution scale.
+@group(3) @binding(0) var<uniform> g: vec4<f32>;
 
 struct Out {
     @builtin(position) clip: vec4<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) tm: vec3<f32>,
+    @location(2) vdepth: f32,
 };
 
 @vertex
@@ -35,6 +41,7 @@ fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> Out {
     o.clip = u.view_proj * vec4<f32>(world, 1.0);
     o.uv = c + vec2<f32>(0.5, 0.5);
     o.tm = tm;
+    o.vdepth = length(p);
     return o;
 }
 
@@ -62,7 +69,13 @@ fn fs(in: Out) -> @location(0) vec4<f32> {
     let core_col = mix(col, vec3<f32>(1.0), mix(0.22, 0.0, smoothstep(0.4, 0.9, t)));
     let exposure = u.params.z;
     let bright = 0.45 + 0.55 * mag;
-    let hdr = (core * core_col * 1.15 + halo * col * 1.2 + spikes * mix(col, vec3<f32>(1.0), 0.5) * 2.0) * (exposure * bright);
+    var hdr = (core * core_col * 1.15 + halo * col * 1.2 + spikes * mix(col, vec3<f32>(1.0), 0.5) * 2.0) * (exposure * bright);
+    // G2 per-star reddening: dust mask stores CCM-tinted optical depth +
+    // nearest dust depth; only stars behind the dust get extinguished.
+    let mdim = vec2<f32>(textureDimensions(dust_tex));
+    let m = textureSample(dust_tex, dust_smp, in.clip.xy / (mdim * max(g.y, 1.0)));
+    let behind = smoothstep(m.a - 0.15, m.a + 0.05, in.vdepth);
+    hdr *= mix(vec3<f32>(1.0), exp(-m.rgb), behind * clamp(g.x, 0.0, 1.0));
     return vec4<f32>(hdr * edge, 1.0);
 }
 "#;
@@ -89,6 +102,40 @@ fn fbm(p: vec2<f32>) -> f32 {
     }
     return v;
 }
+// World-anchored gas coords: rebased center + eye = true world, plus the
+// fragment's world-space offset from center so noise stays fixed in world
+// space at any zoom (no per-quad tiling, no texel magnification).
+// Anisotropic: compressed along arm tangent -> filaments stretch along arm.
+fn gas_q(wc: vec2<f32>, loc: vec2<f32>, seed: f32, eye: vec2<f32>) -> vec2<f32> {
+    let w = wc + eye;
+    let p = (w + loc) * 9.0 + seed * 13.0;
+    let rl = max(length(w), 1e-3);
+    let rd = w / rl;
+    let tg = vec2<f32>(-rd.y, rd.x) * 0.94 + rd * 0.34;
+    let nd = vec2<f32>(-tg.y, tg.x);
+    return tg * dot(p, tg) * 0.55 + nd * dot(p, nd) * 1.35;
+}
+// G2 13-plane impostor orientations: 3 axial + 6 edge-diagonal +
+// 4 corner-diagonal. Any sightline pierces several planes, so gas keeps
+// volume on fly-through and never pops at the near plane.
+const NORMS: array<vec3f, 13> = array<vec3f, 13>(
+    vec3f(1.0, 0.0, 0.0), vec3f(0.0, 1.0, 0.0), vec3f(0.0, 0.0, 1.0),
+    vec3f(0.7071, 0.7071, 0.0), vec3f(0.7071, -0.7071, 0.0),
+    vec3f(0.7071, 0.0, 0.7071), vec3f(0.7071, 0.0, -0.7071),
+    vec3f(0.0, 0.7071, 0.7071), vec3f(0.0, 0.7071, -0.7071),
+    vec3f(0.5774, 0.5774, 0.5774), vec3f(0.5774, 0.5774, -0.5774),
+    vec3f(0.5774, -0.5774, 0.5774), vec3f(-0.5774, 0.5774, 0.5774),
+);
+// Domain-warped density with multiplicative porosity: product of two
+// offset octaves keeps mean ~constant while punching true holes.
+fn gas_d(p: vec2<f32>, tm: f32) -> f32 {
+    let s = vec2<f32>(tm * 0.02, tm * 0.013);
+    let w = vec2<f32>(fbm(p + s), fbm(p + vec2<f32>(5.2, 1.3) - s));
+    let d = fbm(p + 1.6 * w + s);
+    let m = (0.35 + 0.65 * fbm(p * 2.3 + vec2<f32>(4.7, 2.9)))
+        * (0.35 + 0.65 * fbm(p * 4.9 + vec2<f32>(1.7, 8.4)));
+    return d * smoothstep(0.08, 0.45, m);
+}
 "#;
 
 pub const GAS_EMISSION: &str = r#"
@@ -107,21 +154,33 @@ struct Out {
     @builtin(position) clip: vec4<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) tm: vec3<f32>,
+    @location(2) wpos: vec3<f32>,
+    @location(3) lpos: vec3<f32>,
 };
 
+// G2: 13 intersecting quads per instance (52 verts). World-anchored noise
+// makes each plane slice different density -> cheap volumetric read.
 @vertex
 fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> Out {
     let p = curr[ii].pos;
     let tm = curr[ii].misc.xyz;
-    let corners = array<vec2<f32>, 4>(
+    let qid = vi / 4u;
+    let ci = vi % 4u;
+    let n = NORMS[qid % 13u];
+    let up = select(vec3f(1.0, 0.0, 0.0), vec3f(0.0, 1.0, 0.0), abs(n.y) < 0.9);
+    let t = normalize(cross(n, up));
+    let b = cross(n, t);
+    var corners = array<vec2<f32>, 4>(
         vec2<f32>(-0.5, -0.5), vec2<f32>(0.5, -0.5),
         vec2<f32>(-0.5, 0.5), vec2<f32>(0.5, 0.5));
-    let c = corners[vi % 4u];
-    let world = p + (u.cam_right.xyz * c.x + u.cam_up.xyz * c.y) * tm.y * 2.0;
+    let c = corners[ci];
+    let off = (t * c.x + b * c.y) * tm.y;
     var o: Out;
-    o.clip = u.view_proj * vec4<f32>(world, 1.0);
+    o.clip = u.view_proj * vec4<f32>(p + off, 1.0);
     o.uv = c + vec2<f32>(0.5, 0.5);
     o.tm = tm;
+    o.wpos = p;
+    o.lpos = off;
     return o;
 }
 
@@ -129,18 +188,20 @@ fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> Out {
 fn fs(in: Out) -> @location(0) vec4<f32> {
     let centered = in.uv - vec2<f32>(0.5, 0.5);
     let r = length(centered) * 2.0;
-    let q0 = in.uv * 3.0 + in.tm.x * 17.0;
-    let q = q0 + u.params.w * vec2<f32>(0.02, 0.013);
-    let w = vec2<f32>(fbm(q), fbm(q + vec2<f32>(5.2, 1.3)));
-    let d = fbm(q + 1.4 * w);
-    let body = smoothstep(1.0, 0.2, r) * smoothstep(0.32, 0.72, d);
-    var col = vec3<f32>(1.0, 0.28, 0.36);
+    let eye = vec2<f32>(u.cam_right.w, u.cam_up.w);
+    let q = gas_q(in.wpos.xz, in.lpos.xz, in.tm.x, eye) + in.lpos.y * 2.7;
+    let d = gas_d(q, u.params.w);
+    let rim = exp(-pow((r - 0.55) * 2.4, 2.0));
+    let core = exp(-r * r * 4.0) * 0.55;
+    let body = smoothstep(1.0, 0.25, r) * smoothstep(0.30, 0.70, d) * (rim * 0.95 + core);
+    var col = mix(vec3<f32>(1.0, 0.36, 0.42), vec3<f32>(1.0, 0.72, 0.75), smoothstep(0.7, 0.0, r) * smoothstep(0.4, 0.75, d));
     if (in.tm.z > 0.5 && in.tm.z < 1.5) {
-        col = mix(vec3<f32>(0.35, 0.85, 0.78), vec3<f32>(1.0, 0.32, 0.42), smoothstep(0.0, 0.7, r));
+        col = mix(vec3<f32>(0.35, 0.85, 0.78), vec3<f32>(1.0, 0.36, 0.42), smoothstep(0.05, 0.5, r));
     } else if (in.tm.z > 1.5) {
         col = vec3<f32>(0.45, 0.60, 1.0);
     }
-    return vec4<f32>(col * body * 1.1 * u.params.z, 1.0);
+    // EM_NORM: ~13 planes pierce a central sightline; normalize to one.
+    return vec4<f32>(col * body * 0.15 * 0.85 * u.params.z, 1.0);
 }
 "#;
 
@@ -160,21 +221,31 @@ struct Out {
     @builtin(position) clip: vec4<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) tm: vec3<f32>,
+    @location(2) wpos: vec3<f32>,
+    @location(3) lpos: vec3<f32>,
 };
 
 @vertex
 fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> Out {
     let p = curr[ii].pos;
     let tm = curr[ii].misc.xyz;
-    let corners = array<vec2<f32>, 4>(
+    let qid = vi / 4u;
+    let ci = vi % 4u;
+    let n = NORMS[qid % 13u];
+    let up = select(vec3f(1.0, 0.0, 0.0), vec3f(0.0, 1.0, 0.0), abs(n.y) < 0.9);
+    let t = normalize(cross(n, up));
+    let b = cross(n, t);
+    var corners = array<vec2<f32>, 4>(
         vec2<f32>(-0.5, -0.5), vec2<f32>(0.5, -0.5),
         vec2<f32>(-0.5, 0.5), vec2<f32>(0.5, 0.5));
-    let c = corners[vi % 4u];
-    let world = p + (u.cam_right.xyz * c.x + u.cam_up.xyz * c.y) * tm.y * 2.0;
+    let c = corners[ci];
+    let off = (t * c.x + b * c.y) * tm.y;
     var o: Out;
-    o.clip = u.view_proj * vec4<f32>(world, 1.0);
+    o.clip = u.view_proj * vec4<f32>(p + off, 1.0);
     o.uv = c + vec2<f32>(0.5, 0.5);
     o.tm = tm;
+    o.wpos = p;
+    o.lpos = off;
     return o;
 }
 
@@ -182,12 +253,15 @@ fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> Out {
 fn fs(in: Out) -> @location(0) vec4<f32> {
     let centered = in.uv - vec2<f32>(0.5, 0.5);
     let r = length(centered) * 2.0;
-    let q0 = in.uv * 3.0 + in.tm.x * 17.0;
-    let q = q0 + u.params.w * vec2<f32>(0.02, 0.013);
-    let w = vec2<f32>(fbm(q), fbm(q + vec2<f32>(5.2, 1.3)));
-    let d = fbm(q + 1.4 * w);
-    let alpha = smoothstep(0.38, 0.8, d) * smoothstep(1.0, 0.35, r) * 0.62;
-    return vec4<f32>(vec3<f32>(0.012, 0.009, 0.007), alpha);
+    let eye = vec2<f32>(u.cam_right.w, u.cam_up.w);
+    let q = gas_q(in.wpos.xz, in.lpos.xz, in.tm.x, eye) + in.lpos.y * 2.7;
+    let d = gas_d(q, u.params.w);
+    let shape = smoothstep(0.42, 0.8, d) * smoothstep(1.0, 0.35, r);
+    // CCM-tinted optical depth (blue dies first) + nearest depth for the
+    // per-star behind-test. DUST_NORM same 13-plane accounting as emission.
+    let tau = shape * vec3<f32>(0.55, 0.75, 1.0) * 0.9 * 0.12;
+    let dep = mix(10000.0, length(in.wpos), step(0.003, shape));
+    return vec4<f32>(tau, dep);
 }
 "#;
 
@@ -196,6 +270,11 @@ pub const TONEMAP: &str = r#"
 @group(0) @binding(1) var hdr_smp: sampler;
 @group(0) @binding(2) var bloom_tex: texture_2d<f32>;
 @group(0) @binding(3) var bloom_smp: sampler;
+// G2 split-res gas: quarter-res emission HDR + dust optical-depth mask.
+@group(0) @binding(4) var em_tex: texture_2d<f32>;
+@group(0) @binding(5) var em_smp: sampler;
+@group(0) @binding(6) var dust_tex: texture_2d<f32>;
+@group(0) @binding(7) var dust_smp: sampler;
 @group(1) @binding(0) var<uniform> b: vec4<f32>;
 
 @vertex
@@ -209,7 +288,9 @@ fn vs(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {
 fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
     let dim = vec2<f32>(textureDimensions(hdr_tex));
     let uv = fc.xy / dim;
-    let c = textureSample(hdr_tex, hdr_smp, uv).rgb
+    let transmit = exp(-textureSample(dust_tex, dust_smp, uv).rgb);
+    let c = (textureSample(hdr_tex, hdr_smp, uv).rgb
+        + textureSample(em_tex, em_smp, uv).rgb) * transmit
         + textureSample(bloom_tex, bloom_smp, uv).rgb * b.x;
     let mapped = clamp((c * (2.51 * c + 0.03)) / (c * (2.43 * c + 0.59) + 0.14), vec3<f32>(0.0), vec3<f32>(1.0));
     return vec4<f32>(mapped, 1.0);
@@ -220,6 +301,12 @@ pub const BRIGHT: &str = r#"
 struct BrightP { dst_inv: vec2<f32>, inv_exp: f32, thresh: f32 };
 @group(0) @binding(0) var hdr_tex: texture_2d<f32>;
 @group(0) @binding(1) var hdr_smp: sampler;
+@group(0) @binding(2) var bloom_tex: texture_2d<f32>;
+@group(0) @binding(3) var bloom_smp: sampler;
+@group(0) @binding(4) var em_tex: texture_2d<f32>;
+@group(0) @binding(5) var em_smp: sampler;
+@group(0) @binding(6) var dust_tex: texture_2d<f32>;
+@group(0) @binding(7) var dust_smp: sampler;
 @group(1) @binding(0) var<uniform> p: BrightP;
 
 @vertex
@@ -240,6 +327,9 @@ fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
     c += textureSample(hdr_tex, hdr_smp, uv - h + v).rgb;
     c += textureSample(hdr_tex, hdr_smp, uv + h + v).rgb;
     c *= 0.25;
+    // G2: bloom sees the same extinguished composite the eye sees.
+    let transmit = exp(-textureSample(dust_tex, dust_smp, uv).rgb);
+    c = (c + textureSample(em_tex, em_smp, uv).rgb) * transmit;
     let lum = dot(c * p.inv_exp, vec3<f32>(0.2126, 0.7152, 0.0722));
     let k = smoothstep(p.thresh, p.thresh + 0.6, lum);
     return vec4<f32>(c * k, 1.0);
@@ -277,6 +367,8 @@ pub fn billboard_pipeline(
     hdr_format: wgpu::TextureFormat,
     uniform_layout: &wgpu::BindGroupLayout,
     storage_layout: &wgpu::BindGroupLayout,
+    tex_layout: &wgpu::BindGroupLayout,
+    uni_layout: &wgpu::BindGroupLayout,
 ) -> wgpu::RenderPipeline {
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("billboard"),
@@ -284,7 +376,12 @@ pub fn billboard_pipeline(
     });
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("billboard-layout"),
-        bind_group_layouts: &[Some(uniform_layout), Some(storage_layout)],
+        bind_group_layouts: &[
+            Some(uniform_layout),
+            Some(storage_layout),
+            Some(tex_layout),
+            Some(uni_layout),
+        ],
         immediate_size: 0,
     });
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -413,11 +510,16 @@ pub fn dust_pipeline(
         storage_layout,
         wgpu::BlendState {
             color: wgpu::BlendComponent {
-                src_factor: wgpu::BlendFactor::SrcAlpha,
-                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::One,
                 operation: wgpu::BlendOperation::Add,
             },
-            alpha: wgpu::BlendComponent::REPLACE,
+            // Nearest dust depth wins regardless of draw order.
+            alpha: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::One,
+                operation: wgpu::BlendOperation::Min,
+            },
         },
     )
 }
@@ -541,41 +643,34 @@ pub fn tex_layout(device: &wgpu::Device, label: &str) -> wgpu::BindGroupLayout {
 }
 
 pub fn composite_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    let tex = |binding: u32| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    };
+    let smp = |binding: u32| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+        count: None,
+    };
     device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("composite-layout"),
+        // hdr, hdr-smp, bloom, bloom-smp, gas-em, gas-em-smp, dust, dust-smp
         entries: &[
-            wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    multisampled: false,
-                },
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 1,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 2,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    multisampled: false,
-                },
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 3,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                count: None,
-            },
+            tex(0),
+            smp(1),
+            tex(2),
+            smp(3),
+            tex(4),
+            smp(5),
+            tex(6),
+            smp(7),
         ],
     })
 }
