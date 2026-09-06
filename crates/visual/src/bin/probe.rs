@@ -9,6 +9,11 @@ mod gpu;
 mod gpufmm;
 #[path = "../render.rs"]
 mod render;
+#[path = "../ic.rs"]
+mod ic;
+#[allow(dead_code)]
+#[path = "../sim.rs"]
+mod sim;
 
 use camera::{rebase, Camera};
 use gpu::{GpuItem, GpuState, Uniform};
@@ -768,8 +773,7 @@ fn rel_err_fmm_direct(fa: &[[f64; 3]], da: &[[f64; 3]], n: usize) -> (f64, f64) 
     (max_rel, sum_rel / n as f64)
 }
 
-fn gpuloop_bench(device: &wgpu::Device, queue: &wgpu::Queue, n: usize, steps: usize) {
-    let parts = fmm::models::plummer(n, [0.0; 3], 42);
+fn gpuloop_bench(device: &wgpu::Device, queue: &wgpu::Queue, n: usize, steps: usize) {    let parts = fmm::models::plummer(n, [0.0; 3], 42);
     let pos: Vec<[f64; 3]> = parts.iter().map(|p| p.pos).collect();
     let mass: Vec<f64> = parts.iter().map(|p| p.mass).collect();
     let mut be = gpufmm::GpuBackend::new(device, queue, 4);
@@ -786,6 +790,34 @@ fn gpuloop_bench(device: &wgpu::Device, queue: &wgpu::Queue, n: usize, steps: us
     if steps <= 16 {
         let s: Vec<String> = per.iter().map(|v| format!("{v:.0}")).collect();
         println!("  per-step ms: {}", s.join(" "));
+    }
+}
+
+/// Headless app-physics replica: real KDK stepping against GpuBackend,
+/// finite scan per step. Reproduces visual-GPU crashes without a display.
+fn gpusim_run(device: &wgpu::Device, queue: &wgpu::Queue, n: usize, steps: usize, preset: &str) {
+    let preset = ic::Preset::from_str(preset).expect("unknown preset");
+    let gpu = gpufmm::GpuBackend::new(device, queue, 4);
+    let mut sim = sim::Sim::new(n, 0.01, false, Some(gpu), preset);
+    for s in 0..steps {
+        sim.step();
+        let mut mx = 0.0f64;
+        let mut bad = 0;
+        let mut esc = 0;
+        for i in 0..sim.n() {
+            for d in 0..3 {
+                if !sim.pos[i][d].is_finite() {
+                    bad += 1;
+                }
+                mx = mx.max(sim.vel[i][d].abs());
+            }
+            let r2 = sim.pos[i][0] * sim.pos[i][0] + sim.pos[i][1] * sim.pos[i][1] + sim.pos[i][2] * sim.pos[i][2];
+            if r2 > 400.0 {
+                esc += 1;
+            }
+        }
+        println!("gpusim step {s}: max|v|={mx:e} nonfinite={bad} escaped(r>20)={esc}");
+        assert_eq!(bad, 0, "non-finite positions at step {s}");
     }
 }
 
@@ -911,6 +943,7 @@ fn main() {
     let mut m2lacc_mode = false;
     let mut gpufull_mode: Option<(usize, String, usize, f64)> = None;
     let mut gpuloop_mode: Option<(usize, usize)> = None;
+    let mut gpusim_mode: Option<(usize, usize, String)> = None;
     let mut gpuprof_mode: Option<(usize, usize)> = None;
     let mut gpureuse_mode: Option<u64> = None;
     let mut count = 1500usize;
@@ -998,6 +1031,13 @@ fn main() {
                 gpuloop_mode = Some((nn, st));
                 i += 3;
             }
+            "--gpusim" => {
+                let nn: usize = a.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(100000);
+                let st: usize = a.get(i + 2).and_then(|s| s.parse().ok()).unwrap_or(12);
+                let ps: String = a.get(i + 3).cloned().unwrap_or("spiral".to_string());
+                gpusim_mode = Some((nn, st, ps));
+                i += 4;
+            }
             "--gpureuse" => {
                 let kk: u64 = a.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(4);
                 gpureuse_mode = Some(kk);
@@ -1046,6 +1086,10 @@ fn main() {
     }
     if let Some((nn, st)) = gpuloop_mode {
         gpuloop_bench(&device, &queue, nn, st);
+        return;
+    }
+    if let Some((nn, st, ps)) = gpusim_mode {
+        gpusim_run(&device, &queue, nn, st, &ps);
         return;
     }
     if let Some((nn, rr)) = gpuprof_mode {

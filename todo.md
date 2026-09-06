@@ -2,6 +2,52 @@
 
 Source of truth for exit gates: `ROADMAP.md` Phase 1 (lines 34-48).
 
+## Session log — 2026-09-06: visual presets (IC overhaul)
+
+Complaint: 100k default looked chaotic + white — Plummer blob, random
+white-heavy colors, no structure. New `crates/visual/src/ic.rs`:
+mass spectrum (bottom-heavy, total M=1) mapped to spectral look
+(heavy blue-bright → light red-dim, heroes capped ~0.4% so cores stop
+whiting out). Presets via `--preset`: `cluster` (old Plummer, new
+colors), `spiral` (exponential disk + Hernquist bulge + 2% BH, rotation
+curve, 2-arm density modulation, blue arms / old yellow core),
+`merger` (two tilted spirals, bound infall), `bh` (12% BH + hot inner
+rim + faint halo). `Sim::new` takes preset; virial rescale now
+cluster-only (disks built in equilibrium). Tests: 19 green
+(mass/COM/momentum/determinism/Lz/two-BHs + per-preset finite steps);
+build warning-free; probe untouched (synthetic layouts only).
+
+## Session log — 2026-09-06: why disks evaporate + dark-halo fix (research-backed)
+
+Complaint: spiral flings all stars off in minutes, worse at high speed.
+Researched: Rubin flat curves (dark halos ~5-10x visible mass; NASA/ESA),
+Widrow-Dubinski/Hernquist-93/Kuijken-Dubinski equilibrium DFs,
+Power+03 convergence (dt << orbital time, dt ~ sqrt(eps/a), relaxation
+criterion), Zhang+19 softening update. Three compounding causes found:
+(1) speed slider scaled dt up to 40x (0.16) — far past stability near
+the center, pure numerical evaporation; (2) no halo — Keplerian decline
+leaves outskirts weakly bound; (3) unsoftened FMM — fast relaxation.
+Fixes: static Hernquist halo in `ic.rs` (spiral 3.0/3.0, bh 1.5/2.0,
+merger 6.0/5.0 global, cluster none) applied backend-agnostically in
+`Sim::step`; disk vc curves now include halo (v(4)/v(1) > 0.9 test);
+adaptive dt clamp `dt <= 0.25*sqrt(0.02/a_max)` per step — speed
+saturates instead of exploding (slider now 0.1-10); spectrum narrowed
+20:1 → 10:1. Verified: 100k spiral 60 GPU steps, 0 escapers, max|v|
+~2.8; all presets green; 25 tests green, warning-free.
+
+## Session log — 2026-09-06: spiral GPU crash (`leaf over 64 bodies`)
+
+`--preset spiral --n 100000` panicked in `gpufmm.rs:1514` after ~7 steps.
+Traced headless with new `probe --gpusim N STEPS PRESET` (real KDK vs
+GpuBackend): tree fine at t=0, then unsoftened-Newton slingshots
+(max|v| slammed into the 5.0 clamp from step 0) flung bodies out, the
+tree box ballooned, and Morton resolution at the nucleus collapsed.
+Fix without library churn (gates untouched): `cap_accel` (|a| ≤ 50,
+non-finite → 0) in `sim.rs`, applied by CPU-FMM + GPU backends —
+Direct already self-limits via soft2. Verified: 100k spiral 40 steps,
+30k merger/bh 12 steps, all finite, max|v| ~1→3; 22 tests green,
+warning-free.
+
 ## Session log — 2026-09-03: visual side quest V0 harness
 
 Motivation break from FMM optimization. Scaffolded `crates/visual`

@@ -1659,6 +1659,7 @@ impl GpuBackend {
         for (k, &id) in order.iter().enumerate() {
             out[id as usize] = [got[k][0] as f64, got[k][1] as f64, got[k][2] as f64];
         }
+        crate::sim::cap_accel(&mut out);
         out
     }
 }

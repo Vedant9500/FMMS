@@ -1,12 +1,13 @@
 mod camera;
 mod gpu;
 mod gpufmm;
+mod ic;
 mod render;
 mod sim;
 
 use camera::{rebase, Camera};
 use gpu::{GpuItem, GpuState, Uniform};
-use sim::{physics_loop, Ctl, Msg, Sim};
+use sim::{advance_cursor, bracket, physics_loop, Ctl, HistSnap, Msg, Sim};
 use std::sync::Arc;
 use std::collections::VecDeque;
 use std::time::Instant;
@@ -21,6 +22,7 @@ struct Args {
     dt: f64,
     fmm: bool,
     gpu: bool,
+    preset: ic::Preset,
 }
 
 fn parse_args() -> Args {
@@ -29,6 +31,7 @@ fn parse_args() -> Args {
     let mut dt = None::<f64>;
     let mut fmm = false;
     let mut gpu = false;
+    let mut preset = ic::Preset::Cluster;
     let mut i = 1;
     while i < a.len() {
         match a[i].as_str() {
@@ -38,6 +41,10 @@ fn parse_args() -> Args {
             }
             "--dt" => {
                 dt = a.get(i + 1).and_then(|s| s.parse().ok()).or(dt);
+                i += 2;
+            }
+            "--preset" => {
+                preset = a.get(i + 1).and_then(|s| ic::Preset::from_str(s)).unwrap_or(preset);
                 i += 2;
             }
             "--fmm" => {
@@ -52,7 +59,7 @@ fn parse_args() -> Args {
         }
     }
     let dt = dt.unwrap_or(if n > 20000 { 0.01 } else { 0.004 });
-    Args { n, dt, fmm, gpu }
+    Args { n, dt, fmm, gpu, preset }
 }
 
 fn post_binds(
@@ -218,30 +225,28 @@ struct App {
     mag: Vec<f32>,
     body_n: usize,
     hist: VecDeque<HistSnap>,
+    render_t: Option<f64>,
+    sim_rate: f64,
+    sim_dt: f64,
     interval_ema: f64,
     last_arrival: Option<Instant>,
     sim_time: f64,
     sim_steps: u64,
 }
 
-/// Render trails physics by this fixed lag and interpolates between
-/// bracketing snaps. Must exceed the slowest step (refresh ~150 ms+ under
-/// render contention); latency is invisible, hunting is impossible.
-const LAG_S: f64 = 0.35;
-/// Snap history cap: must hold lag/mean-interval + margin (~9 at 100k).
-const HIST_CAP: usize = 10;
-/// One physics snapshot with render-side arrival stamp.
-struct HistSnap {
-    pos: Vec<[f64; 3]>,
-    vel: Vec<[f64; 3]>,
-    time: f64,
-    steps: u64,
-    arrival: Instant,
-}
+/// Target playout buffer in wall seconds, converted to sim time via the
+/// estimated sim rate and clamped to 2..8 steps. Covers a K=4 refresh
+/// burst without freezing; occupancy feedback absorbs the rest.
+const BUFFER_WALL_S: f64 = 0.30;
+/// Snap history cap: must hold the target buffer plus catch-up margin.
+const HIST_CAP: usize = 24;
+/// Physics channel bound: backpressure when steps outrun drains.
+const CHAN_CAP: usize = 16;
 
 impl App {
     fn new(args: Args) -> Self {
         let point_size = (0.035 * (1500.0 / args.n.max(1) as f32).sqrt()).clamp(0.004, 0.035);
+        let sim_dt = args.dt;
         Self {
             args: Some(args),
             gfx: None,
@@ -269,6 +274,9 @@ impl App {
             mag: Vec::new(),
             body_n: 0,
             hist: VecDeque::new(),
+            render_t: None,
+            sim_rate: 0.0,
+            sim_dt,
             interval_ema: 0.25,
             last_arrival: None,
             sim_time: 0.0,
@@ -404,9 +412,9 @@ impl App {
         } else {
             None
         };
-        let sim = Sim::new(args.n, args.dt, args.fmm, gpu_backend);
+        let sim = Sim::new(args.n, args.dt, args.fmm, gpu_backend, args.preset);
         gpu_state.n = sim.n();
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::sync_channel(CHAN_CAP);
         let ctl = Arc::new(Ctl::new());
         *ctl.dt.lock().unwrap() = args.dt;
         *ctl.speed.lock().unwrap() = self.speed;
@@ -602,21 +610,47 @@ impl App {
                 }
             }
         }
-        // Bracket render time between snaps; hold newest on gaps/startup.
-        // Fixed lag (EMA drives the phys-rate readout only): an adaptive
-        // lag hunts bursty arrivals with a ~10-snap time constant.
-        let rt = now - std::time::Duration::from_secs_f64(if self.paused { 0.0 } else { LAG_S });
-        while self.hist.len() >= 2 && self.hist[1].arrival <= rt {
-            self.hist.pop_front();
-        }
-        let (p0, p1, v0, v1, alpha) = match (self.hist.front(), self.hist.get(1)) {
-            (Some(a), Some(b)) => {
-                let span = (b.arrival - a.arrival).as_secs_f64().max(1e-6);
-                let t = ((rt - a.arrival).as_secs_f64() / span).clamp(0.0, 1.0);
-                (&a.pos[..], &b.pos[..], &a.vel[..], &b.vel[..], t)
+        // Sim-time cursor + jitter buffer. Arrival-time blending pulses on
+        // bursty steps (K=4 refresh: 17/17/17/140 ms arrivals, uniform sim
+        // steps); sim time advances uniformly through the same snaps.
+        if let (Some(f), Some(b)) = (self.hist.front(), self.hist.back()) {
+            let n = self.hist.len();
+            if n >= 2 {
+                let span = (b.time - f.time).max(1e-12);
+                self.sim_dt = (span / (n as f64 - 1.0)).max(1e-9);
+                let wall = (b.arrival - f.arrival).as_secs_f64().max(1e-6);
+                let inst = span / wall;
+                self.sim_rate = if self.sim_rate <= 0.0 { inst } else { self.sim_rate * 0.85 + inst * 0.15 };
             }
-            (Some(a), None) => (&a.pos[..], &a.pos[..], &a.vel[..], &a.vel[..], 1.0),
-            (None, _) => (&[][..], &[][..], &[][..], &[][..], 1.0),
+            let mut rt = match self.render_t {
+                Some(t) => t,
+                None => {
+                    let target = (self.sim_rate * BUFFER_WALL_S).clamp(2.0 * self.sim_dt, 8.0 * self.sim_dt);
+                    if self.paused { b.time } else { (b.time - target).max(f.time) }
+                }
+            };
+            if !self.paused && self.sim_rate > 0.0 {
+                rt = advance_cursor(rt, f.time, b.time, self.sim_rate, self.sim_dt, real_dt.min(0.25), BUFFER_WALL_S);
+            }
+            while self.hist.len() > HIST_CAP {
+                self.hist.pop_front();
+            }
+            if let Some(h) = self.hist.front() {
+                rt = rt.max(h.time);
+            }
+            while self.hist.len() >= 3 && self.hist[1].time <= rt {
+                self.hist.pop_front();
+            }
+            self.render_t = Some(rt);
+        }
+        let (lo, alpha, extra) = match self.render_t {
+            Some(t) => bracket(&self.hist, t),
+            None => (0, 1.0, 0.0),
+        };
+        let (p0, p1, v0, v1) = match (self.hist.get(lo), self.hist.get(lo + 1)) {
+            (Some(a), Some(b)) => (&a.pos[..], &b.pos[..], &a.vel[..], &b.vel[..]),
+            (Some(a), None) => (&a.pos[..], &a.pos[..], &a.vel[..], &a.vel[..]),
+            _ => (&[][..], &[][..], &[][..], &[][..]),
         };
 
         let gfx = self.gfx.as_mut().unwrap();
@@ -632,15 +666,15 @@ impl App {
             let q1 = p1[i];
             let u0 = v0[i];
             let u1 = v1[i];
-            let w = [
-                q0[0] + (q1[0] - q0[0]) * a,
-                q0[1] + (q1[1] - q0[1]) * a,
-                q0[2] + (q1[2] - q0[2]) * a,
-            ];
             let v = [
                 u0[0] + (u1[0] - u0[0]) * a,
                 u0[1] + (u1[1] - u0[1]) * a,
                 u0[2] + (u1[2] - u0[2]) * a,
+            ];
+            let w = [
+                q0[0] + (q1[0] - q0[0]) * a + v[0] * extra,
+                q0[1] + (q1[1] - q0[1]) * a + v[1] * extra,
+                q0[2] + (q1[2] - q0[2]) * a + v[2] * extra,
             ];
             let psp = (u0[0] * u0[0] + u0[1] * u0[1] + u0[2] * u0[2]).sqrt() as f32;
             let sp = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt() as f32;
@@ -712,7 +746,7 @@ impl App {
                 ui.label(format!("steps: {sim_steps}"));
                 ui.label(format!("upload/frame: {bytes_kb} KB"));
                 ui.checkbox(&mut self.paused, "paused (space)");
-                ui.add(egui::Slider::new(&mut self.speed, 0.1..=40.0).text("speed"));
+                ui.add(egui::Slider::new(&mut self.speed, 0.1..=10.0).text("speed"));
                 ui.add(egui::Slider::new(&mut self.point_size, 0.002..=0.2).text("size"));
                 ui.add(egui::Slider::new(&mut self.exposure, 0.2..=5.0).text("exposure"));
                 ui.add(egui::Slider::new(&mut self.bloom, 0.0..=2.0).text("bloom"));
