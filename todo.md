@@ -2,9 +2,136 @@
 
 Source of truth for exit gates: `ROADMAP.md` Phase 1 (lines 34-48).
 
-## Session log — 2026-09-07: merged-cloud freeze bug (dead knots rendered)
+## Session log — 2026-09-07: 0.5-1Hz motion breathe (cursor starvation)
 
-Report: some clouds move, some parked forever; user nailed it — merged
+Report: motion pulsed normal/slow at ~0.5-1Hz. Root cause (`sim.rs`
+advance_cursor): the playout cursor was hard-capped at back+2dt. At large
+N, GPU-refresh steps stall snap arrivals for ~1s while the cursor eats its
+2-step budget in ms — then motion froze until the next burst and
+fast-forwarded on catch-up, at the refresh cadence. Fix: ceiling is now
+max(2dt, rate*CURSOR_EXTRA_WALL) with EXTRA_WALL=0.5s, so the cursor glides
+on ballistic snap-velocity extrapolation through gaps and blends back on
+resume (drift bounded, no pop). Tests: extrapolation_stays_bounded
+re-baselined to the allowance; new cursor_glides_through_arrival_gap pins
+steady glide past the old ceiling within allowance (fails on old code).
+Bursty-uniformity guard still green. 55 visual x2, zero warnings. Note: at
+very large N with multi-second refresh gaps the cursor still honestly
+stalls past 0.5s — the remaining lever is refresh cost itself (k/adaptive,
+CPU walk), not the playout.
+
+## Session log — 2026-09-07: gpufmm optimization pass (measured A/B)
+
+Full audit of `crates/visual/src/gpufmm.rs` against RTX 4060 numbers.
+Baseline truth: refresh steps 35ms vs 6ms normal @20k — the CPU walk owns
+the frame, and m2m/l2l "dominance" in probe is submit-latency, not ALU.
+Implemented: P2P_WG 32->64 (dispatch assumed 64; p2p kernel -26% @20k,
+-12% @100k); 1e-12 P2P softening in both kernels (no inf/NaN); M2L shaders
+templated on P via WGSL_HELPERS (killed idx/cmul dup + hardcoded DIM);
+module docs (no-rotation rationale, refresh model, uniform field table,
+buffer scalings, precision); CSR build_p2p_bodies (no per-cell Vec);
+gr-on-GPU (s1 loads centers+dsts, u32 gdst upload replaces vec4 gr:
+-17MB/refresh @100k); split_fat + leaf>64 guard return GpuError (CPU
+fallback, no mid-run assert); bind-group + frozen-uniform caching per
+refresh (~30 allocs/step -> 0); ignored gpu_matches_cpu_fmm test (max
+6.5e-6 rel err, asserts locked at 1e-4/1e-5). A/B (steady-state, 64-step
+medians, stash-controlled): 20k 6/34 both, 100k ~48-50 both — no step-time
+miracle because frames are CPU-walk + submit-latency bound, as predicted;
+structural wins (smaller uploads, cached binds, faster p2p) grow with N.
+Deferred: M2L cell-workgroup restructure + CPU walk algorithmics (need
+timestamped profiling first), pipeline cache, adaptive k. 54 visual x2
+green, zero warnings.
+
+## Session log — 2026-09-07: conserved gas (merge grows, exclusion, no central kill)
+
+Request: gas should merge into bigger clouds, never share space, never be
+destroyed — but blobs sat inside each other untouched and vanished at the
+centre. Root causes (`sim.rs`): merge radius 0.25x summed sizes vs quads
+rendering ~size wide (2x visual overlap before contact); cross-class pairs
+skipped entirely (no exclusion); diameter-add doubling area forced a
+dispersal drain that evaporated every giant; ISCO set size 0 (kill) + tidal
+shred shrank inner clouds. Fixes: volume-transfer coalescence (mass ~
+size³, radii grow as cbrt, gradual per-sweep fraction + wisp gulp, flash
+pump on growth); contact at 0.5x sum = visual touch; non-merging contacts
+(other class, big at cap) push apart along centers (inverse-volume weight)
++ approach-velocity damping, mass untouched; condensation is grow-to-eq
+only; ISCO plunge recycles to a live sibling with size intact + flash 1
+(fountain, kills clamp pile-up without deletion); shred removed.
+Budget stays bounded by conserved volume + caps (giants persist by design).
+Tests rewritten: merge_conserves_volume_and_grows, merge_excludes_and_
+respects_caps (+at-cap exclusion, volume asserts), plunge_recycles_instead_
+of_clamping (size kept, flash 1, rejoins disk), inner_clouds_persist (0.15
+unchanged 100 steps). 54 visual x2 green, zero warnings. Emission/long-run/
+shear/cavity guards all still pass with persistent giants.
+
+## Session log — 2026-09-07: ic.rs 1M audit + fixes (init 365ms/M)
+
+Line-by-line audit of `crates/visual/src/ic.rs` for the 1M-particle goal,
+all findings implemented. `ic.rs`: from_str no-alloc ascii compare;
+sample_class/class_index common-first branch order (identical thresholds);
+stellar hoists 6 ln/star into one LazyLock table + reuses pre-exp log for
+temp map + log-space lum clamp; assign_looks sorts tuples in place by lum
+with total_cmp+unstable (kills li vec 8MB/M, no unwrap, same permutation);
+disk_pos 24-reject fallback randomizes phi; spiral/BH tangents from pos
+(-y/r,x/r, kills ~2M trig/M); bulge vc2 evaluated once (clamped-r fast path);
+Hernquist/BH-halo bounded resample replaces .min() shell piles (~15% bulge
+@3.0, ~30% BH halo @4.0); bh_disk_v2 single source (was 3 copies);
+Rot matrix hoisted per merger galaxy; merger mass-halve removed (renorm
+no-op); renorm fused into zero_com (3 passes->2); nuclear ring scatter
+clamped >=0.2 (no origin mirror); GasTable.precomputed inv_span;
+merger gas table now includes halo in total (was disk+bulge-halo -> 0
+outward); Plummer sampled inline (kills 32MB Particle transient);
+gas_for_disk with_capacity + panic-proof anchor index + &impl Fn;
+generate_gas deleted (diverged test-only dup; tests use generate's gas);
+Gas.kind stays f32 + gauss stays single-variate by decision (documented).
+`sim.rs`/`main.rs`: Sim drops teff/lum vecs (8MB/M; census folded at init
+into Static, new exact-count assert in presets_run_finite); CHAN_CAP 16->4
+(768MB->192MB worst-case queued snaps at 1M). New ignored gate
+spiral_1m_generate_sane: 1M spiral init ~365ms release. 54 visual + full
+workspace green, zero build warnings. Pre-existing clippy failure in
+fmm/rotation.rs (erasing_op, newer toolchain) untouched. Deferred (need GPU
+to verify / visual sign-off): GpuItem static/dynamic split (halves 32MB/frame
+upload), snap double-buffer pool, conditioned-sampling to kill sorts fully.
+
+## Session log — 2026-09-07: heartbeat + white donut regression (merge/flash cadence)
+
+Report with screenshot: gases pulsed like a heartbeat + thick white donut
+around the spiral center, worse than before. Three compounding causes from
+the previous smooth-merge change: (1) merge sweep + respawn burst ran on a
+global every-8-steps clock, so the whole disk merged/flashed/refilled in
+sync; tidal heat floor attacked instantly, strobing each periapsis;
+(2) diameter-add merging doubles area per coalescence while time-based
+drains (dispersal tau 4.0, flash decay) run on sim time — measured 8x
+budget growth in 50 steps; respawn jitter 0.08 landed inside giants' merge
+radii, feeding them; ring at fixed radius rotates rigidly (no shear between
+ring-mates) so they merged into each other; (3) flash glow 4x on big
+overlapping quads white-clipped. Fixes (`sim.rs`/`render.rs`/`ic.rs`):
+strided merge (1/8 rows per step, same per-pair cadence, no sync pulse) +
+trickle respawn (cap 2/step, jitter 0.15) + tidal heat slow attack
+(dt*4 glide) + dispersal tau 4.0->0.5 (same timescale as pump: giants swell
+then fade like remnants) + caps 0.30/0.25->0.18/0.16 + MERGE_F 0.3->0.25,
+XFER 0.4->0.3 + IC ring_frac 0.18/0.25->0.08/0.12, scatter 0.35->0.50 +
+flash glow 4x->2.5x, swell 0.6->0.3. New test `emission_budget_bounded_and_
+steady` (tail flat/draining, no 8-step pulse, step jitter <8%). 54 visual +
+workspace green, zero warnings, clippy clean in visual.
+
+## Session log — 2026-09-07: smooth supernova merges + BH realism + soft ring
+
+Request: merge pop should swell like a supernova, not blink; BH center
+clamped gas into a flickering statue-cloud; spiral kept a hard ring.
+Research grounding: angular-momentum barrier + shear + SN/AGN feedback
+cycles (Goldbaum/Krumholz transport, CMZ quasi-steady ring-burst model),
+ISCO plunge (simulations clear particles there), tidal shredding, bipolar
+winds (~0.1-0.3c polar in TDE sims), hot inner rim. Fixes: gradual merge
+(40%-per-sweep transfer, ~5 sweeps to coalesce, volume-weighted drift) +
+`flash` channel (merge pump, tidal-heat floor, tau decay) streamed via
+snap to emission shader (swell + white-blue + glow); ISCO sink (0.06 BH /
+0.04 spiral), tidal shred cap 0.02+0.5·d, smooth bipolar wind (Gaussian ×
+polar, no step edge), fountain respawn; IC ring feathered (m=2 spiral
+modulation, wide scatter, 15% deterministic leak). Tests: gradual-converge
++ no-pop + caps-fill + ISCO + shred-rate + flash-decay + respawn +
+fed-ring guards. 53 visual + workspace green, zero warnings.
+
+## Session log — 2026-09-07: merged-cloud freeze bug (dead knots rendered)
 losers froze. Root cause: app staged from init-time meta (Static sent once),
 so size-0 dead knots rendered at frozen merge points as statues, piling up
 over time. Fix: Snap/HistSnap carry live `gas_size`, staging lerps size and

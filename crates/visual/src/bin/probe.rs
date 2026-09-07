@@ -666,7 +666,8 @@ fn gpufull_bench(
         &ccount,
         gpufmm::FAT_THR,
         gpufmm::FAT_CHUNK,
-    );
+    )
+    .expect("fat split");
     println!("gpufull n={n}: cells={ncells} leaves={} m2l={} directed={total} p2pbodies={} record={record_ms:.1}ms",
         leaf_ids.len(), rec.pairs.len(), pb.list.len());
 
@@ -1062,7 +1063,7 @@ fn gpuloop_bench(device: &wgpu::Device, queue: &wgpu::Queue, n: usize, steps: us
         "gpuloop n={n} steps={steps} k=4: {ms:.1} ms/step = {:.1} steps/s",
         1000.0 / ms
     );
-    if steps <= 16 {
+    if steps <= 64 {
         let s: Vec<String> = per.iter().map(|v| format!("{v:.0}")).collect();
         println!("  per-step ms: {}", s.join(" "));
     }

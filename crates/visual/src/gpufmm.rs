@@ -1,3 +1,36 @@
+//! GPU-resident FMM backend (visual preset p=4 / eps=1e-2 / n_leaf=64).
+//!
+//! Algorithm: plain spherical-harmonic FMM in f32, evaluated directly
+//! (O(p^4) translations, DIM=25). Unlike the CPU crate there is deliberately
+//! NO Wigner rotation: at p=4 the rotation bookkeeping (swap matrices,
+//! two extra passes) costs more than the direct contraction, and theta
+//! tables stay register-resident per thread.
+//!
+//! Refresh model: the tree + interaction lists rebuild on CPU every `k`
+//! steps (`try_accel_with_refresh`); positions upload every step and
+//! moments/locals recompute on GPU. Non-refresh steps cost one SoA shuffle
+//! plus small uploads on CPU.
+//!
+//! Per-pass uniform `vec4<u32>` meanings (positional fields!):
+//!   p2m: [DIM, nleaf, _, _]      one thread per leaf
+//!   m2m: [DIM, nlevel, level_off, _]  one thread per level cell
+//!   s1:  [_, DIM, npairs, _]     one thread per directed M2L pair
+//!   red: [ncells, DIM, _, _]     one thread per (cell, moment)
+//!   l2l: [DIM, nlevel, level_off, _]
+//!   l2p: [DIM, nslots, _, _]     one thread per body
+//!   p2p: [nleaf, _, _, _]        one workgroup per leaf ordinal
+//!   fat: [njobs, _, _, _]        one workgroup per fat job
+//!   fred:[nfat, _, _, _]         one workgroup per fat leaf
+//!
+//! Buffer size scalings (d=25): b-slots = npairs*d*8B dominates
+//! (~4.3 pairs/body measured: ~280MB@300k, ~0.9GB@1M). `ensure()` checks
+//! every buffer against the device buffer+binding limits and returns
+//! OverBudget instead of hitting wgpu validation.
+//!
+//! Precision: f32 end to end (f64 in, f32 on device, f64 out). P2P uses a
+//! 1e-12 softening + 2x Newton-refined rsqrt; coincident bodies are finite
+//! (no NaN) at negligible force error.
+
 pub const P: usize = 4;
 pub const DIM: usize = (P + 1) * (P + 1);
 pub const EPS: f64 = 1e-2;
@@ -48,91 +81,100 @@ fn upsilon_table(x: f32, y: f32, z: f32) -> array<vec2<f32>, DIM> {
 }
 "#;
 
-pub const M2L_WGSL: &str = r#"
-const P: u32 = 4u;
-const DIM: u32 = 25u;
-
+/// Directed-pair M2L: one thread per pair. Templated on P like the sweep
+/// shaders (was a hardcoded-DIM const duplicating idx/cmul).
+pub fn m2l_source() -> String {
+    let p = P as u32;
+    let d = DIM as u32;
+    format!(
+        r#"const P: u32 = {p}u;
+const DIM: u32 = {d}u;
+{pre}
 @group(0) @binding(0) var<storage, read> moments: array<vec2<f32>>;
 @group(0) @binding(1) var<storage, read> srcs: array<u32>;
-@group(0) @binding(2) var<storage, read> rs: array<vec4<f32>>;
-@group(0) @binding(3) var<storage, read_write> out: array<vec2<f32>>;
-@group(0) @binding(4) var<uniform> u: vec4<u32>;
-
-fn idx(n: u32, m: i32) -> u32 {
-    return u32(i32(n * (n + 1u)) + m);
-}
-
-fn cmul(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
-    return vec2<f32>(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
-}
+@group(0) @binding(2) var<storage, read> centers: array<vec4<f32>>;
+@group(0) @binding(3) var<storage, read> dsts: array<u32>;
+@group(0) @binding(4) var<storage, read_write> out: array<vec2<f32>>;
+@group(0) @binding(5) var<uniform> u: vec4<u32>;
 
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
     let pi = gid.x;
-    if (pi >= u.z) {
+    if (pi >= u.z) {{
         return;
-    }
-    let moff = srcs[pi] * u.y;
+    }}
+    // Separation from cell centers on-device: saves a per-pair CPU loop +
+    // a vec4 upload per refresh (u32 dst list instead).
+    let src = srcs[pi];
+    let r = centers[dsts[pi]].xyz - centers[src].xyz;
+    let moff = src * u.y;
     let ooff = pi * u.y;
-    let x = rs[pi].x;
-    let y = rs[pi].y;
-    let z = rs[pi].z;
+    let x = r.x;
+    let y = r.y;
+    let z = r.z;
     let r2 = x * x + y * y + z * z;
     let ir = inverseSqrt(r2);
 
     var th: array<vec2<f32>, DIM>;
     th[idx(0u, 0)] = vec2<f32>(ir, 0.0);
-    for (var n = 1u; n <= P; n++) {
+    for (var n = 1u; n <= P; n++) {{
         let a = f32(2u * n - 1u) * z;
         let b = f32((n - 1u) * (n - 1u));
         let p1 = th[idx(n - 1u, 0)];
         var p2 = vec2<f32>(0.0, 0.0);
-        if (n >= 2u) {
+        if (n >= 2u) {{
             p2 = th[idx(n - 2u, 0)];
-        }
+        }}
         th[idx(n, 0)] = (p1 * a - p2 * b) / r2;
-    }
-    for (var m = 1u; m <= P; m++) {
+    }}
+    for (var m = 1u; m <= P; m++) {{
         let mi = i32(m);
         th[idx(m, mi)] = cmul(vec2<f32>(x, y) * (f32(2u * m - 1u) / r2), th[idx(m - 1u, mi - 1)]);
-        for (var n = m + 1u; n <= P; n++) {
+        for (var n = m + 1u; n <= P; n++) {{
             let a = f32(2u * n - 1u) * z;
             let b = f32((n - 1u) * (n - 1u) - m * m);
             th[idx(n, mi)] = (th[idx(n - 1u, mi)] * a - th[idx(n - 2u, mi)] * b) / r2;
-        }
-    }
-    for (var m = 1u; m <= P; m++) {
+        }}
+    }}
+    for (var m = 1u; m <= P; m++) {{
         let mi = i32(m);
         var sgn = -1.0;
-        if (m % 2u == 0u) {
+        if (m % 2u == 0u) {{
             sgn = 1.0;
-        }
-        for (var n = m; n <= P; n++) {
+        }}
+        for (var n = m; n <= P; n++) {{
             let c = th[idx(n, mi)];
             th[idx(n, -mi)] = vec2<f32>(c.x, -c.y) * sgn;
-        }
-    }
+        }}
+    }}
 
-    for (var n = 0u; n <= P; n++) {
+    for (var n = 0u; n <= P; n++) {{
         let ni = i32(n);
-        for (var m = -ni; m <= ni; m++) {
+        for (var m = -ni; m <= ni; m++) {{
             var fb = vec2<f32>(0.0, 0.0);
-            for (var k = 0u; k <= P - n; k++) {
+            for (var k = 0u; k <= P - n; k++) {{
                 let ki = i32(k);
-                for (var l = -ki; l <= ki; l++) {
+                for (var l = -ki; l <= ki; l++) {{
                     let t = th[idx(n + k, m + l)];
                     let mc = moments[moff + idx(k, l)];
                     fb += cmul(vec2<f32>(mc.x, -mc.y), t);
-                }
-            }
+                }}
+            }}
             out[ooff + idx(n, m)] = fb;
-        }
-    }
+        }}
+    }}
+}}
+"#,
+        pre = WGSL_HELPERS,
+        p = p,
+        d = d,
+    )
 }
-"#;
 
-pub const M2L_RED_WGSL: &str = r#"
-const DIM: u32 = 25u;
+pub fn m2l_red_source() -> String {
+    let d = DIM as u32;
+    format!(
+        r#"const DIM: u32 = {d}u;
 
 @group(0) @binding(0) var<storage, read> slots: array<vec2<f32>>;
 @group(0) @binding(1) var<storage, read> gstart: array<u32>;
@@ -141,22 +183,25 @@ const DIM: u32 = 25u;
 @group(0) @binding(4) var<uniform> u: vec4<u32>;
 
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
     let t = gid.x;
     let c = t / u.y;
-    if (c >= u.x) {
+    if (c >= u.x) {{
         return;
-    }
+    }}
     let i = t % u.y;
     let start = gstart[c];
     let cnt = gcount[c];
     var acc = vec2<f32>(0.0, 0.0);
-    for (var j = 0u; j < cnt; j++) {
+    for (var j = 0u; j < cnt; j++) {{
         acc += slots[(start + j) * u.y + i];
-    }
+    }}
     locals[c * u.y + i] = acc;
+}}
+"#,
+        d = d,
+    )
 }
-"#;
 
 pub fn p2m_source(p: u32) -> String {
     let d = (p + 1) * (p + 1);
@@ -392,7 +437,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
     )
 }
 
-pub const P2P_WG: u32 = 32;
+pub const P2P_WG: u32 = 64;
 /// Partner-body count above which a leaf is split across workgroups.
 pub const FAT_THR: u32 = 4096;
 /// Partner bodies per fat job (one workgroup each).
@@ -417,7 +462,9 @@ var<workgroup> tids: array<u32, TILE>;
 
 fn interact(px: vec3<f32>, qx: vec3<f32>, qm: f32) -> vec4<f32> {{
     let d = qx - px;
-    let r2 = dot(d, d);
+    // 1e-12 softening: coincident bodies stay finite (no inf/NaN poisoning
+    // the step). Force error ~1e-12 relative; self-skip is by slot id.
+    let r2 = dot(d, d) + 1e-12;
     var inv = inverseSqrt(r2);
     inv = inv * (1.5 - 0.5 * r2 * inv * inv);
     inv = inv * (1.5 - 0.5 * r2 * inv * inv);
@@ -588,9 +635,10 @@ pub fn m2l_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
             storage(0, true),
             storage(1, true),
             storage(2, true),
-            storage(3, false),
+            storage(3, true),
+            storage(4, false),
             wgpu::BindGroupLayoutEntry {
-                binding: 4,
+                binding: 5,
                 visibility: wgpu::ShaderStages::COMPUTE,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
@@ -609,7 +657,7 @@ pub fn m2l_pipeline(
 ) -> wgpu::ComputePipeline {
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("m2l"),
-        source: wgpu::ShaderSource::Wgsl(M2L_WGSL.into()),
+        source: wgpu::ShaderSource::Wgsl(m2l_source().into()),
     });
     let pipe_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("m2l-layout"),
@@ -668,7 +716,7 @@ pub fn m2l_red_pipeline(
 ) -> wgpu::ComputePipeline {
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("m2l-red"),
-        source: wgpu::ShaderSource::Wgsl(M2L_RED_WGSL.into()),
+        source: wgpu::ShaderSource::Wgsl(m2l_red_source().into()),
     });
     let pipe_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("m2l-red-layout"),
@@ -691,13 +739,13 @@ mod tests {
 
     #[test]
     fn m2l_shader_parses() {
-        naga::front::wgsl::parse_str(M2L_WGSL).expect("m2l wgsl");
+        naga::front::wgsl::parse_str(&m2l_source()).expect("m2l wgsl");
         assert_eq!(DIM, 25);
     }
 
     #[test]
     fn m2l_red_shader_parses() {
-        naga::front::wgsl::parse_str(M2L_RED_WGSL).expect("m2l-red wgsl");
+        naga::front::wgsl::parse_str(&m2l_red_source()).expect("m2l-red wgsl");
     }
 
     #[test]
@@ -734,13 +782,12 @@ mod tests {
     }
 
     #[test]
-    fn fat_split_zeroes_main_and_covers_range() {
-        let mut pl = PbLists {
+    fn fat_split_zeroes_main_and_covers_range() {        let mut pl = PbLists {
             start: vec![0, 4],
             count: vec![4, 2],
             list: vec![0, 1, 2, 3, 4, 5],
         };
-        let fj = split_fat(&mut pl, &[0, 1], &[0, 4], &[4, 2], 3, 2);
+        let fj = split_fat(&mut pl, &[0, 1], &[0, 4], &[4, 2], 3, 2).expect("fat split");
         assert_eq!(pl.count, vec![0, 2]);
         assert_eq!((fj.nfat, fj.njobs), (1, 2));
         assert_eq!(fj.job_s0, vec![0, 0]);
@@ -750,6 +797,65 @@ mod tests {
         assert_eq!(fj.fat_start, vec![0, 2]);
         assert_eq!((fj.fat_cf, fj.fat_cc), (vec![0], vec![4]));
         assert_eq!(fj.iters, 16);
+    }
+
+    /// GPU-vs-CPU fidelity: same coarse algorithm (p=4/eps=1e-2/n_leaf=64),
+    /// f32 vs f64 arithmetic. Needs a GPU adapter:
+    /// `cargo test -p fmms-visual -- --ignored gpu_matches_cpu`.
+    /// Guards every kernel/shader change (bindings, WG size, softening,
+    /// on-device r) against silent numerical breakage.
+    #[test]
+    #[ignore]
+    fn gpu_matches_cpu_fmm() {
+        let n = 2000;
+        let parts = fmm::models::plummer(n, [0.0; 3], 7);
+        let pos: Vec<[f64; 3]> = parts.iter().map(|p| p.pos).collect();
+        let mass: Vec<f64> = parts.iter().map(|p| p.mass).collect();
+        // CPU reference, then the same accel cap the GPU path applies.
+        let fmm = fmm::fmm::Fmm::new(&parts, P, EPS, N_LEAF);
+        let mut want = fmm.run_threaded(&parts, 4).accel;
+        crate::sim::cap_accel(&mut want);
+        // Headless device (same as probe harness).
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+            apply_limit_buckets: false,
+        }))
+        .expect("no adapter");
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("acc-test"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::default(),
+            experimental_features: Default::default(),
+            memory_hints: Default::default(),
+            trace: Default::default(),
+        }))
+        .unwrap();
+        let mut be = GpuBackend::new(&device, &queue, u64::MAX);
+        let got = be.accel_with_refresh(&pos, &mass, true);
+        assert_eq!(got.len(), n);
+        let (mut max_rel, mut sum_rel, mut cnt) = (0.0f64, 0.0f64, 0usize);
+        for i in 0..n {
+            let w = want[i];
+            let g = got[i];
+            let wn = (w[0] * w[0] + w[1] * w[1] + w[2] * w[2]).sqrt();
+            if wn < 1e-9 {
+                continue;
+            }
+            let d = ((g[0] - w[0]).powi(2) + (g[1] - w[1]).powi(2) + (g[2] - w[2]).powi(2)).sqrt();
+            let r = d / wn;
+            max_rel = max_rel.max(r);
+            sum_rel += r;
+            cnt += 1;
+        }
+        let mean = sum_rel / cnt as f64;
+        eprintln!("gpu-vs-cpu: max rel {max_rel:.3e} mean {mean:.3e} over {cnt}");
+        // Measured ~6e-6 max / ~1e-7 mean; 100x headroom catches real
+        // breakage (swapped bindings, wrong WG size) without flaking.
+        assert!(max_rel < 1e-4, "max rel err {max_rel}");
+        assert!(mean < 1e-5, "mean rel err {mean}");
     }
 }
 
@@ -807,6 +913,10 @@ pub struct PbLists {
 
 /// Expand recorded leaf pairs into per-leaf partner-body lists.
 /// `leaf_ids[w]` is the cell of leaf ordinal w.
+/// Two-pass counting sort (no per-cell allocation): first pass counts
+/// partner bodies per ordinal, second fills. Same output order as the old
+/// Vec-of-Vecs version (leaves in order, partners in record order, bodies
+/// ascending) so kernel behavior is unchanged.
 pub fn build_p2p_bodies(
     p2p: &[(u32, u32)],
     ncells: usize,
@@ -814,26 +924,43 @@ pub fn build_p2p_bodies(
     leaf_first: &[u32],
     leaf_count: &[u32],
 ) -> PbLists {
-    let mut partners: Vec<Vec<u32>> = vec![Vec::new(); ncells];
+    let mut ord_of = vec![u32::MAX; ncells];
+    for (w, &l) in leaf_ids.iter().enumerate() {
+        ord_of[l as usize] = w as u32;
+    }
+    let bodies = |q: u32| leaf_count[q as usize] as usize;
+    let mut count = vec![0u32; leaf_ids.len()];
     for &(a, b) in p2p {
-        partners[a as usize].push(b);
+        // P2P pairs are leaf-leaf by construction (walk invariant); anything
+        // else would break the per-ordinal kernel tables downstream.
+        debug_assert!(ord_of[a as usize] != u32::MAX && ord_of[b as usize] != u32::MAX);
+        count[ord_of[a as usize] as usize] += bodies(b) as u32;
         if a != b {
-            partners[b as usize].push(a);
+            count[ord_of[b as usize] as usize] += bodies(a) as u32;
         }
     }
     let mut start = vec![0u32; leaf_ids.len()];
-    let mut count = vec![0u32; leaf_ids.len()];
-    let mut list = Vec::new();
-    for (w, &l) in leaf_ids.iter().enumerate() {
-        start[w] = list.len() as u32;
-        for &q in &partners[l as usize] {
-            for k in leaf_first[q as usize] as usize
-                ..(leaf_first[q as usize] + leaf_count[q as usize]) as usize
-            {
-                list.push(k as u32);
-            }
+    let mut acc = 0usize;
+    for w in 0..leaf_ids.len() {
+        start[w] = acc as u32;
+        acc += count[w] as usize;
+    }
+    let mut list = vec![0u32; acc];
+    let mut cursor = start.clone();
+    let mut push_bodies = |ord: u32, q: u32, cursor: &mut [u32]| {
+        let first = leaf_first[q as usize] as usize;
+        let n = leaf_count[q as usize] as usize;
+        let at = cursor[ord as usize] as usize;
+        for k in 0..n {
+            list[at + k] = (first + k) as u32;
         }
-        count[w] = list.len() as u32 - start[w];
+        cursor[ord as usize] += n as u32;
+    };
+    for &(a, b) in p2p {
+        push_bodies(ord_of[a as usize], b, &mut cursor);
+        if a != b {
+            push_bodies(ord_of[b as usize], a, &mut cursor);
+        }
     }
     PbLists { start, count, list }
 }
@@ -864,7 +991,7 @@ pub fn split_fat(
     leaf_count: &[u32],
     thr: u32,
     chunk: u32,
-) -> FatJobs {
+) -> Result<FatJobs, GpuError> {
     let mut job_s0 = Vec::new();
     let mut job_cc = Vec::new();
     let mut job_off = Vec::new();
@@ -881,7 +1008,12 @@ pub fn split_fat(
         fat_start.push(job_s0.len() as u32);
         let cf = leaf_first[l as usize];
         let cc = leaf_count[l as usize];
-        assert!(cc <= 64, "fat leaf {l} holds {cc} bodies (kernel takes 64)");
+        // Kernels address 64 lanes max: graceful Err (caller falls back to
+        // CPU) instead of the old mid-run assert. Evolution can overfill
+        // leaves the init-time build never had.
+        if cc > 64 {
+            return Err(GpuError::OverfullLeaf { leaf: l, count: cc });
+        }
         fat_cf.push(cf);
         fat_cc.push(cc);
         bodies += cc as u64;
@@ -901,7 +1033,7 @@ pub fn split_fat(
     }
     fat_start.push(job_s0.len() as u32);
     let (nfat, njobs) = (fat_cf.len(), job_s0.len());
-    FatJobs {
+    Ok(FatJobs {
         job_s0,
         job_cc,
         job_off,
@@ -913,7 +1045,7 @@ pub fn split_fat(
         njobs,
         bodies,
         iters,
-    }
+    })
 }
 
 /// One workgroup per fat job: tile one partner slice, partial sums per own
@@ -934,7 +1066,8 @@ var<workgroup> tids: array<u32, TILE>;
 
 fn interact(px: vec3<f32>, qx: vec3<f32>, qm: f32) -> vec4<f32> {
     let d = qx - px;
-    let r2 = dot(d, d);
+    // Same 1e-12 softening as the main P2P kernel (see above).
+    let r2 = dot(d, d) + 1e-12;
     var inv = inverseSqrt(r2);
     inv = inv * (1.5 - 0.5 * r2 * inv * inv);
     inv = inv * (1.5 - 0.5 * r2 * inv * inv);
@@ -1107,6 +1240,46 @@ fn nthreads() -> usize {
 /// coherence: bodies move ~v·dt per step, far less than a cell); positions
 /// upload fresh every step and moments/locals recompute on GPU, so per-step
 /// CPU work is one SoA shuffle plus small uploads.
+/// A GPU FMM buffer would exceed the device's buffer/binding limits.
+/// Carries which buffer and by how much, so callers can fall back to CPU.
+#[derive(Clone, Copy, Debug)]
+pub struct OverBudget {
+    pub buffer: &'static str,
+    pub bytes: u64,
+    pub limit: u64,
+}
+
+impl std::fmt::Display for OverBudget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} needs {} MiB, device limit {} MiB",
+            self.buffer,
+            self.bytes / (1024 * 1024),
+            self.limit / (1024 * 1024)
+        )
+    }
+}
+
+/// Fallible GPU FMM failure: over-budget buffers or a broken tree invariant.
+/// Both map to the CPU FMM fallback in the app (never a mid-run panic).
+#[derive(Clone, Copy, Debug)]
+pub enum GpuError {
+    OverBudget(OverBudget),
+    OverfullLeaf { leaf: u32, count: u32 },
+}
+
+impl std::fmt::Display for GpuError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GpuError::OverBudget(e) => write!(f, "over budget: {e}"),
+            GpuError::OverfullLeaf { leaf, count } => {
+                write!(f, "leaf {leaf} holds {count} bodies (kernel takes 64)")
+            }
+        }
+    }
+}
+
 pub struct GpuBackend {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -1133,6 +1306,32 @@ pub struct GpuBackend {
     parts: Vec<fmm::models::Particle>,
     step: u64,
     k: u64,
+    /// Per-pass bind groups + frozen uniforms, rebuilt on every refresh.
+    /// Tables (and hence counts/offsets) only change on refresh, so the
+    /// ~30 buffer+bindgroup creations per step collapse to zero on
+    /// non-refresh steps. Invalidated implicitly: rebuilt wherever tables are.
+    binds: Option<PassBinds>,
+}
+
+/// One cached dispatch: pipeline selector + thread count. The bind group
+/// lives in `PassBinds.bg` at the same index.
+#[derive(Clone, Copy)]
+enum PassKind {
+    P2m,
+    M2m,
+    S1,
+    Red,
+    L2l,
+    L2p,
+    P2p,
+    Fat,
+    Fred,
+}
+
+struct PassBinds {
+    uni: Vec<wgpu::Buffer>,
+    bg: Vec<wgpu::BindGroup>,
+    cmds: Vec<(PassKind, u32)>,
 }
 
 struct GpuBufs {
@@ -1148,7 +1347,7 @@ struct GpuBufs {
     loc: wgpu::Buffer,
     acc: wgpu::Buffer,
     gsrc: wgpu::Buffer,
-    gr: wgpu::Buffer,
+    gdst: wgpu::Buffer,
     slots: wgpu::Buffer,
     gs: wgpu::Buffer,
     gc: wgpu::Buffer,
@@ -1210,6 +1409,7 @@ impl GpuBackend {
             parts: Vec::new(),
             step: 0,
             k: k.max(1),
+            binds: None,
         }
     }
 
@@ -1221,7 +1421,7 @@ impl GpuBackend {
         pbl: usize,
         fjobs: usize,
         nfat: usize,
-    ) {
+    ) -> Result<(), OverBudget> {
         let ok = match &self.bufs {
             Some(b) => {
                 ncells <= b.cap_cells
@@ -1234,7 +1434,60 @@ impl GpuBackend {
             None => false,
         };
         if ok {
-            return;
+            return Ok(());
+        }
+        // Budget pre-check: every buffer below must fit max_buffer_size, and
+        // every STORAGE-bound one (all but b-rb) must fit
+        // max_storage_buffer_binding_size. Failing here returns OverBudget
+        // instead of dying inside wgpu validation.
+        let d = DIM as u64;
+        let nc = ncells as u64;
+        let ns = nslots as u64;
+        let tt = total.max(1) as u64;
+        let pb = pbl.max(1) as u64;
+        let fj = fjobs.max(1) as u64;
+        let nf = nfat as u64;
+        // (label, bytes, bound_as_storage)
+        let sizes: [(&str, u64, bool); 24] = [
+            ("b-pos", ns * 16, true),
+            ("b-cen", nc * 16, true),
+            ("b-cf", nc * 4, true),
+            ("b-cc", nc * 4, true),
+            ("b-ch", nc * 32, true),
+            ("b-leaves", nc * 4, true),
+            ("b-levels", nc * 4, true),
+            ("b-cos", ns * 4, true),
+            ("b-mom", nc * d * 8, true),
+            ("b-loc", nc * d * 8, true),
+            ("b-acc", ns * 16, true),
+            ("b-rb", ns * 16, false),
+            ("b-gsrc", tt * 4, true),
+            ("b-gdst", tt * 4, true),
+            ("b-slots", tt * d * 8, true),
+            ("b-gs", nc * 4, true),
+            ("b-gc", nc * 4, true),
+            ("b-pbs", nc * 4, true),
+            ("b-pbc", nc * 4, true),
+            ("b-pbl", pb * 4, true),
+            ("b-fjob", fj * 4, true),
+            ("b-fscr", fj * 64 * 16, true),
+            ("b-ffstart", (nf + 1) * 4, true),
+            ("b-ffcc", nf * 4, true),
+        ];
+        let lim = self.device.limits();
+        for &(label, bytes, storage) in &sizes {
+            let cap = if storage {
+                lim.max_storage_buffer_binding_size
+            } else {
+                lim.max_buffer_size
+            };
+            if bytes.max(16) > cap {
+                return Err(OverBudget {
+                    buffer: label,
+                    bytes: bytes.max(16),
+                    limit: cap,
+                });
+            }
         }
         let d = DIM;
         let mk = |label: &str, size: u64, extra: wgpu::BufferUsages| {
@@ -1284,9 +1537,9 @@ impl GpuBackend {
                 (total.max(1) * 4) as u64,
                 wgpu::BufferUsages::COPY_DST,
             ),
-            gr: mk(
-                "b-gr",
-                (total.max(1) * 16) as u64,
+            gdst: mk(
+                "b-gdst",
+                (total.max(1) * 4) as u64,
                 wgpu::BufferUsages::COPY_DST,
             ),
             slots: mk(
@@ -1350,10 +1603,170 @@ impl GpuBackend {
             cap_fjobs: fjobs.max(1),
             cap_nfat: nfat.max(1),
         });
+        Ok(())
     }
 
     fn upload<T: bytemuck::Pod>(&self, buf: &wgpu::Buffer, data: &[T]) {
         self.queue.write_buffer(buf, 0, bytemuck::cast_slice(data));
+    }
+
+    /// (Re)build every pass's bind group + frozen uniform. Call after the
+    /// refresh uploads, before encoding: counts/offsets come from the fresh
+    /// tables, buffers from `self.bufs`. Same pass order as the old inline
+    /// encoder (ordering inside one encoder is preserved).
+    fn build_binds(
+        &self,
+        ct: &CellTables,
+        g: &M2lGroups,
+        fj: &FatJobs,
+        ncells: u32,
+        nslots: u32,
+        d: u32,
+    ) -> PassBinds {
+        use wgpu::util::DeviceExt;
+        let b = self.bufs.as_ref().expect("bufs for binds");
+        let nleaf = ct.leaf_ids.len() as u32;
+        let nlevels = ct.level_off.len() - 1;
+        let mut pb = PassBinds {
+            uni: Vec::new(),
+            bg: Vec::new(),
+            cmds: Vec::new(),
+        };
+        let add = |pb: &mut PassBinds,
+                       label: &str,
+                       layout: &wgpu::BindGroupLayout,
+                       bufs: &[&wgpu::Buffer],
+                       vals: [u32; 4],
+                       kind: PassKind,
+                       count: u32| {
+            let ub = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("g-uni"),
+                contents: bytemuck::bytes_of(&vals),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+            let mut all: Vec<&wgpu::Buffer> = bufs.to_vec();
+            all.push(&ub);
+            let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(label),
+                layout,
+                entries: &all
+                    .iter()
+                    .enumerate()
+                    .map(|(i, b)| wgpu::BindGroupEntry {
+                        binding: i as u32,
+                        resource: b.as_entire_binding(),
+                    })
+                    .collect::<Vec<_>>(),
+            });
+            pb.uni.push(ub);
+            pb.bg.push(bind);
+            pb.cmds.push((kind, count));
+        };
+        add(
+            &mut pb,
+            "p2m",
+            &self.p2m_layout,
+            &[&b.pos, &b.leaves, &b.cen, &b.cf, &b.cc, &b.mom],
+            [d, nleaf, 0, 0],
+            PassKind::P2m,
+            nleaf,
+        );
+        for l in (0..nlevels).rev() {
+            let (lo, ct_) = (
+                ct.level_off[l] as u32,
+                (ct.level_off[l + 1] - ct.level_off[l]) as u32,
+            );
+            if ct_ == 0 {
+                continue;
+            }
+            add(
+                &mut pb,
+                "m2m",
+                &self.m2m_layout,
+                &[&b.mom, &b.cen, &b.ch, &b.levels],
+                [d, ct_, lo, 0],
+                PassKind::M2m,
+                ct_,
+            );
+        }
+        add(
+            &mut pb,
+            "m2ls1",
+            &self.s1_layout,
+            &[&b.mom, &b.gsrc, &b.cen, &b.gdst, &b.slots],
+            [0, d, g.total.max(1) as u32, 0],
+            PassKind::S1,
+            g.total.max(1) as u32,
+        );
+        add(
+            &mut pb,
+            "m2lred",
+            &self.red_layout,
+            &[&b.slots, &b.gs, &b.gc, &b.loc],
+            [ncells, d, 0, 0],
+            PassKind::Red,
+            ncells * d,
+        );
+        for l in 0..nlevels {
+            let (lo, ct_) = (
+                ct.level_off[l] as u32,
+                (ct.level_off[l + 1] - ct.level_off[l]) as u32,
+            );
+            if ct_ == 0 {
+                continue;
+            }
+            add(
+                &mut pb,
+                "l2l",
+                &self.l2l_layout,
+                &[&b.loc, &b.cen, &b.ch, &b.levels],
+                [d, ct_, lo, 0],
+                PassKind::L2l,
+                ct_,
+            );
+        }
+        add(
+            &mut pb,
+            "l2p",
+            &self.l2p_layout,
+            &[&b.pos, &b.cos, &b.cen, &b.loc, &b.acc],
+            [d, nslots, 0, 0],
+            PassKind::L2p,
+            nslots,
+        );
+        add(
+            &mut pb,
+            "p2p",
+            &self.p2p_layout,
+            &[
+                &b.pos, &b.leaves, &b.cf, &b.cc, &b.pbs, &b.pbc, &b.pbl, &b.acc,
+            ],
+            [nleaf, 0, 0, 0],
+            PassKind::P2p,
+            // One WG=P2P_WG-wide workgroup per leaf ordinal.
+            nleaf * P2P_WG,
+        );
+        add(
+            &mut pb,
+            "fat",
+            &self.fat_layout,
+            &[
+                &b.pos, &b.fjob_s0, &b.fjob_cc, &b.fjob_o, &b.fjob_n, &b.pbl, &b.fscr,
+            ],
+            [fj.njobs as u32, 0, 0, 0],
+            PassKind::Fat,
+            fj.njobs as u32 * 64,
+        );
+        add(
+            &mut pb,
+            "fatred",
+            &self.fatred_layout,
+            &[&b.fscr, &b.ffstart, &b.ffcf, &b.ffcc, &b.acc],
+            [fj.nfat as u32, 0, 0, 0],
+            PassKind::Fred,
+            fj.nfat as u32 * 64,
+        );
+        pb
     }
 
     /// Isolated submit+poll for profiling (probe-only in the app binary).
@@ -1531,7 +1944,7 @@ impl GpuBackend {
                 "m2ls1",
                 &self.s1_pipe,
                 &self.s1_layout,
-                &[&b.mom, &b.gsrc, &b.gr, &b.slots],
+                &[&b.mom, &b.gsrc, &b.cen, &b.gdst, &b.slots],
                 &[0, d, total.max(1) as u32, 0],
                 total.max(1) as u32,
             ),
@@ -1590,7 +2003,7 @@ impl GpuBackend {
                     &b.pos, &b.leaves, &b.cf, &b.cc, &b.pbs, &b.pbc, &b.pbl, &b.acc,
                 ],
                 &[nleaf as u32, 0, 0, 0],
-                nleaf as u32 * 64,
+                nleaf as u32 * P2P_WG,
             ),
         ));
         let (njobs, nfat) = {
@@ -1646,12 +2059,15 @@ impl GpuBackend {
     }
 
     /// Force evaluation with explicit refresh control (harness use).
-    pub fn accel_with_refresh(
+    /// Err(GpuError) on over-budget buffers or a broken tree invariant;
+    /// callers fall back to CPU instead of hitting wgpu validation.
+    /// bufs/tables are left untouched on Err.
+    pub fn try_accel_with_refresh(
         &mut self,
         pos: &[[f64; 3]],
         mass: &[f64],
         refresh: bool,
-    ) -> Vec<[f64; 3]> {
+    ) -> Result<Vec<[f64; 3]>, GpuError> {
         let n = pos.len();
         let nt = nthreads();
         self.parts.clear();
@@ -1678,10 +2094,18 @@ impl GpuBackend {
             let g = group_m2l(&rec.pairs, ncells);
             let ct = cell_tables(&tree, n);
             let mut pl = build_p2p_bodies(&rec.p2p, ncells, &ct.leaf_ids, &ct.cfirst, &ct.ccount);
-            assert!(
-                ct.leaf_ids.iter().all(|&l| ct.ccount[l as usize] <= 64),
-                "leaf over 64 bodies"
-            );
+            // Kernels address 64 lanes max: graceful fallback, not a mid-run
+            // panic (split_fat re-checks the fat path identically).
+            if let Some(&l) = ct
+                .leaf_ids
+                .iter()
+                .find(|&&l| ct.ccount[l as usize] > 64)
+            {
+                return Err(GpuError::OverfullLeaf {
+                    leaf: l,
+                    count: ct.ccount[l as usize],
+                });
+            }
             let fj = split_fat(
                 &mut pl,
                 &ct.leaf_ids,
@@ -1689,8 +2113,9 @@ impl GpuBackend {
                 &ct.ccount,
                 FAT_THR,
                 FAT_CHUNK,
-            );
-            self.ensure(ncells, n, g.total, pl.list.len(), fj.njobs, fj.nfat);
+            )?;
+            self.ensure(ncells, n, g.total, pl.list.len(), fj.njobs, fj.nfat)
+                .map_err(GpuError::OverBudget)?;
             let b = self.bufs.as_ref().unwrap();
             self.upload(&b.cen, &ct.centers);
             self.upload(&b.cf, &ct.cfirst);
@@ -1702,19 +2127,7 @@ impl GpuBackend {
             self.upload(&b.levels, &lvl_u32);
             self.upload(&b.cos, &ct.cell_of_slot);
             self.upload(&b.gsrc, &g.gsrc);
-            let gr: Vec<[f32; 4]> = (0..g.total)
-                .map(|j| {
-                    let ca = tree.cells[g.gsrc[j] as usize].cen;
-                    let cb = tree.cells[g.gdst[j] as usize].cen;
-                    [
-                        (cb[0] - ca[0]) as f32,
-                        (cb[1] - ca[1]) as f32,
-                        (cb[2] - ca[2]) as f32,
-                        0.0,
-                    ]
-                })
-                .collect();
-            self.upload(&b.gr, &gr);
+            self.upload(&b.gdst, &g.gdst);
             self.upload(&b.gs, &g.starts);
             self.upload(&b.gc, &g.counts);
             self.upload(&b.pbs, &pl.start);
@@ -1727,13 +2140,13 @@ impl GpuBackend {
             self.upload(&b.ffstart, &fj.fat_start);
             self.upload(&b.ffcf, &fj.fat_cf);
             self.upload(&b.ffcc, &fj.fat_cc);
+            // Freeze pass binds for the next k steps (counts/offsets are
+            // refresh-stable; buffers outlive in bufs + binds).
+            let binds = self.build_binds(&ct, &g, &fj, ncells as u32, n as u32, DIM as u32);
+            self.binds = Some(binds);
             self.tables = Some((ct, g, pl, fj, tree.order.clone()));
         }
-        let (ct, g, _pl, _fj, order) = self.tables.as_ref().unwrap();
-        let d = DIM as u32;
-        let ncells = ct.centers.len();
-        let nslots = n as u32;
-        let nlevels = ct.level_off.len() - 1;
+        let (_ct, _g, _pl, _fj, order) = self.tables.as_ref().unwrap();
         let bodies = fmm::bodies::Bodies::from_parts(&self.parts, order);
         let pos: Vec<[f32; 4]> = (0..n)
             .map(|k| {
@@ -1747,182 +2160,36 @@ impl GpuBackend {
             .collect();
         let b = self.bufs.as_ref().unwrap();
         self.upload(&b.pos, &pos);
+        // Encode from cached binds: zero buffer/bindgroup allocation on
+        // non-refresh steps (all ~30 were created per step before).
+        let binds = self.binds.as_ref().expect("binds built on refresh");
         let mut enc = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("gpu-step"),
             });
-        let mut keepalive: Vec<wgpu::Buffer> = Vec::new();
-        let mut keepbind: Vec<wgpu::BindGroup> = Vec::new();
-        let pass = |enc: &mut wgpu::CommandEncoder,
-                    label: &str,
-                    pipe: &wgpu::ComputePipeline,
-                    layout: &wgpu::BindGroupLayout,
-                    bufs: &[&wgpu::Buffer],
-                    vals: &[u32; 4],
-                    count: u32,
-                    keepalive: &mut Vec<wgpu::Buffer>,
-                    keepbind: &mut Vec<wgpu::BindGroup>| {
-            use wgpu::util::DeviceExt;
-            let ub = self
-                .device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("g-uni"),
-                    contents: bytemuck::bytes_of(vals),
-                    usage: wgpu::BufferUsages::UNIFORM,
-                });
-            let mut all: Vec<&wgpu::Buffer> = bufs.to_vec();
-            all.push(&ub);
-            let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some(label),
-                layout,
-                entries: &all
-                    .iter()
-                    .enumerate()
-                    .map(|(i, b)| wgpu::BindGroupEntry {
-                        binding: i as u32,
-                        resource: b.as_entire_binding(),
-                    })
-                    .collect::<Vec<_>>(),
+        for (ci, &(kind, count)) in binds.cmds.iter().enumerate() {
+            // Layouts were validated at bind-group creation; encode needs
+            // only the pipeline + cached group.
+            let pipe: &wgpu::ComputePipeline = match kind {
+                PassKind::P2m => &self.p2m_pipe,
+                PassKind::M2m => &self.m2m_pipe,
+                PassKind::S1 => &self.s1_pipe,
+                PassKind::Red => &self.red_pipe,
+                PassKind::L2l => &self.l2l_pipe,
+                PassKind::L2p => &self.l2p_pipe,
+                PassKind::P2p => &self.p2p_pipe,
+                PassKind::Fat => &self.fat_pipe,
+                PassKind::Fred => &self.fatred_pipe,
+            };
+            let mut p = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: None,
+                timestamp_writes: None,
             });
-            {
-                let mut p = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some(label),
-                    timestamp_writes: None,
-                });
-                p.set_pipeline(pipe);
-                p.set_bind_group(0, &bg, &[]);
-                p.dispatch_workgroups(count.div_ceil(64), 1, 1);
-            }
-            keepalive.push(ub);
-            keepbind.push(bg);
-        };
-        let b = self.bufs.as_ref().unwrap();
-        pass(
-            &mut enc,
-            "p2m",
-            &self.p2m_pipe,
-            &self.p2m_layout,
-            &[&b.pos, &b.leaves, &b.cen, &b.cf, &b.cc, &b.mom],
-            &[d, ct.leaf_ids.len() as u32, 0, 0],
-            ct.leaf_ids.len() as u32,
-            &mut keepalive,
-            &mut keepbind,
-        );
-        for l in (0..nlevels).rev() {
-            let (lo, ct_) = (
-                ct.level_off[l] as u32,
-                (ct.level_off[l + 1] - ct.level_off[l]) as u32,
-            );
-            if ct_ == 0 {
-                continue;
-            }
-            pass(
-                &mut enc,
-                "m2m",
-                &self.m2m_pipe,
-                &self.m2m_layout,
-                &[&b.mom, &b.cen, &b.ch, &b.levels],
-                &[d, ct_, lo, 0],
-                ct_,
-                &mut keepalive,
-                &mut keepbind,
-            );
+            p.set_pipeline(pipe);
+            p.set_bind_group(0, &binds.bg[ci], &[]);
+            p.dispatch_workgroups(count.div_ceil(64), 1, 1);
         }
-        pass(
-            &mut enc,
-            "m2ls1",
-            &self.s1_pipe,
-            &self.s1_layout,
-            &[&b.mom, &b.gsrc, &b.gr, &b.slots],
-            &[0, d, g.total.max(1) as u32, 0],
-            g.total.max(1) as u32,
-            &mut keepalive,
-            &mut keepbind,
-        );
-        pass(
-            &mut enc,
-            "m2lred",
-            &self.red_pipe,
-            &self.red_layout,
-            &[&b.slots, &b.gs, &b.gc, &b.loc],
-            &[ncells as u32, d, 0, 0],
-            ncells as u32 * d,
-            &mut keepalive,
-            &mut keepbind,
-        );
-        for l in 0..nlevels {
-            let (lo, ct_) = (
-                ct.level_off[l] as u32,
-                (ct.level_off[l + 1] - ct.level_off[l]) as u32,
-            );
-            if ct_ == 0 {
-                continue;
-            }
-            pass(
-                &mut enc,
-                "l2l",
-                &self.l2l_pipe,
-                &self.l2l_layout,
-                &[&b.loc, &b.cen, &b.ch, &b.levels],
-                &[d, ct_, lo, 0],
-                ct_,
-                &mut keepalive,
-                &mut keepbind,
-            );
-        }
-        pass(
-            &mut enc,
-            "l2p",
-            &self.l2p_pipe,
-            &self.l2p_layout,
-            &[&b.pos, &b.cos, &b.cen, &b.loc, &b.acc],
-            &[d, nslots, 0, 0],
-            nslots,
-            &mut keepalive,
-            &mut keepbind,
-        );
-        pass(
-            &mut enc,
-            "p2p",
-            &self.p2p_pipe,
-            &self.p2p_layout,
-            &[
-                &b.pos, &b.leaves, &b.cf, &b.cc, &b.pbs, &b.pbc, &b.pbl, &b.acc,
-            ],
-            &[ct.leaf_ids.len() as u32, 0, 0, 0],
-            ct.leaf_ids.len() as u32 * 64, // workgroups*64; WG size is P2P_WG
-            &mut keepalive,
-            &mut keepbind,
-        );
-        let (njobs, nfat) = {
-            let (_, _, _, fj, _) = self.tables.as_ref().unwrap();
-            (fj.njobs as u32, fj.nfat as u32)
-        };
-        pass(
-            &mut enc,
-            "fat",
-            &self.fat_pipe,
-            &self.fat_layout,
-            &[
-                &b.pos, &b.fjob_s0, &b.fjob_cc, &b.fjob_o, &b.fjob_n, &b.pbl, &b.fscr,
-            ],
-            &[njobs, 0, 0, 0],
-            njobs * 64,
-            &mut keepalive,
-            &mut keepbind,
-        );
-        pass(
-            &mut enc,
-            "fatred",
-            &self.fatred_pipe,
-            &self.fatred_layout,
-            &[&b.fscr, &b.ffstart, &b.ffcf, &b.ffcc, &b.acc],
-            &[nfat, 0, 0, 0],
-            nfat * 64,
-            &mut keepalive,
-            &mut keepbind,
-        );
         enc.copy_buffer_to_buffer(&b.acc, 0, &b.rb, 0, (n * 16) as u64);
         self.queue.submit([enc.finish()]);
         let (tx, rx) = std::sync::mpsc::channel();
@@ -1948,15 +2215,41 @@ impl GpuBackend {
             out[id as usize] = [got[k][0] as f64, got[k][1] as f64, got[k][2] as f64];
         }
         crate::sim::cap_accel(&mut out);
-        out
+        Ok(out)
+    }
+
+    /// Compatibility wrapper: panics with the budget message instead of a
+    /// wgpu validation error. Probe harnesses use this; the app uses
+    /// `try_accel` and falls back to CPU.
+    #[allow(dead_code)]
+    pub fn accel_with_refresh(
+        &mut self,
+        pos: &[[f64; 3]],
+        mass: &[f64],
+        refresh: bool,
+    ) -> Vec<[f64; 3]> {
+        self.try_accel_with_refresh(pos, mass, refresh)
+            .unwrap_or_else(|e| panic!("GPU FMM over budget, use CPU FMM: {e}"))
     }
 }
 
 impl GpuBackend {
     /// Physics-trait entry point: refresh every k-th step.
+    #[allow(dead_code)]
     pub fn accel(&mut self, pos: &[[f64; 3]], mass: &[f64]) -> Vec<[f64; 3]> {
         let refresh = self.step % self.k == 0;
         self.accel_with_refresh(pos, mass, refresh)
+    }
+
+    /// Fallible refresh-every-k-th-step entry point for the app: on
+    /// Err(GpuError) the caller swaps in the CPU FMM backend.
+    pub fn try_accel(
+        &mut self,
+        pos: &[[f64; 3]],
+        mass: &[f64],
+    ) -> Result<Vec<[f64; 3]>, GpuError> {
+        let refresh = self.step % self.k == 0;
+        self.try_accel_with_refresh(pos, mass, refresh)
     }
 
     /// Frozen-tree slot→particle-id order (None before first refresh).

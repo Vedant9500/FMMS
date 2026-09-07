@@ -153,17 +153,19 @@ struct Item { pos: vec3<f32>, speed: f32, misc: vec4<f32> };
 struct Out {
     @builtin(position) clip: vec4<f32>,
     @location(0) uv: vec2<f32>,
-    @location(1) tm: vec3<f32>,
+    @location(1) tm: vec4<f32>,
     @location(2) wpos: vec3<f32>,
     @location(3) lpos: vec3<f32>,
 };
 
 // G2: 13 intersecting quads per instance (52 verts). World-anchored noise
 // makes each plane slice different density -> cheap volumetric read.
+// misc.w carries the supernova/tidal flash: swell + white-blue + 4x glow.
 @vertex
 fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> Out {
     let p = curr[ii].pos;
     let tm = curr[ii].misc.xyz;
+    let fl = curr[ii].misc.w;
     let qid = vi / 4u;
     let ci = vi % 4u;
     let n = NORMS[qid % 13u];
@@ -174,11 +176,11 @@ fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> Out {
         vec2<f32>(-0.5, -0.5), vec2<f32>(0.5, -0.5),
         vec2<f32>(-0.5, 0.5), vec2<f32>(0.5, 0.5));
     let c = corners[ci];
-    let off = (t * c.x + b * c.y) * tm.y;
+    let off = (t * c.x + b * c.y) * tm.y * (1.0 + fl * 0.3);
     var o: Out;
     o.clip = u.view_proj * vec4<f32>(p + off, 1.0);
     o.uv = c + vec2<f32>(0.5, 0.5);
-    o.tm = tm;
+    o.tm = vec4<f32>(tm, fl);
     o.wpos = p;
     o.lpos = off;
     return o;
@@ -200,8 +202,11 @@ fn fs(in: Out) -> @location(0) vec4<f32> {
     } else if (in.tm.z > 1.5) {
         col = vec3<f32>(0.45, 0.60, 1.0);
     }
+    let fl = clamp(in.tm.w, 0.0, 1.0);
+    col = mix(col, vec3<f32>(0.75, 0.85, 1.0), fl * 0.7);
     // EM_NORM: ~13 planes pierce a central sightline; normalize to one.
-    return vec4<f32>(col * body * 0.15 * 0.85 * u.params.z, 1.0);
+    // Flash glow capped at 2.5x so overlapping giants can't white-clip.
+    return vec4<f32>(col * body * 0.15 * 0.85 * u.params.z * (1.0 + fl * 1.5), 1.0);
 }
 "#;
 
@@ -220,7 +225,7 @@ struct Item { pos: vec3<f32>, speed: f32, misc: vec4<f32> };
 struct Out {
     @builtin(position) clip: vec4<f32>,
     @location(0) uv: vec2<f32>,
-    @location(1) tm: vec3<f32>,
+    @location(1) tm: vec4<f32>,
     @location(2) wpos: vec3<f32>,
     @location(3) lpos: vec3<f32>,
 };
@@ -229,6 +234,7 @@ struct Out {
 fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> Out {
     let p = curr[ii].pos;
     let tm = curr[ii].misc.xyz;
+    let fl = curr[ii].misc.w;
     let qid = vi / 4u;
     let ci = vi % 4u;
     let n = NORMS[qid % 13u];
@@ -243,7 +249,7 @@ fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> Out {
     var o: Out;
     o.clip = u.view_proj * vec4<f32>(p + off, 1.0);
     o.uv = c + vec2<f32>(0.5, 0.5);
-    o.tm = tm;
+    o.tm = vec4<f32>(tm, fl);
     o.wpos = p;
     o.lpos = off;
     return o;

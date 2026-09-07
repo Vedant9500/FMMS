@@ -315,8 +315,11 @@ struct App {
 const BUFFER_WALL_S: f64 = 0.30;
 /// Snap history cap: must hold the target buffer plus catch-up margin.
 const HIST_CAP: usize = 24;
-/// Physics channel bound: backpressure when steps outrun drains.
-const CHAN_CAP: usize = 16;
+/// Physics channel bound: backpressure when steps outrun drains. Was 16:
+/// at 1M a queued snap is ~48MB (pos+vel), so 16 deep = ~768MB of stale
+/// snaps. 4 keeps the playout buffer fed (HIST_CAP=24 drains faster than
+/// physics produces) while capping staleness at ~192MB worst case.
+const CHAN_CAP: usize = 4;
 
 impl App {
     fn new(args: Args) -> Self {
@@ -381,15 +384,45 @@ impl App {
             apply_limit_buckets: false,
         }))
         .expect("no GPU adapter");
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("fmms"),
-            required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::default(),
-            experimental_features: Default::default(),
-            memory_hints: Default::default(),
-            trace: Default::default(),
-        }))
-        .unwrap();
+        let (device, queue) = {
+            // The GPU FMM stages M2L pairs in one scratch buffer
+            // (b-slots = pairs x 25 x 8B: ~280MB at 300k bodies), past the
+            // 256MiB default max_buffer_size. Ask the adapter for up to 2GiB
+            // (clamped to what it reports); retry with defaults on refusal.
+            let alim = adapter.limits();
+            let want_buf = alim.max_buffer_size.min(2 * 1024 * 1024 * 1024);
+            let want_bind = alim
+                .max_storage_buffer_binding_size
+                .min(2 * 1024 * 1024 * 1024)
+                .min(want_buf);
+            let mut limits = wgpu::Limits::default();
+            limits.max_buffer_size = want_buf.max(limits.max_buffer_size);
+            limits.max_storage_buffer_binding_size =
+                want_bind.max(limits.max_storage_buffer_binding_size);
+            let desc = wgpu::DeviceDescriptor {
+                label: Some("fmms"),
+                required_features: wgpu::Features::empty(),
+                required_limits: limits,
+                experimental_features: Default::default(),
+                memory_hints: Default::default(),
+                trace: Default::default(),
+            };
+            match pollster::block_on(adapter.request_device(&desc)) {
+                Ok(d) => d,
+                Err(_) => {
+                    eprintln!("high GPU buffer limits refused; retrying with defaults");
+                    pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+                        label: Some("fmms"),
+                        required_features: wgpu::Features::empty(),
+                        required_limits: wgpu::Limits::default(),
+                        experimental_features: Default::default(),
+                        memory_hints: Default::default(),
+                        trace: Default::default(),
+                    }))
+                    .unwrap()
+                }
+            }
+        };
         let caps = surface.get_capabilities(&adapter);
         let format = caps
             .formats
@@ -703,7 +736,7 @@ impl App {
             while let Ok(msg) = rx.try_recv() {
                 match msg {
                     Msg::Static(s) => {
-                        self.census = ic::census(&s.teff, &s.lum);
+                        self.census = s.census;
                         self.temp = s.temp;
                         self.mag = s.mag;
                         self.gas_om = s.gas_om;
@@ -723,6 +756,7 @@ impl App {
                             vel: s.vel,
                             gas: s.gas,
                             gas_size: s.gas_size,
+                            gas_flash: s.gas_flash,
                             time: s.time,
                             steps: s.steps,
                             arrival,
@@ -851,7 +885,8 @@ impl App {
         self.stage_gas_em.clear();
         self.stage_gas_dust.clear();
         // M1: gas rides live snaps (interpolated like stars), not the old
-        // rigid pattern carousel. Meta (size/kind/seed) stays static.
+        // rigid pattern carousel. Meta (kind/seed) stays static; size and
+        // flash ride the snaps (gradual merge swell + supernova fade).
         let (g0, g1) = match (self.hist.get(lo), self.hist.get(lo + 1)) {
             (Some(a), Some(b)) => (&a.gas[..], &b.gas[..]),
             (Some(a), None) => (&a.gas[..], &a.gas[..]),
@@ -862,10 +897,16 @@ impl App {
             (Some(a), None) => (&a.gas_size[..], &a.gas_size[..]),
             _ => (&[][..], &[][..]),
         };
-        let gn = self
-            .gas
-            .len()
-            .min(g0.len().min(g1.len()).min(s0.len().min(s1.len())));
+        let (f0, f1) = match (self.hist.get(lo), self.hist.get(lo + 1)) {
+            (Some(a), Some(b)) => (&a.gas_flash[..], &b.gas_flash[..]),
+            (Some(a), None) => (&a.gas_flash[..], &a.gas_flash[..]),
+            _ => (&[][..], &[][..]),
+        };
+        let gn = self.gas.len().min(
+            g0.len()
+                .min(g1.len())
+                .min(s0.len().min(s1.len()).min(f0.len().min(f1.len()))),
+        );
         for i in 0..gn {
             let g = &self.gas[i];
             // Live size rides the snaps: merged-away knots read 0 here
@@ -874,6 +915,7 @@ impl App {
             if size <= 0.0 {
                 continue;
             }
+            let flash = (f0[i] + (f1[i] - f0[i]) * alpha as f32).clamp(0.0, 1.0);
             let (a, b) = (g0[i], g1[i]);
             let w = [
                 a[0] + (b[0] - a[0]) * alpha,
@@ -883,7 +925,7 @@ impl App {
             let item = GpuItem {
                 pos: rebase(&w, &eye),
                 speed: 0.0,
-                misc: [g.seed, size, g.kind, 0.0],
+                misc: [g.seed, size, g.kind, flash],
             };
             if g.kind < 2.5 {
                 if self.stage_gas_em.len() < 1024 {
