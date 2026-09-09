@@ -87,3 +87,16 @@
   regular for SIMT anyway).
 - Bit-compat contract explicitly does NOT extend to GPU (fp32).
 - Long-term home may become `crates/fmm-gpu`; stays in `visual` until S3.
+- [x] **S5 — smooth playout (render side only).** Exact-window rate +
+  adaptive gap-covering target + weak-spring cursor (playout 0.97–1.02x @100k
+  pattern in simulation), drop-newest snapshot send, dead prev-buffer upload
+  cut (halved frame bytes, pixel-identical). Sync refresh hitches remain
+  (140 ms @100k) but ride inside the buffer invisibly.
+- [ ] **Pipelined refresh — REVERTED, do not retry without the secular gate.**
+  Moving the rebuild to a background thread looked like a free 2.3x
+  (100k 29→13 ms avg, max 140→18 ms) but stretched tree age to k+build
+  steps and disks evaporated secularly past age ~8 (sync k=8 bounded 200
+  steps at max|v|~3.2; sync k=16 pinned at the 5.0 clamp). Instantaneous
+  force error is flat to k=16 and does NOT predict heating. Rule: installed
+  age never exceeds k. Gate: `spiral_30k_200steps_stays_bound` (ignored,
+  release). First lever on failure: k 8→4.

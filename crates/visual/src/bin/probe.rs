@@ -149,18 +149,11 @@ fn m2l_bench(device: &wgpu::Device, queue: &wgpu::Queue, npairs: usize) {
     // GPU buffers.
     let m32: Vec<[f32; 2]> = moments.iter().map(|c| [c.re as f32, c.im as f32]).collect();
     let srcs: Vec<u32> = pairs.iter().map(|&(a, _)| a as u32).collect();
-    let rs: Vec<[f32; 4]> = pairs
+    let dsts: Vec<u32> = pairs.iter().map(|&(_, b)| b as u32).collect();
+    let centers: Vec<[f32; 4]> = tree
+        .cells
         .iter()
-        .map(|&(a, b)| {
-            let ca = tree.cells[a].cen;
-            let cb = tree.cells[b].cen;
-            [
-                (cb[0] - ca[0]) as f32,
-                (cb[1] - ca[1]) as f32,
-                (cb[2] - ca[2]) as f32,
-                0.0,
-            ]
-        })
+        .map(|c| [c.cen[0] as f32, c.cen[1] as f32, c.cen[2] as f32, 0.0])
         .collect();
     let mkbuf = |label: &str, size: u64, usage: wgpu::BufferUsages| {
         device.create_buffer(&wgpu::BufferDescriptor {
@@ -181,9 +174,14 @@ fn m2l_bench(device: &wgpu::Device, queue: &wgpu::Queue, npairs: usize) {
         contents: bytemuck::cast_slice(&srcs),
         usage: wgpu::BufferUsages::STORAGE,
     });
-    let r_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("m2l-r"),
-        contents: bytemuck::cast_slice(&rs),
+    let cen_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("m2l-cen"),
+        contents: bytemuck::cast_slice(&centers),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let dst_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("m2l-dst"),
+        contents: bytemuck::cast_slice(&dsts),
         usage: wgpu::BufferUsages::STORAGE,
     });
     let out_buf = mkbuf(
@@ -193,7 +191,7 @@ fn m2l_bench(device: &wgpu::Device, queue: &wgpu::Queue, npairs: usize) {
     );
     let uni_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("m2l-uni"),
-        contents: bytemuck::bytes_of(&[ncells as u32, d as u32, npairs as u32, 0u32]),
+        contents: bytemuck::bytes_of(&[0u32, d as u32, npairs as u32, 0u32]),
         usage: wgpu::BufferUsages::UNIFORM,
     });
     let layout = gpufmm::m2l_layout(device);
@@ -212,14 +210,18 @@ fn m2l_bench(device: &wgpu::Device, queue: &wgpu::Queue, npairs: usize) {
             },
             wgpu::BindGroupEntry {
                 binding: 2,
-                resource: r_buf.as_entire_binding(),
+                resource: cen_buf.as_entire_binding(),
             },
             wgpu::BindGroupEntry {
                 binding: 3,
-                resource: out_buf.as_entire_binding(),
+                resource: dst_buf.as_entire_binding(),
             },
             wgpu::BindGroupEntry {
                 binding: 4,
+                resource: out_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
                 resource: uni_buf.as_entire_binding(),
             },
         ],
@@ -384,17 +386,10 @@ fn m2lacc_bench(device: &wgpu::Device, queue: &wgpu::Queue) {
     // segmented reduce into per-cell locals.
     use wgpu::util::DeviceExt;
     let m32: Vec<[f32; 2]> = moments.iter().map(|c| [c.re as f32, c.im as f32]).collect();
-    let rslots: Vec<[f32; 4]> = (0..total)
-        .map(|j| {
-            let ca = tree.cells[gsrc[j] as usize].cen;
-            let cb = tree.cells[gdst[j] as usize].cen;
-            [
-                (cb[0] - ca[0]) as f32,
-                (cb[1] - ca[1]) as f32,
-                (cb[2] - ca[2]) as f32,
-                0.0,
-            ]
-        })
+    let centers_acc: Vec<[f32; 4]> = tree
+        .cells
+        .iter()
+        .map(|c| [c.cen[0] as f32, c.cen[1] as f32, c.cen[2] as f32, 0.0])
         .collect();
     let init = |label: &str, contents: &[u8]| {
         device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -405,7 +400,8 @@ fn m2lacc_bench(device: &wgpu::Device, queue: &wgpu::Queue) {
     };
     let mom_buf = init("acc-mom", bytemuck::cast_slice(&m32));
     let src_buf = init("acc-gsrc", bytemuck::cast_slice(&gsrc));
-    let r_buf = init("acc-r", bytemuck::cast_slice(&rslots));
+    let cen_acc_buf = init("acc-cen", bytemuck::cast_slice(&centers_acc));
+    let dst_acc_buf = init("acc-gdst", bytemuck::cast_slice(&gdst));
     let slots_buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("acc-slots"),
         size: (total * d * 8) as u64,
@@ -433,14 +429,18 @@ fn m2lacc_bench(device: &wgpu::Device, queue: &wgpu::Queue) {
             },
             wgpu::BindGroupEntry {
                 binding: 2,
-                resource: r_buf.as_entire_binding(),
+                resource: cen_acc_buf.as_entire_binding(),
             },
             wgpu::BindGroupEntry {
                 binding: 3,
-                resource: slots_buf.as_entire_binding(),
+                resource: dst_acc_buf.as_entire_binding(),
             },
             wgpu::BindGroupEntry {
                 binding: 4,
+                resource: slots_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
                 resource: s1_uni.as_entire_binding(),
             },
         ],
@@ -455,7 +455,7 @@ fn m2lacc_bench(device: &wgpu::Device, queue: &wgpu::Queue) {
     });
     let red_uni = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("acc-reduni"),
-        contents: bytemuck::bytes_of(&[ncells as u32, d as u32, 0u32, 0u32]),
+        contents: bytemuck::bytes_of(&[ncells as u32, d as u32, 0u32, total as u32]),
         usage: wgpu::BufferUsages::UNIFORM,
     });
     let red_layout = gpufmm::m2l_red_layout(device);
@@ -487,7 +487,7 @@ fn m2lacc_bench(device: &wgpu::Device, queue: &wgpu::Queue) {
         ],
     });
     let up_mb =
-        (m32.len() * 8 + rslots.len() * 16 + gsrc.len() * 4 + starts.len() * 8) as f64 / 1e6;
+        (m32.len() * 8 + centers_acc.len() * 16 + gsrc.len() * 4 + gdst.len() * 4 + starts.len() * 8) as f64 / 1e6;
     let mut enc =
         device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("acc") });
     {
@@ -569,35 +569,22 @@ fn gpufull_bench(
     let ncells = tree.cells.len();
     let nslots = bodies.x.len();
 
-    // CPU cell tables.
-    let centers: Vec<[f32; 4]> = tree
-        .cells
-        .iter()
-        .map(|c| [c.cen[0] as f32, c.cen[1] as f32, c.cen[2] as f32, 0.0])
-        .collect();
-    let cfirst: Vec<u32> = tree.cells.iter().map(|c| c.first as u32).collect();
-    let ccount: Vec<u32> = tree.cells.iter().map(|c| c.count as u32).collect();
-    let mut children = vec![u32::MAX; ncells * 8];
-    let mut leaf_ids = Vec::new();
-    for (c, cell) in tree.cells.iter().enumerate() {
-        for k in 0..8 {
-            if cell.children[k] >= 0 {
-                children[c * 8 + k] = cell.children[k] as u32;
-            }
-        }
-        if tree.is_leaf(c) {
-            leaf_ids.push(c as u32);
-        }
-    }
-    let (level_off, level_idx) = tree.levels_csr();
+    // CPU cell tables (shared builder: includes edge + internal-parent tables).
+    let ct = gpufmm::cell_tables(&tree, nslots);
+    let (centers, cfirst, ccount, children, leaf_ids) =
+        (ct.centers.clone(), ct.cfirst.clone(), ct.ccount.clone(), ct.children.clone(), ct.leaf_ids.clone());
+    let (level_off, level_cells, cell_of_slot) =
+        (ct.level_off.clone(), ct.level_cells.clone(), ct.cell_of_slot.clone());
+    let (edge_par, edge_chd, edge_off, int_par, int_off, edge_map) = (
+        ct.edge_par.clone(),
+        ct.edge_chd.clone(),
+        ct.edge_off.clone(),
+        ct.int_par.clone(),
+        ct.int_off.clone(),
+        ct.edge_map.clone(),
+    );
     let nlevels = level_off.len() - 1;
-    let mut cell_of_slot = vec![0u32; nslots];
-    for &l in &leaf_ids {
-        let c = l as usize;
-        for k in tree.cells[c].first..tree.cells[c].first + tree.cells[c].count {
-            cell_of_slot[k] = l;
-        }
-    }
+    let level_idx: Vec<usize> = level_cells.iter().map(|&c| c as usize).collect();
     let pos: Vec<[f32; 4]> = (0..nslots)
         .map(|k| {
             [
@@ -686,11 +673,21 @@ fn gpufull_bench(
     let cc_buf = sbuf("g-ccount", bytemuck::cast_slice(&ccount));
     let ch_buf = sbuf("g-children", bytemuck::cast_slice(&children));
     let leaf_buf = sbuf("g-leaves", bytemuck::cast_slice(&leaf_ids));
-    let lvl_buf = sbuf(
+    let _lvl_buf = sbuf(
         "g-levels",
         bytemuck::cast_slice(&level_idx.iter().map(|&c| c as u32).collect::<Vec<_>>()),
     );
     let cos_buf = sbuf("g-cos", bytemuck::cast_slice(&cell_of_slot));
+    let epar_buf = sbuf("g-epar", bytemuck::cast_slice(&edge_par));
+    let echd_buf = sbuf("g-echd", bytemuck::cast_slice(&edge_chd));
+    let emap_buf = sbuf("g-emap", bytemuck::cast_slice(&edge_map));
+    let ipar_buf = sbuf("g-ipar", bytemuck::cast_slice(&int_par));
+    let mpart_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("g-mpart"),
+        size: (edge_par.len().max(1) * d * 8) as u64,
+        usage: wgpu::BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
     let mom_buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("g-mom"),
         size: (ncells * d * 8) as u64,
@@ -709,20 +706,8 @@ fn gpufull_bench(
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         mapped_at_creation: false,
     });
-    let rslots: Vec<[f32; 4]> = (0..total)
-        .map(|j| {
-            let ca = tree.cells[gsrc[j] as usize].cen;
-            let cb = tree.cells[gdst[j] as usize].cen;
-            [
-                (cb[0] - ca[0]) as f32,
-                (cb[1] - ca[1]) as f32,
-                (cb[2] - ca[2]) as f32,
-                0.0,
-            ]
-        })
-        .collect();
     let gsrc_buf = sbuf("g-gsrc", bytemuck::cast_slice(&gsrc));
-    let gr_buf = sbuf("g-gr", bytemuck::cast_slice(&rslots));
+    let gdst_full_buf = sbuf("g-gdst", bytemuck::cast_slice(&gdst));
     let slots_buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("g-slots"),
         size: (total.max(1) * d * 8) as u64,
@@ -764,10 +749,14 @@ fn gpufull_bench(
 
     let p2m_l = gpufmm::sweep_layout(device, "p2m", 6, 5);
     let p2m_p = gpufmm::sweep_pipeline(device, "p2m", &gpufmm::p2m_source(p as u32), &p2m_l);
-    let m2m_l = gpufmm::sweep_layout(device, "m2m", 4, 0);
-    let m2m_p = gpufmm::sweep_pipeline(device, "m2m", &gpufmm::m2m_source(p as u32), &m2m_l);
-    let l2l_l = gpufmm::sweep_layout(device, "l2l", 4, 0);
-    let l2l_p = gpufmm::sweep_pipeline(device, "l2l", &gpufmm::l2l_source(p as u32), &l2l_l);
+    let m2mp_l = gpufmm::sweep_layout(device, "m2mp", 5, 4);
+    let m2mp_p =
+        gpufmm::sweep_pipeline(device, "m2mp", &gpufmm::m2m_part_source(p as u32), &m2mp_l);
+    let m2mr_l = gpufmm::sweep_layout(device, "m2mr", 5, 3);
+    let m2mr_p = gpufmm::sweep_pipeline(device, "m2mr", &gpufmm::m2m_red_source(), &m2mr_l);
+    let l2le_l = gpufmm::sweep_layout(device, "l2le", 4, 0);
+    let l2le_p =
+        gpufmm::sweep_pipeline(device, "l2le", &gpufmm::l2l_edge_source(p as u32), &l2le_l);
     let l2p_l = gpufmm::sweep_layout(device, "l2p", 5, 4);
     let l2p_p = gpufmm::sweep_pipeline(device, "l2p", &gpufmm::l2p_source(p as u32), &l2p_l);
     let p2p_l = gpufmm::sweep_layout(device, "p2p", 8, 7);
@@ -834,20 +823,33 @@ fn gpufull_bench(
         &mut keepbind,
     );
     for l in (0..nlevels).rev() {
-        let lo = level_off[l];
-        let ct = level_off[l + 1] - lo;
-        let (lo, ct) = (lo as u32, ct as u32);
-        if ct == 0 {
+        let (eoff, ne) = (edge_off[l] as u32, (edge_off[l + 1] - edge_off[l]) as u32);
+        if ne == 0 {
             continue;
         }
         pass(
             &mut enc,
-            "m2m",
-            &m2m_p,
-            &m2m_l,
-            &[&mom_buf, &cen_buf, &ch_buf, &lvl_buf],
-            &[d as u32, ct, lo, 0],
-            ct,
+            "m2mp",
+            &m2mp_p,
+            &m2mp_l,
+            &[&mom_buf, &cen_buf, &epar_buf, &echd_buf, &mpart_buf],
+            &[d as u32, ne, eoff, 0],
+            ne,
+            &mut keepalive,
+            &mut keepbind,
+        );
+        let (ioff, ni) = (int_off[l] as u32, (int_off[l + 1] - int_off[l]) as u32);
+        if ni == 0 {
+            continue;
+        }
+        pass(
+            &mut enc,
+            "m2mr",
+            &m2mr_p,
+            &m2mr_l,
+            &[&mpart_buf, &ch_buf, &emap_buf, &mom_buf, &ipar_buf],
+            &[d as u32, ni, ioff, 0],
+            ni,
             &mut keepalive,
             &mut keepbind,
         );
@@ -857,7 +859,7 @@ fn gpufull_bench(
         "m2ls1",
         &s1_p,
         &s1_l,
-        &[&mom_buf, &gsrc_buf, &gr_buf, &slots_buf],
+        &[&mom_buf, &gsrc_buf, &cen_buf, &gdst_full_buf, &slots_buf],
         &[0u32, d as u32, total as u32, 0u32],
         total.max(1) as u32,
         &mut keepalive,
@@ -869,26 +871,24 @@ fn gpufull_bench(
         &red_p,
         &red_l,
         &[&slots_buf, &gs_buf, &gc_buf, &loc_buf],
-        &[ncells as u32, d as u32, 0u32, 0u32],
+        &[ncells as u32, d as u32, 0u32, total as u32],
         (ncells * d) as u32,
         &mut keepalive,
         &mut keepbind,
     );
     for l in 0..nlevels {
-        let lo = level_off[l];
-        let ct = level_off[l + 1] - lo;
-        let (lo, ct) = (lo as u32, ct as u32);
-        if ct == 0 {
+        let (eoff, ne) = (edge_off[l] as u32, (edge_off[l + 1] - edge_off[l]) as u32);
+        if ne == 0 {
             continue;
         }
         pass(
             &mut enc,
-            "l2l",
-            &l2l_p,
-            &l2l_l,
-            &[&loc_buf, &cen_buf, &ch_buf, &lvl_buf],
-            &[d as u32, ct, lo, 0],
-            ct,
+            "l2le",
+            &l2le_p,
+            &l2le_l,
+            &[&loc_buf, &cen_buf, &epar_buf, &echd_buf],
+            &[d as u32, ne, eoff, 0],
+            ne,
             &mut keepalive,
             &mut keepbind,
         );
@@ -1046,10 +1046,11 @@ fn rel_err_fmm_direct(fa: &[[f64; 3]], da: &[[f64; 3]], n: usize) -> (f64, f64) 
 }
 
 fn gpuloop_bench(device: &wgpu::Device, queue: &wgpu::Queue, n: usize, steps: usize) {
+    let k: u64 = std::env::var("PROBE_K").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
     let parts = fmm::models::plummer(n, [0.0; 3], 42);
     let pos: Vec<[f64; 3]> = parts.iter().map(|p| p.pos).collect();
     let mass: Vec<f64> = parts.iter().map(|p| p.mass).collect();
-    let mut be = gpufmm::GpuBackend::new(device, queue, 4);
+    let mut be = gpufmm::GpuBackend::new(device, queue, k);
     be.accel(&pos, &mass);
     let t = std::time::Instant::now();
     let mut per = Vec::with_capacity(steps);
@@ -1060,7 +1061,7 @@ fn gpuloop_bench(device: &wgpu::Device, queue: &wgpu::Queue, n: usize, steps: us
     }
     let ms = t.elapsed().as_secs_f64() * 1000.0 / steps as f64;
     println!(
-        "gpuloop n={n} steps={steps} k=4: {ms:.1} ms/step = {:.1} steps/s",
+        "gpuloop n={n} steps={steps} k={k}: {ms:.1} ms/step = {:.1} steps/s",
         1000.0 / ms
     );
     if steps <= 64 {
@@ -1073,7 +1074,8 @@ fn gpuloop_bench(device: &wgpu::Device, queue: &wgpu::Queue, n: usize, steps: us
 /// finite scan per step. Reproduces visual-GPU crashes without a display.
 fn gpusim_run(device: &wgpu::Device, queue: &wgpu::Queue, n: usize, steps: usize, preset: &str) {
     let preset = ic::Preset::from_str(preset).expect("unknown preset");
-    let gpu = gpufmm::GpuBackend::new(device, queue, 4);
+    let k: u64 = std::env::var("PROBE_K").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
+    let gpu = gpufmm::GpuBackend::new(device, queue, k);
     let mut sim = sim::Sim::new(n, 0.01, false, Some(gpu), preset);
     for s in 0..steps {
         sim.step();
@@ -1672,7 +1674,7 @@ fn main() {
         cam_up: [up.x, up.y, up.z, eye[2] as f32],
         params: [point_size, 1.0, exposure, 0.0],
     };
-    state.upload(&queue, &star_items, &star_items, &uni);
+    state.upload(&queue, &star_items, &uni);
     let bw = (w / 4).max(1) as f32;
     let bh = (h / 4).max(1) as f32;
     queue.write_buffer(

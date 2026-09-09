@@ -7,7 +7,7 @@ mod sim;
 
 use camera::{rebase, Camera};
 use gpu::{GpuItem, GpuState, Uniform};
-use sim::{advance_cursor, bracket, physics_loop, Ctl, HistSnap, Msg, Sim};
+use sim::{advance_cursor, bracket, physics_loop, target_wall_for_gap, Ctl, HistSnap, Msg, RateWindow, Sim};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Instant;
@@ -288,7 +288,6 @@ struct App {
     last_cursor: Option<winit::dpi::PhysicalPosition<f64>>,
     modifiers: winit::keyboard::ModifiersState,
     bg: Vec<([f64; 3], f32, f32)>,
-    stage_prev: Vec<GpuItem>,
     stage_curr: Vec<GpuItem>,
     stage_bg: Vec<GpuItem>,
     stage_gas_em: Vec<GpuItem>,
@@ -302,6 +301,8 @@ struct App {
     hist: VecDeque<HistSnap>,
     render_t: Option<f64>,
     sim_rate: f64,
+    rate_win: RateWindow,
+    cursor_slow: f64,
     sim_dt: f64,
     interval_ema: f64,
     last_arrival: Option<Instant>,
@@ -309,10 +310,8 @@ struct App {
     sim_steps: u64,
 }
 
-/// Target playout buffer in wall seconds, converted to sim time via the
-/// estimated sim rate and clamped to 2..8 steps. Covers a K=4 refresh
-/// burst without freezing; occupancy feedback absorbs the rest.
-const BUFFER_WALL_S: f64 = 0.30;
+/// Snap history cap: must hold the adaptive playout target (worst gap +
+/// margin, up to 1.0s wall) plus catch-up margin.
 /// Snap history cap: must hold the target buffer plus catch-up margin.
 const HIST_CAP: usize = 24;
 /// Physics channel bound: backpressure when steps outrun drains. Was 16:
@@ -345,7 +344,6 @@ impl App {
             last_cursor: None,
             modifiers: winit::keyboard::ModifiersState::default(),
             bg: bg_stars(),
-            stage_prev: Vec::new(),
             stage_curr: Vec::new(),
             stage_bg: Vec::new(),
             stage_gas_em: Vec::new(),
@@ -359,6 +357,8 @@ impl App {
             hist: VecDeque::new(),
             render_t: None,
             sim_rate: 0.0,
+            rate_win: RateWindow::new(4.0),
+            cursor_slow: 0.0,
             sim_dt,
             interval_ema: 0.25,
             last_arrival: None,
@@ -545,8 +545,12 @@ impl App {
         );
         let egui_renderer =
             egui_wgpu::Renderer::new(&device, format, egui_wgpu::RendererOptions::default());
+        // Refresh every 8 steps: frozen-tree mean error 5.5e-3 sits on the
+        // p=4/eps=1e-2 truncation floor (5.6e-3) out to k=16 (`probe
+        // --gpureuse`), while refresh CPU (prepass+record ~120ms @100k)
+        // amortizes 30->15ms. k=8 measured 28ms/step vs 43ms at k=4 @100k.
         let gpu_backend = if args.gpu || args.n > 30000 {
-            Some(gpufmm::GpuBackend::new(&device, &queue, 4))
+            Some(gpufmm::GpuBackend::new(&device, &queue, 8))
         } else {
             None
         };
@@ -745,6 +749,7 @@ impl App {
                     }
                     Msg::Snap(s) => {
                         let arrival = Instant::now();
+                        self.rate_win.push(arrival, s.time);
                         if let Some(last) = self.last_arrival {
                             let dt = (arrival - last).as_secs_f64().max(1e-3);
                             self.interval_ema = self.interval_ema * 0.9 + dt * 0.1;
@@ -772,27 +777,31 @@ impl App {
                 }
             }
         }
-        // Sim-time cursor + jitter buffer. Arrival-time blending pulses on
-        // bursty steps (K=4 refresh: 17/17/17/140 ms arrivals, uniform sim
-        // steps); sim time advances uniformly through the same snaps.
+        // Sim-time cursor + jitter buffer. Rate comes from an exact 4s
+        // window (burst-proof mean); the buffer target covers the worst
+        // recent gap + margin, so refresh bursts never starve the bracket;
+        // the weak spring on filtered occupancy centers the level with <5%
+        // ripple instead of hunting. Startup seeds from the instant rate
+        // until the window fills.
+        let tw = target_wall_for_gap(self.rate_win.max_gap(now));
         if let (Some(f), Some(b)) = (self.hist.front(), self.hist.back()) {
             let n = self.hist.len();
             if n >= 2 {
                 let span = (b.time - f.time).max(1e-12);
                 self.sim_dt = (span / (n as f64 - 1.0)).max(1e-9);
-                let wall = (b.arrival - f.arrival).as_secs_f64().max(1e-6);
-                let inst = span / wall;
-                self.sim_rate = if self.sim_rate <= 0.0 {
-                    inst
+                let r = self.rate_win.rate();
+                if r > 0.0 {
+                    self.sim_rate = r;
                 } else {
-                    self.sim_rate * 0.85 + inst * 0.15
-                };
+                    let wall = (b.arrival - f.arrival).as_secs_f64().max(1e-6);
+                    self.sim_rate = span / wall;
+                }
             }
             let mut rt = match self.render_t {
                 Some(t) => t,
                 None => {
                     let target =
-                        (self.sim_rate * BUFFER_WALL_S).clamp(2.0 * self.sim_dt, 8.0 * self.sim_dt);
+                        (self.sim_rate * tw).clamp(2.0 * self.sim_dt, 12.0 * self.sim_dt);
                     if self.paused {
                         b.time
                     } else {
@@ -808,7 +817,8 @@ impl App {
                     self.sim_rate,
                     self.sim_dt,
                     real_dt.min(0.25),
-                    BUFFER_WALL_S,
+                    tw,
+                    &mut self.cursor_slow,
                 );
             }
             while self.hist.len() > HIST_CAP {
@@ -835,9 +845,10 @@ impl App {
         let gfx = self.gfx.as_mut().unwrap();
         let eye = self.camera.eye();
         let n = self.body_n.min(p0.len().min(p1.len()));
-        self.stage_prev.clear();
+        // Curr-only staging: the shader reads curr directly (alpha=1), so
+        // the old prev buffer (build + upload, 32B/body/frame) was pure
+        // waste. .speed is likewise never read by any shader: no sqrt.
         self.stage_curr.clear();
-        self.stage_prev.reserve(n);
         self.stage_curr.reserve(n);
         for i in 0..n {
             let a = alpha;
@@ -855,16 +866,9 @@ impl App {
                 q0[1] + (q1[1] - q0[1]) * a + v[1] * extra,
                 q0[2] + (q1[2] - q0[2]) * a + v[2] * extra,
             ];
-            let psp = (u0[0] * u0[0] + u0[1] * u0[1] + u0[2] * u0[2]).sqrt() as f32;
-            let sp = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt() as f32;
-            self.stage_prev.push(GpuItem {
-                pos: rebase(&q0, &eye),
-                speed: psp,
-                misc: [self.temp[i], self.mag[i], 0.0, 0.0],
-            });
             self.stage_curr.push(GpuItem {
                 pos: rebase(&w, &eye),
-                speed: sp,
+                speed: 0.0,
                 misc: [self.temp[i], self.mag[i], 0.0, 0.0],
             });
         }
@@ -985,7 +989,7 @@ impl App {
             ],
         };
         gfx.gpu_state
-            .upload(&gfx.queue, &self.stage_prev, &self.stage_curr, &uni);
+            .upload(&gfx.queue, &self.stage_curr, &uni);
         gfx.queue.write_buffer(
             &gfx.gas_uni,
             0,

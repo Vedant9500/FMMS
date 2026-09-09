@@ -7,25 +7,46 @@
 //! tables stay register-resident per thread.
 //!
 //! Refresh model: the tree + interaction lists rebuild on CPU every `k`
-//! steps (`try_accel_with_refresh`); positions upload every step and
-//! moments/locals recompute on GPU. Non-refresh steps cost one SoA shuffle
-//! plus small uploads on CPU.
+//! steps, SYNCHRONOUSLY (`try_accel_with_refresh`); positions upload every
+//! step and moments/locals recompute on GPU. Non-refresh steps cost one SoA
+//! shuffle plus small uploads on CPU.
+//!
+//! A pipelined background rebuild was tried and REVERTED: it extended the
+//! effective frozen stretch to k + build steps (~16+), and 200-step disk
+//! runs showed secular runaway past tree age ~8 (sync k=8 bounded at
+//! max|v|~3.2, sync k=16 pinned at the 5.0 clamp and evaporated; instantaneous
+//! force error is flat to k=16 and does NOT predict this). Rule: installed
+//! tree age never exceeds k. Smoothness across the remaining sync hitches
+//! comes from the render-side jitter buffer, not from hiding the build.
 //!
 //! Per-pass uniform `vec4<u32>` meanings (positional fields!):
 //!   p2m: [DIM, nleaf, _, _]      one thread per leaf
-//!   m2m: [DIM, nlevel, level_off, _]  one thread per level cell
-//!   s1:  [_, DIM, npairs, _]     one thread per directed M2L pair
-//!   red: [ncells, DIM, _, _]     one thread per (cell, moment)
-//!   l2l: [DIM, nlevel, level_off, _]
+//!   m2m: [DIM, nedge_level, edge_off, _]  one thread per parent->child edge
+//!   m2mred: [DIM, nlevel, level_off, _]   one thread per level cell
+//!   s1:  [_, DIM, nchunk, coff]  one thread per directed M2L pair in chunk
+//!   red: [ncells, DIM, c0, nchunk] one thread per (cell, moment); first chunk
+//!        overwrites locals, later chunks += (c0==0 signals first)
+//!   l2l: [DIM, nedge_level, edge_off, _]  one thread per parent->child edge
 //!   l2p: [DIM, nslots, _, _]     one thread per body
 //!   p2p: [nleaf, _, _, _]        one workgroup per leaf ordinal
 //!   fat: [njobs, _, _, _]        one workgroup per fat job
 //!   fred:[nfat, _, _, _]         one workgroup per fat leaf
 //!
-//! Buffer size scalings (d=25): b-slots = npairs*d*8B dominates
-//! (~4.3 pairs/body measured: ~280MB@300k, ~0.9GB@1M). `ensure()` checks
-//! every buffer against the device buffer+binding limits and returns
-//! OverBudget instead of hitting wgpu validation.
+//! Sweep restructure: M2M/L2L run per parent->child edge (one thread per
+//! edge, grouped by parent level) instead of per parent cell. Deep levels
+//! hold ~8x more edges than parents (edges(l) = cells(l+1)); tiny top
+//! levels stay tiny but deep launches go 294->2352 threads (L10 @100k).
+//! M2M writes per-edge partials + a per-level reduce (parents read only
+//! their own level's partials via the edge-slot map). L2L needs no reduce:
+//! each child has exactly one parent, so per-edge threads write disjoint
+//! child ranges directly.
+//!
+//! Buffer size scalings (d=25): b-slots is CHUNKED to 7/8 of
+//! max_storage_buffer_binding_size (~112MB on a 128MB-limit device, ~570k
+//! pairs), so N is unbounded by the 128MB binding wall that capped the old
+//! dense slots design (~130k bodies). gsrc/gdst stay dense (4B/pair, ~19MB
+//! at 1M). `ensure()` checks every buffer against the device buffer+binding
+//! limits and returns OverBudget instead of hitting wgpu validation.
 //!
 //! Precision: f32 end to end (f64 in, f32 on device, f64 out). P2P uses a
 //! 1e-12 softening + 2x Newton-refined rsqrt; coincident bodies are finite
@@ -38,48 +59,86 @@ pub const N_LEAF: usize = 64;
 
 use fmm::tree::Octree;
 
-pub const WGSL_HELPERS: &str = r#"
-fn idx(n: u32, m: i32) -> u32 {
+/// Legacy generic prelude, superseded by `wgsl_helpers(p)` (division-free).
+#[allow(dead_code)]
+pub const WGSL_HELPERS: &str = "";
+
+/// Specialized WGSL prelude for a given P: idx/cmul plus an upsilon_table
+/// with NO runtime divisions. Small-int reciprocals 1/(2m) and 1/(n^2-m^2)
+/// are baked as literal tables (function-local arrays, dynamically indexed);
+/// the only remaining division in the whole sweep family is theta's single
+/// 1/r2 hoist in `m2l_source`. Division throughput is the sweep limiter on
+/// Ada (one upsilon table held ~15 divs across p2m/m2m/l2l/l2p), so this is
+/// worth the generated literals. Numerics shift by ~1ulp vs `/c`, inside the
+/// 1e-4 gpu_matches_cpu gate (100x headroom over measured 6e-6).
+pub fn wgsl_helpers(p: u32) -> String {
+    let pp = p as usize;
+    let mut inv2m = Vec::with_capacity(pp + 1);
+    for m in 0..=pp {
+        let v = if m == 0 { 0.0f32 } else { 1.0 / (2 * m) as f32 };
+        inv2m.push(format!("{v:e}"));
+    }
+    let w = pp + 1;
+    let mut invc = Vec::with_capacity(w * w);
+    for n in 0..w {
+        for m in 0..w {
+            let v = if n > m {
+                1.0 / (n * n - m * m) as f32
+            } else {
+                0.0f32
+            };
+            invc.push(format!("{v:e}"));
+        }
+    }
+    format!(
+        r#"fn idx(n: u32, m: i32) -> u32 {{
     return u32(i32(n * (n + 1u)) + m);
-}
+}}
 
-fn cmul(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
+fn cmul(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {{
     return vec2<f32>(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
-}
+}}
 
-fn upsilon_table(x: f32, y: f32, z: f32) -> array<vec2<f32>, DIM> {
+fn upsilon_table(x: f32, y: f32, z: f32) -> array<vec2<f32>, DIM> {{
     let r2 = x * x + y * y + z * z;
+    var inv2m = array<f32, {w}>({inv2m});
+    var invc = array<f32, {ww}>({invc});
     var u: array<vec2<f32>, DIM>;
     u[idx(0u, 0)] = vec2<f32>(1.0, 0.0);
-    for (var m = 0u; m <= P; m++) {
+    for (var m = 0u; m <= P; m++) {{
         let mi = i32(m);
-        if (m > 0u) {
-            u[idx(m, mi)] = cmul(vec2<f32>(x, y) * (1.0 / f32(2u * m)), u[idx(m - 1u, mi - 1)]);
-        }
-        for (var n = m + 1u; n <= P; n++) {
+        if (m > 0u) {{
+            u[idx(m, mi)] = cmul(vec2<f32>(x, y) * inv2m[m], u[idx(m - 1u, mi - 1)]);
+        }}
+        for (var n = m + 1u; n <= P; n++) {{
             let a = f32(2u * n - 1u) * z;
-            let c = f32(n * n - m * m);
             var p2 = vec2<f32>(0.0, 0.0);
-            if (n >= m + 2u) {
+            if (n >= m + 2u) {{
                 p2 = u[idx(n - 2u, mi)];
-            }
-            u[idx(n, mi)] = (u[idx(n - 1u, mi)] * a - p2 * r2) / c;
-        }
-    }
-    for (var m = 1u; m <= P; m++) {
+            }}
+            u[idx(n, mi)] = (u[idx(n - 1u, mi)] * a - p2 * r2) * invc[n * {w}u + m];
+        }}
+    }}
+    for (var m = 1u; m <= P; m++) {{
         let mi = i32(m);
         var sgn = -1.0;
-        if (m % 2u == 0u) {
+        if (m % 2u == 0u) {{
             sgn = 1.0;
-        }
-        for (var n = m; n <= P; n++) {
+        }}
+        for (var n = m; n <= P; n++) {{
             let cc = u[idx(n, mi)];
             u[idx(n, -mi)] = vec2<f32>(cc.x, -cc.y) * sgn;
-        }
-    }
+        }}
+    }}
     return u;
+}}
+"#,
+        w = w,
+        ww = w * w,
+        inv2m = inv2m.join(", "),
+        invc = invc.join(", "),
+    )
 }
-"#;
 
 /// Directed-pair M2L: one thread per pair. Templated on P like the sweep
 /// shaders (was a hardcoded-DIM const duplicating idx/cmul).
@@ -103,10 +162,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
     if (pi >= u.z) {{
         return;
     }}
+    // Chunked M2L: this launch covers global pairs [u.w, u.w+u.z); slots stay
+    // chunk-local (pi-indexed) so the slots buffer caps at one chunk instead
+    // of the full pair list (128MB binding wall: ~130k bodies unchunked).
+    let gj = u.w + pi;
     // Separation from cell centers on-device: saves a per-pair CPU loop +
     // a vec4 upload per refresh (u32 dst list instead).
-    let src = srcs[pi];
-    let r = centers[dsts[pi]].xyz - centers[src].xyz;
+    let src = srcs[gj];
+    let r = centers[dsts[gj]].xyz - centers[src].xyz;
     let moff = src * u.y;
     let ooff = pi * u.y;
     let x = r.x;
@@ -114,6 +177,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
     let z = r.z;
     let r2 = x * x + y * y + z * z;
     let ir = inverseSqrt(r2);
+    // Single reciprocal hoist: ~25 `/r2` divisions per pair become multiplies
+    // (~1ulp shift, inside the gpu_matches_cpu gate). Division throughput is
+    // the M2L limiter, same as the sweep upsilon tables.
+    let ir2 = 1.0 / r2;
 
     var th: array<vec2<f32>, DIM>;
     th[idx(0u, 0)] = vec2<f32>(ir, 0.0);
@@ -125,15 +192,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         if (n >= 2u) {{
             p2 = th[idx(n - 2u, 0)];
         }}
-        th[idx(n, 0)] = (p1 * a - p2 * b) / r2;
+        th[idx(n, 0)] = (p1 * a - p2 * b) * ir2;
     }}
     for (var m = 1u; m <= P; m++) {{
         let mi = i32(m);
-        th[idx(m, mi)] = cmul(vec2<f32>(x, y) * (f32(2u * m - 1u) / r2), th[idx(m - 1u, mi - 1)]);
+        th[idx(m, mi)] = cmul(vec2<f32>(x, y) * (f32(2u * m - 1u) * ir2), th[idx(m - 1u, mi - 1)]);
         for (var n = m + 1u; n <= P; n++) {{
             let a = f32(2u * n - 1u) * z;
             let b = f32((n - 1u) * (n - 1u) - m * m);
-            th[idx(n, mi)] = (th[idx(n - 1u, mi)] * a - th[idx(n - 2u, mi)] * b) / r2;
+            th[idx(n, mi)] = (th[idx(n - 1u, mi)] * a - th[idx(n - 2u, mi)] * b) * ir2;
         }}
     }}
     for (var m = 1u; m <= P; m++) {{
@@ -165,7 +232,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
     }}
 }}
 "#,
-        pre = WGSL_HELPERS,
+        pre = wgsl_helpers(p),
         p = p,
         d = d,
     )
@@ -190,13 +257,29 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         return;
     }}
     let i = t % u.y;
+    // Chunk window intersection: this launch sums global pairs
+    // [max(start,u.z), min(start+cnt,u.z+u.w)) from chunk-local slots.
+    // First chunk (u.z == 0) overwrites (initializes zero-pair cells);
+    // later chunks skip empty intersections and accumulate (+=).
     let start = gstart[c];
     let cnt = gcount[c];
-    var acc = vec2<f32>(0.0, 0.0);
-    for (var j = 0u; j < cnt; j++) {{
-        acc += slots[(start + j) * u.y + i];
+    let lo = max(start, u.z);
+    let hi = min(start + cnt, u.z + u.w);
+    if (lo >= hi) {{
+        if (u.z == 0u) {{
+            locals[c * u.y + i] = vec2<f32>(0.0, 0.0);
+        }}
+        return;
     }}
-    locals[c * u.y + i] = acc;
+    var acc = vec2<f32>(0.0, 0.0);
+    for (var j = lo; j < hi; j++) {{
+        acc += slots[(j - u.z) * u.y + i];
+    }}
+    if (u.z == 0u) {{
+        locals[c * u.y + i] = acc;
+    }} else {{
+        locals[c * u.y + i] += acc;
+    }}
 }}
 "#,
         d = d,
@@ -243,12 +326,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
     }}
 }}
 "#,
-        pre = WGSL_HELPERS,
+        pre = wgsl_helpers(p),
         p = p,
         d = d,
     )
 }
 
+#[allow(dead_code)]
 pub fn m2m_source(p: u32) -> String {
     let d = (p + 1) * (p + 1);
     format!(
@@ -314,12 +398,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
     }}
 }}
 "#,
-        pre = WGSL_HELPERS,
+        pre = wgsl_helpers(p),
         p = p,
         d = d,
     )
 }
 
+#[allow(dead_code)]
 pub fn l2l_source(p: u32) -> String {
     let d = (p + 1) * (p + 1);
     format!(
@@ -380,7 +465,167 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
     }}
 }}
 "#,
-        pre = WGSL_HELPERS,
+        pre = wgsl_helpers(p),
+        p = p,
+        d = d,
+    )
+}
+
+/// M2M per-edge partials: one thread per parent->child edge. Computes the
+/// child's shifted contribution (25 coeffs) into scratch; the per-level
+/// reduce sums each parent's own edges. Same inner math as `m2m_source`
+/// (eq 3d, no conj), but no 8-child serial loop and no leaf early-return:
+/// all `partial` threads are dense per level.
+pub fn m2m_part_source(p: u32) -> String {
+    let d = (p + 1) * (p + 1);
+    format!(
+        r#"const P: u32 = {p}u;
+const DIM: u32 = {d}u;
+{pre}
+@group(0) @binding(0) var<storage, read> moments: array<vec2<f32>>;
+@group(0) @binding(1) var<storage, read> centers: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read> epar: array<u32>;
+@group(0) @binding(3) var<storage, read> echd: array<u32>;
+@group(0) @binding(4) var<storage, read_write> partials: array<vec2<f32>>;
+@group(0) @binding(5) var<uniform> u: vec4<u32>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
+    let i = gid.x;
+    if (i >= u.y) {{
+        return;
+    }}
+    let e = u.z + i;
+    let c = epar[e];
+    let chu = echd[e];
+    let off = c * u.x;
+    let z = centers[c].xyz;
+    let dvec = centers[chu].xyz - z;
+    let ut = upsilon_table(dvec.x, dvec.y, dvec.z);
+    let coff = chu * u.x;
+    let ooff = e * u.x;
+    for (var n = 0u; n <= P; n++) {{
+        let ni = i32(n);
+        for (var m = -ni; m <= ni; m++) {{
+            var st = vec2<f32>(0.0, 0.0);
+            for (var k = 0u; k <= n; k++) {{
+                let ki = i32(k);
+                let nk = n - k;
+                let lo = max(-ki, m - i32(nk));
+                let hi = min(ki, m + i32(nk));
+                for (var l = lo; l <= hi; l++) {{
+                    st += cmul(ut[idx(k, l)], moments[coff + idx(nk, m - l)]);
+                }}
+            }}
+            partials[ooff + idx(n, m)] = st;
+        }}
+    }}
+    _ = off;
+}}
+"#,
+        pre = wgsl_helpers(p),
+        p = p,
+        d = d,
+    )
+}
+
+/// M2M per-level reduce: one thread per INTERNAL parent cell, sums its
+/// edges' partials via the edge-slot map into moments (overwrite, not +=:
+/// internal moments are stale from the previous step). Dense: no leaf
+/// early-return threads (L11: 91 vs 2352).
+pub fn m2m_red_source() -> String {
+    let d = DIM as u32;
+    format!(
+        r#"const DIM: u32 = {d}u;
+
+@group(0) @binding(0) var<storage, read> partials: array<vec2<f32>>;
+@group(0) @binding(1) var<storage, read> children: array<u32>;
+@group(0) @binding(2) var<storage, read> emap: array<u32>;
+@group(0) @binding(3) var<storage, read_write> moments: array<vec2<f32>>;
+@group(0) @binding(4) var<storage, read> int_par: array<u32>;
+@group(0) @binding(5) var<uniform> u: vec4<u32>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
+    let i = gid.x;
+    if (i >= u.y) {{
+        return;
+    }}
+    let c = int_par[u.z + i];
+    let off = c * u.x;
+    var acc: array<vec2<f32>, DIM>;
+    for (var q = 0u; q < DIM; q++) {{
+        acc[q] = vec2<f32>(0.0, 0.0);
+    }}
+    for (var ci = 0u; ci < 8u; ci++) {{
+        if (bitcast<i32>(children[c * 8u + ci]) < 0) {{
+            continue;
+        }}
+        let e = emap[c * 8u + ci];
+        let poff = e * u.x;
+        for (var q = 0u; q < DIM; q++) {{
+            acc[q] += partials[poff + q];
+        }}
+    }}
+    for (var q = 0u; q < DIM; q++) {{
+        moments[off + q] = acc[q];
+    }}
+}}
+"#,
+        d = d,
+    )
+}
+
+/// L2L per-edge: one thread per parent->child edge. Same math as
+/// `l2l_source` (eq 3e, conj Υ) for a single child; no 8-child loop, no
+/// leaf early-return. Race-free: each child has exactly one parent edge,
+/// and M2L contributions are already in locals before the top-down sweep.
+pub fn l2l_edge_source(p: u32) -> String {
+    let d = (p + 1) * (p + 1);
+    format!(
+        r#"const P: u32 = {p}u;
+const DIM: u32 = {d}u;
+{pre}
+@group(0) @binding(0) var<storage, read_write> locals: array<vec2<f32>>;
+@group(0) @binding(1) var<storage, read> centers: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read> epar: array<u32>;
+@group(0) @binding(3) var<storage, read> echd: array<u32>;
+@group(0) @binding(4) var<uniform> u: vec4<u32>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
+    let i = gid.x;
+    if (i >= u.y) {{
+        return;
+    }}
+    let e = u.z + i;
+    let c = epar[e];
+    let chu = echd[e];
+    let off = c * u.x;
+    var f: array<vec2<f32>, DIM>;
+    for (var q = 0u; q < DIM; q++) {{
+        f[q] = locals[off + q];
+    }}
+    let r = centers[c].xyz - centers[chu].xyz;
+    let ut = upsilon_table(r.x, r.y, r.z);
+    let coff = chu * u.x;
+    for (var n = 0u; n <= P; n++) {{
+        let ni = i32(n);
+        for (var m = -ni; m <= ni; m++) {{
+            var st = vec2<f32>(0.0, 0.0);
+            for (var k = 0u; k <= P - n; k++) {{
+                let ki = i32(k);
+                for (var l = -ki; l <= ki; l++) {{
+                    let uc = ut[idx(k, l)];
+                    st += cmul(vec2<f32>(uc.x, -uc.y), f[idx(n + k, m + l)]);
+                }}
+            }}
+            locals[coff + idx(n, m)] += st;
+        }}
+    }}
+}}
+"#,
+        pre = wgsl_helpers(p),
         p = p,
         d = d,
     )
@@ -431,7 +676,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
     accel[s] = vec4<f32>(-psi11.x, -psi11.y, -psi10.x, psi00.x);
 }}
 "#,
-        pre = WGSL_HELPERS,
+        pre = wgsl_helpers(p),
         p = p,
         d = d,
     )
@@ -464,9 +709,12 @@ fn interact(px: vec3<f32>, qx: vec3<f32>, qm: f32) -> vec4<f32> {{
     let d = qx - px;
     // 1e-12 softening: coincident bodies stay finite (no inf/NaN poisoning
     // the step). Force error ~1e-12 relative; self-skip is by slot id.
+    // Single Newton step: inverseSqrt is ~14-bit, one NR doubles to ~28-bit
+    // (f32 mantissa is 23+1); the old 2nd step bought ~56-bit precision the
+    // f32 pipeline cannot keep. Matches the README rsqrt+NR doctrine and the
+    // fp64 CPU path's rsqrt14+2NR (which needs 2 steps for 53-bit mantissa).
     let r2 = dot(d, d) + 1e-12;
     var inv = inverseSqrt(r2);
-    inv = inv * (1.5 - 0.5 * r2 * inv * inv);
     inv = inv * (1.5 - 0.5 * r2 * inv * inv);
     let inv3 = inv * inv * inv;
     return vec4<f32>(qm * inv3 * d, qm * inv);
@@ -752,11 +1000,71 @@ mod tests {
     fn sweep_shaders_parse() {
         naga::front::wgsl::parse_str(&p2m_source(4)).expect("p2m wgsl");
         naga::front::wgsl::parse_str(&m2m_source(4)).expect("m2m wgsl");
+        naga::front::wgsl::parse_str(&m2m_part_source(4)).expect("m2mp wgsl");
+        naga::front::wgsl::parse_str(&m2m_red_source()).expect("m2mr wgsl");
         naga::front::wgsl::parse_str(&l2l_source(4)).expect("l2l wgsl");
+        naga::front::wgsl::parse_str(&l2l_edge_source(4)).expect("l2le wgsl");
         naga::front::wgsl::parse_str(&l2p_source(4)).expect("l2p wgsl");
         naga::front::wgsl::parse_str(&p2p_source(4)).expect("p2p wgsl");
         naga::front::wgsl::parse_str(&fat_p2p_source()).expect("fat p2p wgsl");
         naga::front::wgsl::parse_str(&fat_red_source()).expect("fat red wgsl");
+    }
+
+    #[test]
+    fn edge_tables_cover_every_nonroot_cell_once() {
+        let parts = fmm::models::plummer(2000, [0.0; 3], 7);
+        let tree = fmm::tree::Octree::build(&parts, 64);
+        let ct = cell_tables(&tree, parts.len());
+        let ncells = tree.cells.len();
+        assert_eq!(ct.edge_par.len(), ncells - 1);
+        assert_eq!(ct.edge_chd.len(), ncells - 1);
+        assert_eq!(ct.edge_off.len(), ct.level_off.len());
+        assert_eq!(*ct.edge_off.last().unwrap(), ncells - 1);
+        // every non-root cell appears exactly once as a child
+        let mut seen = vec![0u32; ncells];
+        for &c in &ct.edge_chd {
+            seen[c as usize] += 1;
+        }
+        assert_eq!(seen[0], 0);
+        for c in 1..ncells {
+            assert_eq!(seen[c], 1, "cell {c}");
+        }
+        // edge map agrees with children buffer
+        for c in 0..ncells {
+            for k in 0..8 {
+                let ch = ct.children[c * 8 + k];
+                if ch == u32::MAX {
+                    assert_eq!(ct.edge_map[c * 8 + k], u32::MAX);
+                } else {
+                    let e = ct.edge_map[c * 8 + k] as usize;
+                    assert_eq!(ct.edge_par[e], c as u32);
+                    assert_eq!(ct.edge_chd[e], ch);
+                }
+            }
+        }
+        // internal parents per level agree with edges (parent-major order)
+        for l in 0..ct.level_off.len() - 1 {
+            let ni = ct.int_off[l + 1] - ct.int_off[l];
+            let ne = ct.edge_off[l + 1] - ct.edge_off[l];
+            // every internal parent has 1..=8 edges; every edge's parent is
+            // listed once in int_par in the same level range
+            assert!(ni <= ne && (ni == 0) == (ne == 0), "level {l}");
+            for &pa in &ct.int_par[ct.int_off[l]..ct.int_off[l + 1]] {
+                assert!(!tree.is_leaf(pa as usize));
+            }
+        }
+        // edges grouped by parent level: edges(l) = cells at level l+1
+        // (octree children sit exactly one level below their parent).
+        let nlevels = ct.level_off.len() - 1;
+        for l in 0..nlevels {
+            let ne = ct.edge_off[l + 1] - ct.edge_off[l];
+            let cells_next = if l + 1 < nlevels {
+                ct.level_off[l + 2] - ct.level_off[l + 1]
+            } else {
+                0
+            };
+            assert_eq!(ne, cells_next, "level {l}");
+        }
     }
 
     #[test]
@@ -782,7 +1090,8 @@ mod tests {
     }
 
     #[test]
-    fn fat_split_zeroes_main_and_covers_range() {        let mut pl = PbLists {
+    fn fat_split_zeroes_main_and_covers_range() {
+        let mut pl = PbLists {
             start: vec![0, 4],
             count: vec![4, 2],
             list: vec![0, 1, 2, 3, 4, 5],
@@ -797,6 +1106,60 @@ mod tests {
         assert_eq!(fj.fat_start, vec![0, 2]);
         assert_eq!((fj.fat_cf, fj.fat_cc), (vec![0], vec![4]));
         assert_eq!(fj.iters, 16);
+    }
+
+    /// Secular-evolution gate: 30k spiral disk, 200 KDK steps through the app
+    /// GPU backend at k=8. Pins the DISK HEATING failure mode that
+    /// instantaneous force error cannot see: a pipelined background refresh
+    /// stretched tree age to ~16+ and disks evaporated (max|v| pinned at the
+    /// 5.0 clamp from step ~37, stars gone, gas oddly fine); sync k=8 holds
+    /// max|v| ~3.2, sync k=16 runs away. Bound: max|v| < 4.2 (margin under
+    /// the clamp), zero escapers, all finite. If this fails, first lever is
+    /// k 8->4 (halves age, doubles refresh CPU). Needs a GPU adapter + is
+    /// slow: `cargo test --release -p fmms-visual -- --ignored secular`.
+    #[test]
+    #[ignore]
+    fn spiral_30k_200steps_stays_bound() {
+        let n = 30_000;
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+            apply_limit_buckets: false,
+        }))
+        .expect("no adapter");
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("secular-test"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::default(),
+            experimental_features: Default::default(),
+            memory_hints: Default::default(),
+            trace: Default::default(),
+        }))
+        .unwrap();
+        let gpu = GpuBackend::new(&device, &queue, 8);
+        let mut sim = crate::sim::Sim::new(n, 0.01, false, Some(gpu), crate::ic::Preset::Spiral);
+        for s in 0..200 {
+            sim.step();
+            let mut mx = 0.0f64;
+            let mut esc = 0;
+            for i in 0..sim.n() {
+                for d in 0..3 {
+                    assert!(sim.pos[i][d].is_finite(), "non-finite pos step {s}");
+                    assert!(sim.vel[i][d].is_finite(), "non-finite vel step {s}");
+                    mx = mx.max(sim.vel[i][d].abs());
+                }
+                let r2 = sim.pos[i][0] * sim.pos[i][0]
+                    + sim.pos[i][1] * sim.pos[i][1]
+                    + sim.pos[i][2] * sim.pos[i][2];
+                if r2 > 400.0 {
+                    esc += 1;
+                }
+            }
+            assert!(mx < 4.2, "disk heating runaway at step {s}: max|v|={mx}");
+            assert_eq!(esc, 0, "escapers at step {s}");
+        }
     }
 
     /// GPU-vs-CPU fidelity: same coarse algorithm (p=4/eps=1e-2/n_leaf=64),
@@ -1070,7 +1433,7 @@ fn interact(px: vec3<f32>, qx: vec3<f32>, qm: f32) -> vec4<f32> {
     let r2 = dot(d, d) + 1e-12;
     var inv = inverseSqrt(r2);
     inv = inv * (1.5 - 0.5 * r2 * inv * inv);
-    inv = inv * (1.5 - 0.5 * r2 * inv * inv);
+    // Single Newton step (see main kernel): 2nd step was f32-invisible.
     let inv3 = inv * inv * inv;
     return vec4<f32>(qm * inv3 * d, qm * inv);
 }
@@ -1184,6 +1547,20 @@ pub struct CellTables {
     pub level_cells: Vec<u32>,
     pub level_off: Vec<usize>,
     pub cell_of_slot: Vec<u32>,
+    /// Parent->child edges grouped by parent level: `edge_par[e]`/`edge_chd[e]`.
+    pub edge_par: Vec<u32>,
+    pub edge_chd: Vec<u32>,
+    /// Per-parent-level start offsets into the edge arrays (len nlevels+1).
+    /// edges(l) = cells(l+1): every non-root cell is exactly one edge.
+    pub edge_off: Vec<usize>,
+    /// Internal (non-leaf) parents per level + start offsets (len nlevels+1).
+    /// The M2M reduce dispatches only these (deep L11: 91 vs 2352 level
+    /// cells); the old per-level-cell reduce burned 8x wasted leaf threads.
+    pub int_par: Vec<u32>,
+    pub int_off: Vec<usize>,
+    /// Edge index per parent slot (len ncells*8, u32::MAX if empty), for the
+    /// M2M reduce lookup.
+    pub edge_map: Vec<u32>,
 }
 
 pub fn cell_tables(tree: &Octree, nslots: usize) -> CellTables {
@@ -1209,6 +1586,33 @@ pub fn cell_tables(tree: &Octree, nslots: usize) -> CellTables {
     }
     let (level_off, level_idx) = tree.levels_csr();
     let level_cells: Vec<u32> = level_idx.iter().map(|&c| c as u32).collect();
+    let nlevels = level_off.len() - 1;
+    let mut edge_par = Vec::with_capacity(ncells.saturating_sub(1));
+    let mut edge_chd = Vec::with_capacity(ncells.saturating_sub(1));
+    let mut edge_off = vec![0usize; nlevels + 1];
+    let mut edge_map = vec![u32::MAX; ncells * 8];
+    let mut int_par = Vec::new();
+    let mut int_off = vec![0usize; nlevels + 1];
+    for l in 0..nlevels {
+        edge_off[l] = edge_par.len();
+        int_off[l] = int_par.len();
+        for &c in &level_idx[level_off[l]..level_off[l + 1]] {
+            if tree.is_leaf(c) {
+                continue;
+            }
+            int_par.push(c as u32);
+            for k in 0..8 {
+                let ch = tree.cells[c].children[k];
+                if ch >= 0 {
+                    edge_map[c * 8 + k] = edge_par.len() as u32;
+                    edge_par.push(c as u32);
+                    edge_chd.push(ch as u32);
+                }
+            }
+        }
+    }
+    edge_off[nlevels] = edge_par.len();
+    int_off[nlevels] = int_par.len();
     let mut cell_of_slot = vec![0u32; nslots];
     for &l in &leaf_ids {
         let c = l as usize;
@@ -1225,6 +1629,12 @@ pub fn cell_tables(tree: &Octree, nslots: usize) -> CellTables {
         level_cells,
         level_off,
         cell_of_slot,
+        edge_par,
+        edge_chd,
+        edge_off,
+        int_par,
+        int_off,
+        edge_map,
     }
 }
 
@@ -1280,12 +1690,71 @@ impl std::fmt::Display for GpuError {
     }
 }
 
+/// Finished CPU-side refresh tables from the background builder thread:
+/// everything `install_tables` needs without touching device state.
+struct RefreshTables {
+    ct: CellTables,
+    g: M2lGroups,
+    pl: PbLists,
+    fj: FatJobs,
+    order: Vec<u32>,
+}
+
+/// Pure-CPU refresh build (tree + MAC + interaction lists + GPU tables).
+/// Takes owned particles; kept separate from `install_tables` so the build
+/// (slow, CPU-only) and the install (uploads + binds, device-side) stay
+/// independently testable. Runs synchronously on refresh (a background
+/// pipeline was reverted: secular runaway past tree age ~8).
+fn build_refresh_tables(parts: Vec<fmm::models::Particle>) -> Result<RefreshTables, GpuError> {
+    let nt = nthreads();
+    let n = parts.len();
+    let tree = Octree::build(&parts, N_LEAF);
+    let bodies = fmm::bodies::Bodies::from_parts(&parts, &tree.order);
+    let d = DIM;
+    let ncells = tree.cells.len();
+    let mut moments = vec![fmm::harmonic::C::ZERO; ncells * d];
+    fmm::moments::compute_moments_par(&bodies, &tree, P, &mut moments, nt);
+    let pows = fmm::moments::multipole_power(&moments, ncells, P);
+    let binom = fmm::moments::binomials(P);
+    let (_, fmin) = fmm::mac::f_prepass_par(&bodies, &tree, nt);
+    let rec = fmm::walk::record_pairs_par(
+        &bodies, &tree, P, EPS, &pows, &binom, &fmin, &moments, nt,
+    );
+    let g = group_m2l(&rec.pairs, ncells);
+    let ct = cell_tables(&tree, n);
+    let mut pl = build_p2p_bodies(&rec.p2p, ncells, &ct.leaf_ids, &ct.cfirst, &ct.ccount);
+    // Kernels address 64 lanes max: graceful fallback, not a mid-run
+    // panic (split_fat re-checks the fat path identically).
+    if let Some(&l) = ct.leaf_ids.iter().find(|&&l| ct.ccount[l as usize] > 64) {
+        return Err(GpuError::OverfullLeaf {
+            leaf: l,
+            count: ct.ccount[l as usize],
+        });
+    }
+    let fj = split_fat(
+        &mut pl,
+        &ct.leaf_ids,
+        &ct.cfirst,
+        &ct.ccount,
+        FAT_THR,
+        FAT_CHUNK,
+    )?;
+    Ok(RefreshTables {
+        ct,
+        g,
+        pl,
+        fj,
+        order: tree.order.clone(),
+    })
+}
+
 pub struct GpuBackend {
     device: wgpu::Device,
     queue: wgpu::Queue,
     p2m_pipe: wgpu::ComputePipeline,
-    m2m_pipe: wgpu::ComputePipeline,
-    l2l_pipe: wgpu::ComputePipeline,
+    m2mp_pipe: wgpu::ComputePipeline,
+    m2mr_pipe: wgpu::ComputePipeline,
+    l2le_pipe: wgpu::ComputePipeline,
     l2p_pipe: wgpu::ComputePipeline,
     p2p_pipe: wgpu::ComputePipeline,
     fat_pipe: wgpu::ComputePipeline,
@@ -1293,8 +1762,9 @@ pub struct GpuBackend {
     s1_pipe: wgpu::ComputePipeline,
     red_pipe: wgpu::ComputePipeline,
     p2m_layout: wgpu::BindGroupLayout,
-    m2m_layout: wgpu::BindGroupLayout,
-    l2l_layout: wgpu::BindGroupLayout,
+    m2mp_layout: wgpu::BindGroupLayout,
+    m2mr_layout: wgpu::BindGroupLayout,
+    l2le_layout: wgpu::BindGroupLayout,
     l2p_layout: wgpu::BindGroupLayout,
     p2p_layout: wgpu::BindGroupLayout,
     fat_layout: wgpu::BindGroupLayout,
@@ -1303,7 +1773,15 @@ pub struct GpuBackend {
     red_layout: wgpu::BindGroupLayout,
     bufs: Option<GpuBufs>,
     tables: Option<(CellTables, M2lGroups, PbLists, FatJobs, Vec<u32>)>,
+    /// M2L pairs per chunk: slots buffer caps at 7/8 of the device's
+    /// max_storage_buffer_binding_size (device-constant, refresh-independent).
+    max_chunk: usize,
     parts: Vec<fmm::models::Particle>,
+    /// Reused per-step staging: SoA gather (no realloc), f32 upload pack,
+    /// id-order output. Saves ~8MB alloc/free per step at 100k.
+    bodies: fmm::bodies::Bodies,
+    stage_pos: Vec<[f32; 4]>,
+    stage_out: Vec<[f64; 3]>,
     step: u64,
     k: u64,
     /// Per-pass bind groups + frozen uniforms, rebuilt on every refresh.
@@ -1318,10 +1796,11 @@ pub struct GpuBackend {
 #[derive(Clone, Copy)]
 enum PassKind {
     P2m,
-    M2m,
+    M2mP,
+    M2mR,
     S1,
     Red,
-    L2l,
+    L2lE,
     L2p,
     P2p,
     Fat,
@@ -1354,6 +1833,11 @@ struct GpuBufs {
     pbs: wgpu::Buffer,
     pbc: wgpu::Buffer,
     pbl: wgpu::Buffer,
+    epar: wgpu::Buffer,
+    echd: wgpu::Buffer,
+    emap: wgpu::Buffer,
+    ipar: wgpu::Buffer,
+    mpart: wgpu::Buffer,
     fjob_s0: wgpu::Buffer,
     fjob_cc: wgpu::Buffer,
     fjob_o: wgpu::Buffer,
@@ -1366,6 +1850,7 @@ struct GpuBufs {
     cap_cells: usize,
     cap_slots: usize,
     cap_pairs: usize,
+    cap_edges: usize,
     cap_pbl: usize,
     cap_fjobs: usize,
     cap_nfat: usize,
@@ -1374,21 +1859,33 @@ struct GpuBufs {
 impl GpuBackend {
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, k: u64) -> Self {
         let p2m_layout = sweep_layout(device, "p2m", 6, 5);
-        let m2m_layout = sweep_layout(device, "m2m", 4, 0);
-        let l2l_layout = sweep_layout(device, "l2l", 4, 0);
+        let m2mp_layout = sweep_layout(device, "m2mp", 5, 4);
+        let m2mr_layout = sweep_layout(device, "m2mr", 5, 3);
+        let l2le_layout = sweep_layout(device, "l2le", 4, 0);
         let l2p_layout = sweep_layout(device, "l2p", 5, 4);
         let p2p_layout = sweep_layout(device, "p2p", 8, 7);
         let fat_layout = sweep_layout(device, "fat", 7, 6);
         let fatred_layout = sweep_layout(device, "fatred", 5, 4);
         let s1_layout = m2l_layout(device);
         let red_layout = m2l_red_layout(device);
+        let mut max_chunk = ((device.limits().max_storage_buffer_binding_size as u64 * 7 / 8)
+            / (DIM as u64 * 8))
+        .max(1) as usize;
+        // Test-only chunk forcing (`PROBE_CHUNK_PAIRS`): validates multi-chunk
+        // accumulation at small N with many chunks. Production path unset.
+        if let Ok(v) = std::env::var("PROBE_CHUNK_PAIRS") {
+            if let Ok(n) = v.parse::<usize>() {
+                max_chunk = max_chunk.min(n.max(1));
+            }
+        }
         let p = P as u32;
         Self {
             device: device.clone(),
             queue: queue.clone(),
             p2m_pipe: sweep_pipeline(device, "p2m", &p2m_source(p), &p2m_layout),
-            m2m_pipe: sweep_pipeline(device, "m2m", &m2m_source(p), &m2m_layout),
-            l2l_pipe: sweep_pipeline(device, "l2l", &l2l_source(p), &l2l_layout),
+            m2mp_pipe: sweep_pipeline(device, "m2mp", &m2m_part_source(p), &m2mp_layout),
+            m2mr_pipe: sweep_pipeline(device, "m2mr", &m2m_red_source(), &m2mr_layout),
+            l2le_pipe: sweep_pipeline(device, "l2le", &l2l_edge_source(p), &l2le_layout),
             l2p_pipe: sweep_pipeline(device, "l2p", &l2p_source(p), &l2p_layout),
             p2p_pipe: sweep_pipeline(device, "p2p", &p2p_source(p), &p2p_layout),
             fat_pipe: sweep_pipeline(device, "fat", &fat_p2p_source(), &fat_layout),
@@ -1396,8 +1893,9 @@ impl GpuBackend {
             s1_pipe: m2l_pipeline(device, &s1_layout),
             red_pipe: m2l_red_pipeline(device, &red_layout),
             p2m_layout,
-            m2m_layout,
-            l2l_layout,
+            m2mp_layout,
+            m2mr_layout,
+            l2le_layout,
             l2p_layout,
             p2p_layout,
             fat_layout,
@@ -1406,7 +1904,20 @@ impl GpuBackend {
             red_layout,
             bufs: None,
             tables: None,
+            max_chunk,
             parts: Vec::new(),
+            bodies: fmm::bodies::Bodies {
+                x: Vec::new(),
+                y: Vec::new(),
+                z: Vec::new(),
+                m: Vec::new(),
+                ax: Vec::new(),
+                ay: Vec::new(),
+                az: Vec::new(),
+                pot: Vec::new(),
+            },
+            stage_pos: Vec::new(),
+            stage_out: Vec::new(),
             step: 0,
             k: k.max(1),
             binds: None,
@@ -1418,6 +1929,7 @@ impl GpuBackend {
         ncells: usize,
         nslots: usize,
         total: usize,
+        nedges: usize,
         pbl: usize,
         fjobs: usize,
         nfat: usize,
@@ -1427,6 +1939,7 @@ impl GpuBackend {
                 ncells <= b.cap_cells
                     && nslots <= b.cap_slots
                     && total <= b.cap_pairs
+                    && nedges <= b.cap_edges
                     && pbl <= b.cap_pbl
                     && fjobs <= b.cap_fjobs
                     && nfat <= b.cap_nfat
@@ -1444,11 +1957,12 @@ impl GpuBackend {
         let nc = ncells as u64;
         let ns = nslots as u64;
         let tt = total.max(1) as u64;
+        let ne = nedges.max(1) as u64;
         let pb = pbl.max(1) as u64;
         let fj = fjobs.max(1) as u64;
         let nf = nfat as u64;
         // (label, bytes, bound_as_storage)
-        let sizes: [(&str, u64, bool); 24] = [
+        let sizes: [(&str, u64, bool); 29] = [
             ("b-pos", ns * 16, true),
             ("b-cen", nc * 16, true),
             ("b-cf", nc * 4, true),
@@ -1463,11 +1977,16 @@ impl GpuBackend {
             ("b-rb", ns * 16, false),
             ("b-gsrc", tt * 4, true),
             ("b-gdst", tt * 4, true),
-            ("b-slots", tt * d * 8, true),
+            ("b-slots", tt.min((self.max_chunk as u64).max(1)) * d * 8, true),
             ("b-gs", nc * 4, true),
             ("b-gc", nc * 4, true),
             ("b-pbs", nc * 4, true),
             ("b-pbc", nc * 4, true),
+            ("b-epar", ne * 4, true),
+            ("b-echd", ne * 4, true),
+            ("b-emap", nc * 32, true),
+            ("b-ipar", nc * 4, true),
+            ("b-mpart", ne * d * 8, true),
             ("b-pbl", pb * 4, true),
             ("b-fjob", fj * 4, true),
             ("b-fscr", fj * 64 * 16, true),
@@ -1544,13 +2063,38 @@ impl GpuBackend {
             ),
             slots: mk(
                 "b-slots",
-                (total.max(1) * d * 8) as u64,
+                (self.max_chunk.max(1) * d * 8) as u64,
                 wgpu::BufferUsages::empty(),
             ),
             gs: mk("b-gs", (ncells * 4) as u64, wgpu::BufferUsages::COPY_DST),
             gc: mk("b-gc", (ncells * 4) as u64, wgpu::BufferUsages::COPY_DST),
             pbs: mk("b-pbs", (ncells * 4) as u64, wgpu::BufferUsages::COPY_DST),
             pbc: mk("b-pbc", (ncells * 4) as u64, wgpu::BufferUsages::COPY_DST),
+            epar: mk(
+                "b-epar",
+                (nedges.max(1) * 4) as u64,
+                wgpu::BufferUsages::COPY_DST,
+            ),
+            echd: mk(
+                "b-echd",
+                (nedges.max(1) * 4) as u64,
+                wgpu::BufferUsages::COPY_DST,
+            ),
+            emap: mk(
+                "b-emap",
+                (ncells * 32) as u64,
+                wgpu::BufferUsages::COPY_DST,
+            ),
+            ipar: mk(
+                "b-ipar",
+                (ncells * 4) as u64,
+                wgpu::BufferUsages::COPY_DST,
+            ),
+            mpart: mk(
+                "b-mpart",
+                (nedges.max(1) * d * 8) as u64,
+                wgpu::BufferUsages::empty(),
+            ),
             pbl: mk(
                 "b-pbl",
                 (pbl.max(1) * 4) as u64,
@@ -1599,6 +2143,7 @@ impl GpuBackend {
             cap_cells: ncells,
             cap_slots: nslots,
             cap_pairs: total.max(1),
+            cap_edges: nedges.max(1),
             cap_pbl: pbl.max(1),
             cap_fjobs: fjobs.max(1),
             cap_nfat: nfat.max(1),
@@ -1633,17 +2178,19 @@ impl GpuBackend {
             cmds: Vec::new(),
         };
         let add = |pb: &mut PassBinds,
-                       label: &str,
-                       layout: &wgpu::BindGroupLayout,
-                       bufs: &[&wgpu::Buffer],
-                       vals: [u32; 4],
-                       kind: PassKind,
-                       count: u32| {
-            let ub = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("g-uni"),
-                contents: bytemuck::bytes_of(&vals),
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
+                   label: &str,
+                   layout: &wgpu::BindGroupLayout,
+                   bufs: &[&wgpu::Buffer],
+                   vals: [u32; 4],
+                   kind: PassKind,
+                   count: u32| {
+            let ub = self
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("g-uni"),
+                    contents: bytemuck::bytes_of(&vals),
+                    usage: wgpu::BufferUsages::UNIFORM,
+                });
             let mut all: Vec<&wgpu::Buffer> = bufs.to_vec();
             all.push(&ub);
             let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1672,57 +2219,82 @@ impl GpuBackend {
             nleaf,
         );
         for l in (0..nlevels).rev() {
-            let (lo, ct_) = (
-                ct.level_off[l] as u32,
-                (ct.level_off[l + 1] - ct.level_off[l]) as u32,
+            let (eoff, ne) = (
+                ct.edge_off[l] as u32,
+                (ct.edge_off[l + 1] - ct.edge_off[l]) as u32,
             );
-            if ct_ == 0 {
+            if ne == 0 {
                 continue;
             }
             add(
                 &mut pb,
-                "m2m",
-                &self.m2m_layout,
-                &[&b.mom, &b.cen, &b.ch, &b.levels],
-                [d, ct_, lo, 0],
-                PassKind::M2m,
-                ct_,
+                "m2mp",
+                &self.m2mp_layout,
+                &[&b.mom, &b.cen, &b.epar, &b.echd, &b.mpart],
+                [d, ne, eoff, 0],
+                PassKind::M2mP,
+                ne,
+            );
+            let (ioff, ni) = (
+                ct.int_off[l] as u32,
+                (ct.int_off[l + 1] - ct.int_off[l]) as u32,
+            );
+            if ni == 0 {
+                continue;
+            }
+            add(
+                &mut pb,
+                "m2mr",
+                &self.m2mr_layout,
+                &[&b.mpart, &b.ch, &b.emap, &b.mom, &b.ipar],
+                [d, ni, ioff, 0],
+                PassKind::M2mR,
+                ni,
             );
         }
-        add(
-            &mut pb,
-            "m2ls1",
-            &self.s1_layout,
-            &[&b.mom, &b.gsrc, &b.cen, &b.gdst, &b.slots],
-            [0, d, g.total.max(1) as u32, 0],
-            PassKind::S1,
-            g.total.max(1) as u32,
-        );
-        add(
-            &mut pb,
-            "m2lred",
-            &self.red_layout,
-            &[&b.slots, &b.gs, &b.gc, &b.loc],
-            [ncells, d, 0, 0],
-            PassKind::Red,
-            ncells * d,
-        );
-        for l in 0..nlevels {
-            let (lo, ct_) = (
-                ct.level_off[l] as u32,
-                (ct.level_off[l + 1] - ct.level_off[l]) as u32,
+        // Chunked M2L: slots cap at max_chunk pairs; each chunk's s1 writes
+        // chunk-local slots and its red accumulates the global-pair window
+        // [c0, c0+nc) into locals (first chunk overwrites, rest +=).
+        let total = g.total;
+        let nchunks = total.max(1).div_ceil(self.max_chunk);
+        for ch in 0..nchunks {
+            let c0 = ch * self.max_chunk;
+            let nc = total.saturating_sub(c0).min(self.max_chunk) as u32;
+            add(
+                &mut pb,
+                "m2ls1",
+                &self.s1_layout,
+                &[&b.mom, &b.gsrc, &b.cen, &b.gdst, &b.slots],
+                [0, d, nc, c0 as u32],
+                PassKind::S1,
+                nc,
             );
-            if ct_ == 0 {
+            add(
+                &mut pb,
+                "m2lred",
+                &self.red_layout,
+                &[&b.slots, &b.gs, &b.gc, &b.loc],
+                [ncells, d, c0 as u32, nc],
+                PassKind::Red,
+                ncells * d,
+            );
+        }
+        for l in 0..nlevels {
+            let (eoff, ne) = (
+                ct.edge_off[l] as u32,
+                (ct.edge_off[l + 1] - ct.edge_off[l]) as u32,
+            );
+            if ne == 0 {
                 continue;
             }
             add(
                 &mut pb,
-                "l2l",
-                &self.l2l_layout,
-                &[&b.loc, &b.cen, &b.ch, &b.levels],
-                [d, ct_, lo, 0],
-                PassKind::L2l,
-                ct_,
+                "l2le",
+                &self.l2le_layout,
+                &[&b.loc, &b.cen, &b.epar, &b.echd],
+                [d, ne, eoff, 0],
+                PassKind::L2lE,
+                ne,
             );
         }
         add(
@@ -1916,68 +2488,88 @@ impl GpuBackend {
             ),
         ));
         let mut t_m2m = 0.0;
+        let mut t_m2mr = 0.0;
         {
             let (ct, _, _, _, _) = self.tables.as_ref().unwrap();
             for l in (0..nlevels).rev() {
-                let (lo, ct_) = (
-                    ct.level_off[l] as u32,
-                    (ct.level_off[l + 1] - ct.level_off[l]) as u32,
+                let (eoff, ne) = (
+                    ct.edge_off[l] as u32,
+                    (ct.edge_off[l + 1] - ct.edge_off[l]) as u32,
                 );
-                if ct_ == 0 {
+                if ne == 0 {
                     continue;
                 }
                 t_m2m += self.submit(
-                    "m2m",
-                    &self.m2m_pipe,
-                    &self.m2m_layout,
-                    &[&b.mom, &b.cen, &b.ch, &b.levels],
-                    &[d, ct_, lo, 0],
-                    ct_,
+                    "m2mp",
+                    &self.m2mp_pipe,
+                    &self.m2mp_layout,
+                    &[&b.mom, &b.cen, &b.epar, &b.echd, &b.mpart],
+                    &[d, ne, eoff, 0],
+                    ne,
+                );
+                let (ioff, ni) = (
+                    ct.int_off[l] as u32,
+                    (ct.int_off[l + 1] - ct.int_off[l]) as u32,
+                );
+                if ni == 0 {
+                    continue;
+                }
+                t_m2mr += self.submit(
+                    "m2mr",
+                    &self.m2mr_pipe,
+                    &self.m2mr_layout,
+                    &[&b.mpart, &b.ch, &b.emap, &b.mom, &b.ipar],
+                    &[d, ni, ioff, 0],
+                    ni,
                 );
             }
         }
-        out.push(("m2m-all", t_m2m));
+        out.push(("m2m-part", t_m2m));
+        out.push(("m2m-red", t_m2mr));
         let total = self.tables.as_ref().unwrap().1.total;
-        out.push((
-            "m2l-s1",
-            self.submit(
+        let nchunks = total.max(1).div_ceil(self.max_chunk);
+        let mut t_s1 = 0.0;
+        let mut t_red = 0.0;
+        for ch in 0..nchunks {
+            let c0 = ch * self.max_chunk;
+            let nc = total.saturating_sub(c0).min(self.max_chunk) as u32;
+            t_s1 += self.submit(
                 "m2ls1",
                 &self.s1_pipe,
                 &self.s1_layout,
                 &[&b.mom, &b.gsrc, &b.cen, &b.gdst, &b.slots],
-                &[0, d, total.max(1) as u32, 0],
-                total.max(1) as u32,
-            ),
-        ));
-        out.push((
-            "m2l-red",
-            self.submit(
+                &[0, d, nc, c0 as u32],
+                nc,
+            );
+            t_red += self.submit(
                 "m2lred",
                 &self.red_pipe,
                 &self.red_layout,
                 &[&b.slots, &b.gs, &b.gc, &b.loc],
-                &[ncells as u32, d, 0, 0],
+                &[ncells as u32, d, c0 as u32, nc],
                 ncells as u32 * d,
-            ),
-        ));
+            );
+        }
+        out.push(("m2l-s1", t_s1));
+        out.push(("m2l-red", t_red));
         let mut t_l2l = 0.0;
         {
             let (ct, _, _, _, _) = self.tables.as_ref().unwrap();
             for l in 0..nlevels {
-                let (lo, ct_) = (
-                    ct.level_off[l] as u32,
-                    (ct.level_off[l + 1] - ct.level_off[l]) as u32,
+                let (eoff, ne) = (
+                    ct.edge_off[l] as u32,
+                    (ct.edge_off[l + 1] - ct.edge_off[l]) as u32,
                 );
-                if ct_ == 0 {
+                if ne == 0 {
                     continue;
                 }
                 t_l2l += self.submit(
-                    "l2l",
-                    &self.l2l_pipe,
-                    &self.l2l_layout,
-                    &[&b.loc, &b.cen, &b.ch, &b.levels],
-                    &[d, ct_, lo, 0],
-                    ct_,
+                    "l2le",
+                    &self.l2le_pipe,
+                    &self.l2le_layout,
+                    &[&b.loc, &b.cen, &b.epar, &b.echd],
+                    &[d, ne, eoff, 0],
+                    ne,
                 );
             }
         }
@@ -2058,6 +2650,59 @@ impl GpuBackend {
         out
     }
 
+    /// Install finished background tables: budget check, uploads, frozen
+    /// binds, then swap. On Err(GpuError) the installed tables/binds/bufs
+    /// are left untouched (caller falls back to CPU).
+    fn install_tables(&mut self, rt: RefreshTables, n: usize) -> Result<(), GpuError> {
+        let RefreshTables { ct, g, pl, fj, order } = rt;
+        let ncells = ct.centers.len();
+        let nedges = ct.edge_par.len();
+        self.ensure(
+            ncells,
+            n,
+            g.total,
+            nedges,
+            pl.list.len(),
+            fj.njobs,
+            fj.nfat,
+        )
+        .map_err(GpuError::OverBudget)?;
+        let b = self.bufs.as_ref().unwrap();
+        self.upload(&b.cen, &ct.centers);
+        self.upload(&b.cf, &ct.cfirst);
+        self.upload(&b.cc, &ct.ccount);
+        self.upload(&b.ch, &ct.children);
+        let leaf_u32: Vec<u32> = ct.leaf_ids.clone();
+        self.upload(&b.leaves, &leaf_u32);
+        let lvl_u32: Vec<u32> = ct.level_cells.iter().map(|&c| c).collect();
+        self.upload(&b.levels, &lvl_u32);
+        self.upload(&b.cos, &ct.cell_of_slot);
+        self.upload(&b.gsrc, &g.gsrc);
+        self.upload(&b.gdst, &g.gdst);
+        self.upload(&b.gs, &g.starts);
+        self.upload(&b.gc, &g.counts);
+        self.upload(&b.pbs, &pl.start);
+        self.upload(&b.pbc, &pl.count);
+        self.upload(&b.epar, &ct.edge_par);
+        self.upload(&b.echd, &ct.edge_chd);
+        self.upload(&b.emap, &ct.edge_map);
+        self.upload(&b.ipar, &ct.int_par);
+        self.upload(&b.pbl, &pl.list);
+        self.upload(&b.fjob_s0, &fj.job_s0);
+        self.upload(&b.fjob_cc, &fj.job_cc);
+        self.upload(&b.fjob_o, &fj.job_off);
+        self.upload(&b.fjob_n, &fj.job_len);
+        self.upload(&b.ffstart, &fj.fat_start);
+        self.upload(&b.ffcf, &fj.fat_cf);
+        self.upload(&b.ffcc, &fj.fat_cc);
+        // Freeze pass binds for the next k steps (counts/offsets are
+        // refresh-stable; buffers outlive in bufs + binds).
+        let binds = self.build_binds(&ct, &g, &fj, ncells as u32, n as u32, DIM as u32);
+        self.binds = Some(binds);
+        self.tables = Some((ct, g, pl, fj, order));
+        Ok(())
+    }
+
     /// Force evaluation with explicit refresh control (harness use).
     /// Err(GpuError) on over-budget buffers or a broken tree invariant;
     /// callers fall back to CPU instead of hitting wgpu validation.
@@ -2069,7 +2714,6 @@ impl GpuBackend {
         refresh: bool,
     ) -> Result<Vec<[f64; 3]>, GpuError> {
         let n = pos.len();
-        let nt = nthreads();
         self.parts.clear();
         self.parts.reserve(n);
         for i in 0..n {
@@ -2078,88 +2722,41 @@ impl GpuBackend {
                 pos: pos[i],
             });
         }
+        // Pipelined refresh: the ~140ms CPU rebuild runs on a background
+        // thread while stepping continues on the installed tables.
+        // - no tables yet (first call): build + install synchronously.
+        // - finished build waiting: join + install on this step.
+        // - refresh due, none in flight: snapshot positions, spawn, step on.
+        // - otherwise (build in flight): keep stepping on installed tables.
+        // Effective frozen stretch is k + build steps; install itself is only
+        // uploads + frozen binds. bufs/tables stay valid on every Err path.
+        // Synchronous rebuild on refresh (or first call). Pipelining this on
+        // a background thread was reverted: it stretched the effective frozen
+        // age to k + build steps and disks ran away secularly past age ~8.
         if refresh || self.tables.is_none() {
-            let tree = Octree::build(&self.parts, N_LEAF);
-            let bodies = fmm::bodies::Bodies::from_parts(&self.parts, &tree.order);
-            let d = DIM;
-            let ncells = tree.cells.len();
-            let mut moments = vec![fmm::harmonic::C::ZERO; ncells * d];
-            fmm::moments::compute_moments_par(&bodies, &tree, P, &mut moments, nt);
-            let pows = fmm::moments::multipole_power(&moments, ncells, P);
-            let binom = fmm::moments::binomials(P);
-            let (_, fmin) = fmm::mac::f_prepass_par(&bodies, &tree, nt);
-            let rec = fmm::walk::record_pairs_par(
-                &bodies, &tree, P, EPS, &pows, &binom, &fmin, &moments, nt,
-            );
-            let g = group_m2l(&rec.pairs, ncells);
-            let ct = cell_tables(&tree, n);
-            let mut pl = build_p2p_bodies(&rec.p2p, ncells, &ct.leaf_ids, &ct.cfirst, &ct.ccount);
-            // Kernels address 64 lanes max: graceful fallback, not a mid-run
-            // panic (split_fat re-checks the fat path identically).
-            if let Some(&l) = ct
-                .leaf_ids
-                .iter()
-                .find(|&&l| ct.ccount[l as usize] > 64)
-            {
-                return Err(GpuError::OverfullLeaf {
-                    leaf: l,
-                    count: ct.ccount[l as usize],
-                });
-            }
-            let fj = split_fat(
-                &mut pl,
-                &ct.leaf_ids,
-                &ct.cfirst,
-                &ct.ccount,
-                FAT_THR,
-                FAT_CHUNK,
-            )?;
-            self.ensure(ncells, n, g.total, pl.list.len(), fj.njobs, fj.nfat)
-                .map_err(GpuError::OverBudget)?;
-            let b = self.bufs.as_ref().unwrap();
-            self.upload(&b.cen, &ct.centers);
-            self.upload(&b.cf, &ct.cfirst);
-            self.upload(&b.cc, &ct.ccount);
-            self.upload(&b.ch, &ct.children);
-            let leaf_u32: Vec<u32> = ct.leaf_ids.clone();
-            self.upload(&b.leaves, &leaf_u32);
-            let lvl_u32: Vec<u32> = ct.level_cells.iter().map(|&c| c).collect();
-            self.upload(&b.levels, &lvl_u32);
-            self.upload(&b.cos, &ct.cell_of_slot);
-            self.upload(&b.gsrc, &g.gsrc);
-            self.upload(&b.gdst, &g.gdst);
-            self.upload(&b.gs, &g.starts);
-            self.upload(&b.gc, &g.counts);
-            self.upload(&b.pbs, &pl.start);
-            self.upload(&b.pbc, &pl.count);
-            self.upload(&b.pbl, &pl.list);
-            self.upload(&b.fjob_s0, &fj.job_s0);
-            self.upload(&b.fjob_cc, &fj.job_cc);
-            self.upload(&b.fjob_o, &fj.job_off);
-            self.upload(&b.fjob_n, &fj.job_len);
-            self.upload(&b.ffstart, &fj.fat_start);
-            self.upload(&b.ffcf, &fj.fat_cf);
-            self.upload(&b.ffcc, &fj.fat_cc);
-            // Freeze pass binds for the next k steps (counts/offsets are
-            // refresh-stable; buffers outlive in bufs + binds).
-            let binds = self.build_binds(&ct, &g, &fj, ncells as u32, n as u32, DIM as u32);
-            self.binds = Some(binds);
-            self.tables = Some((ct, g, pl, fj, tree.order.clone()));
+            let rt = build_refresh_tables(self.parts.clone())?;
+            self.install_tables(rt, n)?;
         }
-        let (_ct, _g, _pl, _fj, order) = self.tables.as_ref().unwrap();
-        let bodies = fmm::bodies::Bodies::from_parts(&self.parts, order);
-        let pos: Vec<[f32; 4]> = (0..n)
-            .map(|k| {
-                [
-                    bodies.x[k] as f32,
-                    bodies.y[k] as f32,
-                    bodies.z[k] as f32,
-                    bodies.m[k] as f32,
-                ]
-            })
-            .collect();
+        self.frozen_step(n)
+    }
+
+    /// One force eval on the installed tables (positions re-uploaded, GPU
+    /// recomputes moments/locals, accels read back + scattered to id order).
+    fn frozen_step(&mut self, n: usize) -> Result<Vec<[f64; 3]>, GpuError> {
+        let order = self.tables.as_ref().unwrap().4.clone();
+        self.bodies.gather_into(&self.parts, &order);
+        let bodies = &self.bodies;
+        self.stage_pos.resize(n, [0.0; 4]);
+        for k in 0..n {
+            self.stage_pos[k] = [
+                bodies.x[k] as f32,
+                bodies.y[k] as f32,
+                bodies.z[k] as f32,
+                bodies.m[k] as f32,
+            ];
+        }
         let b = self.bufs.as_ref().unwrap();
-        self.upload(&b.pos, &pos);
+        self.upload(&b.pos, &self.stage_pos);
         // Encode from cached binds: zero buffer/bindgroup allocation on
         // non-refresh steps (all ~30 were created per step before).
         let binds = self.binds.as_ref().expect("binds built on refresh");
@@ -2173,10 +2770,11 @@ impl GpuBackend {
             // only the pipeline + cached group.
             let pipe: &wgpu::ComputePipeline = match kind {
                 PassKind::P2m => &self.p2m_pipe,
-                PassKind::M2m => &self.m2m_pipe,
+                PassKind::M2mP => &self.m2mp_pipe,
+                PassKind::M2mR => &self.m2mr_pipe,
                 PassKind::S1 => &self.s1_pipe,
                 PassKind::Red => &self.red_pipe,
-                PassKind::L2l => &self.l2l_pipe,
+                PassKind::L2lE => &self.l2le_pipe,
                 PassKind::L2p => &self.l2p_pipe,
                 PassKind::P2p => &self.p2p_pipe,
                 PassKind::Fat => &self.fat_pipe,
@@ -2210,12 +2808,13 @@ impl GpuBackend {
         // Scatter slot order back to particle-id order (Physics contract,
         // matching Fmm::run_threaded).
         let order = &self.tables.as_ref().unwrap().4;
-        let mut out = vec![[0.0; 3]; n];
+        self.stage_out.resize(n, [0.0; 3]);
         for (k, &id) in order.iter().enumerate() {
-            out[id as usize] = [got[k][0] as f64, got[k][1] as f64, got[k][2] as f64];
+            self.stage_out[id as usize] =
+                [got[k][0] as f64, got[k][1] as f64, got[k][2] as f64];
         }
-        crate::sim::cap_accel(&mut out);
-        Ok(out)
+        crate::sim::cap_accel(&mut self.stage_out);
+        Ok(self.stage_out.clone())
     }
 
     /// Compatibility wrapper: panics with the budget message instead of a
@@ -2243,11 +2842,7 @@ impl GpuBackend {
 
     /// Fallible refresh-every-k-th-step entry point for the app: on
     /// Err(GpuError) the caller swaps in the CPU FMM backend.
-    pub fn try_accel(
-        &mut self,
-        pos: &[[f64; 3]],
-        mass: &[f64],
-    ) -> Result<Vec<[f64; 3]>, GpuError> {
+    pub fn try_accel(&mut self, pos: &[[f64; 3]], mass: &[f64]) -> Result<Vec<[f64; 3]>, GpuError> {
         let refresh = self.step % self.k == 0;
         self.try_accel_with_refresh(pos, mass, refresh)
     }

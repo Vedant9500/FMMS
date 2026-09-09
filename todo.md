@@ -1,5 +1,95 @@
 # TODO — remaining Phase-1 gates + session log
 
+## Session log — 2026-09-09: pipeline revert (secular runaway) + secular gate
+
+CORRECTION to the stutter entry below: the pipelined background refresh
+evaporated disks and was reverted same-day. Repro: 30k spiral gpusim pinned
+max|v| at the 5.0 clamp from step ~37 (stars gone, gas fine — gas is capped /
+relaxed / respawned). Bisection: sync k=8 bounded 200 steps (~3.2), sync k=16
+also ran away → pure tree-age staleness, not an install bug. Instantaneous
+force error (flat to k=16) does not predict secular heating; cliff between
+age 8 and 16 at 30k. Rule learned: installed tree age never exceeds k.
+Kept from the pipeline work: build/install/frozen-step split (sync calls),
+all render-side fixes (cursor/rate/channel/upload), all GPU kernels.
+New ignored release gate `spiral_30k_200steps_stays_bound` (max|v| < 4.2,
+zero escapers) pins the failure mode; first lever on failure is k 8->4.
+Back to sync profile: ~28ms avg / ~140ms refresh @100k, hitches now ride the
+jitter buffer instead of the old hunting cursor.
+
+
+## Session log — 2026-09-09: periodic stutter hunt (1% lows at burst cadence)
+
+Symptom: sine-like slow/fast wave, 2-3Hz @100k, 0.5-1Hz @300k, worse with N.
+Cause (proven, no product edits during diagnosis): GPU refresh bursts
+([13x7,140]ms @100k, [30x7,393]ms @300k, k=8) beating against the render
+cursor. The 0.25x-1.5x occupancy feedback WAS the wave generator; the
+per-window span/wall rate estimate aliased bursts (+8% mean, gap-pop
+overshoot) and the feedback only masked it. Cursor-loop simulation driven by
+measured arrivals reproduced playout locked to burst period (0.52x-1.63x @300k
+pattern). Gas ruled out (strided/trickle by construction), upload ruled out
+(constant/frame).
+
+Fixes (all four, each measured):
+1. Jitter buffer rework (`sim.rs`/`main.rs`): exact-4s-window rate (left edge
+   interpolated, kills aliasing to ~1%), adaptive target (worst gap + margin,
+   0.4-1.0s), weak spring on slow-filtered occupancy (k=0.3/1% EMA). Sim:
+   100k 0.97-1.02x zero >5%, 300k 0.91-1.10x. Tests: rate/gap/target pins +
+   k=4 + k=8-with-hitches uniform-ride rig (speed-normalized <2x).
+2. Pipelined background refresh (`gpufmm.rs`): rebuild on `gpu-refresh`
+   thread while stepping on installed tables; install (uploads+binds) on
+   completion. 100k avg 29->13ms, max 140->18ms; 300k 76->33ms, max 393->38ms;
+   20k 7.3->3.9ms. Effective frozen stretch k+build steps (inside flat frozen
+   envelope to k=16). k=1 perpetual-build stress + 24-step gpusim green.
+3. Dead upload cut (`render.rs`/`gpu.rs`/`main.rs`): prev buffer dead at
+   alpha=1 (all shaders curr-only) + per-frame sqrt fed unread `.speed`.
+   Upload 19.2->9.6MB/frame @300k; probe sparse+cluster PPM-identical.
+4. Non-blocking snapshot send (`physics_loop` try_send, drop-newest): physics
+   clock never stalls on a full queue; interpolation covers coarser spans.
+
+58 visual green, gpu_matches_cpu green (incl. PROBE_CHUNK_PAIRS=500),
+zero build warnings (clippy hits all pre-existing fmm ones).
+
+
+## Session log — 2026-09-09: gpufmm full audit + optimization pass (measured A/B, RTX 4060)
+
+Function-by-function audit of `crates/visual/src/gpufmm.rs` vs Dehnen-2014 CPU
+reference (harmonic/translate/moments) + probe A/B. No math mistakes found in
+the app path (gpu-vs-cpu-fmm max 8.5e-6, exact pipeline agreement); one real
+bug: `--m2l/--m2lacc/--gpufull` probe harnesses bit-rotted after the gr-on-GPU
+change (4-binding s1 vs 6-binding layout, panicked on bind creation). Fixed to
+centers+gdst; triangle green again (mean vs direct = truncation floor 5.6e-3).
+
+Implemented, each A/B isolated at 100k (gpuprof split-total + k=8 gpuloop avg):
+- Per-edge M2M/L2L (edges grouped by parent level, edges(l)=cells(l+1); M2M via
+  per-edge partials + dense internal-parent reduce, L2L raceless per-edge):
+  sweeps 7.28 -> 2.98ms (m2m 3.65->1.7, l2l 3.63->1.1). 59% off sweeps.
+- Division cull (theta single-ir2 hoist; upsilon 1/(2m)+1/(n^2-m^2) literal
+  tables via new `wgsl_helpers(p)`): no measurable gain (11.65->11.58ms) —
+  sweeps are local-memory/occupancy bound, not divider bound. Kept (exact,
+  gate holds, removes ~15 divs/table for future unroll work).
+- P2P 2NR->1NR (rsqrt~14b +1NR ~= 28b covers f32 23+1b; 2nd step was
+  f32-invisible): 1.50->1.38ms, gpu-vs-cpu max 8.8e-6 (was 8.5e-6). Keep.
+- k=4->8 (`main.rs` default): frozen-tree mean 5.5e-3 == truncation floor to
+  k=16 (`--gpureuse` 1/2/4/8/16 flat); avg step 43.3->28.4ms @100k (1.5x).
+  k=16 hits 21ms (+20% over floor) — left as documented lever.
+- Staging reuse (`Bodies::gather_into` + cached pos/out vecs): ~0.5ms, kept
+  (kills ~8MB alloc/free per step @100k, zero risk).
+- Chunked M2L (slots cap 7/8 binding limit, s1/red windowed [c0,c0+nc), first
+  chunk overwrites / rest +=): 300k Unhandleable (245MB > 128MB binding wall)
+  now runs at 24ms GPU / 76ms avg k=8. N unbounded (1M ~= 9 chunks).
+  Multi-chunk proven exact via `PROBE_CHUNK_PAIRS=500` gate run.
+
+Totals @100k: GPU non-refresh 17-18 -> 12-13ms; avg k=8 43->29ms (34/s);
+@20k 7.3ms avg (137/s); @300k 76ms avg (13/s, was OverBudget panic).
+56 visual + 35 fmm-lib green, zero build warnings (clippy fail is the
+pre-existing rotation.rs erasing_op deny, file off-limits).
+
+At the limit now, in order: refresh CPU (prepass 70 + record 50ms @100k, 91%
+of refresh) needs geometric-MAC-for-visual or GPU traversal (S5); sweeps+M2L
+(~6ms) need const-index unrolled codegen (local-memory bound, div cull proved
+it); k=16 for 21ms avg. Chunking closed the capacity wall, not the rate wall.
+
+
 Source of truth for exit gates: `ROADMAP.md` Phase 1 (lines 34-48).
 
 ## Session log — 2026-09-07: 0.5-1Hz motion breathe (cursor starvation)

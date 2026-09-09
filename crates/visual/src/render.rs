@@ -26,9 +26,12 @@ struct Out {
 
 @vertex
 fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> Out {
-    let alpha = u.params.y;
-    let p = mix(prev[ii].pos, curr[ii].pos, alpha);
-    let tm = mix(prev[ii].misc.xyz, curr[ii].misc.xyz, alpha);
+    // Staging uploads the fully interpolated state into curr every frame, so
+    // the shader reads curr directly. The old mix(prev, curr, alpha) with a
+    // CPU-lerped curr squared the blend into an easing curve AND paid a full
+    // extra buffer of GPU reads; prev stays bound (layout churn) but unread.
+    let p = curr[ii].pos;
+    let tm = curr[ii].misc.xyz;
     let corners = array<vec2<f32>, 4>(
         vec2<f32>(-0.5, -0.5), vec2<f32>(0.5, -0.5),
         vec2<f32>(-0.5, 0.5), vec2<f32>(0.5, 0.5));

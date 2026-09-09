@@ -890,15 +890,125 @@ pub struct HistSnap {
     pub arrival: std::time::Instant,
 }
 
-/// Advance a sim-time playout cursor. Occupancy feedback (0.25x..1.5x)
-/// keeps bracketing snaps live through bursty arrivals; past the newest
-/// snap the cursor glides on ballistic extrapolation (snap velocities, via
-/// `bracket`'s extra term) for up to CURSOR_EXTRA_WALL of wall time.
-/// That allowance covers arrival gaps from slow GPU-refresh steps at large
-/// N: the old hard 2-step ceiling froze motion whenever snaps stalled and
-/// then fast-forwarded on catch-up — the periodic breathe. Drift during a
-/// gap is bounded by rate*EXTRA_WALL and blends back on resume.
+/// Advance a sim-time playout cursor. Weak-spring level control on
+/// SLOW-FILTERED occupancy: `slow` (1%/frame EMA, ~1.7s at 60fps) tracks the
+/// buffer level while ignoring burst swings, and the spring (30%) centers
+/// the level with <5% ripple. Every simpler scheme failed in simulation:
+/// continuous 0.25x..1.5x feedback WAS the periodic wave; deadband-only
+/// rested on band edges (chronic 0.9x); stiff springs re-imprinted the
+/// swing. Past the newest snap the cursor crawls at 0.25x on ballistic
+/// extrapolation (snap velocities, via `bracket`'s extra term) for up to
+/// CURSOR_EXTRA_WALL of wall time. Drift during a gap is bounded by
+/// rate*EXTRA_WALL and blends back on resume.
 pub const CURSOR_EXTRA_WALL: f64 = 0.5;
+/// Occupancy filter: fraction of each frame's occupancy mixed into `slow`.
+pub const CURSOR_SLOW_ALPHA: f64 = 0.01;
+/// Spring stiffness on the filtered level error.
+pub const CURSOR_SPRING_K: f64 = 0.3;
+
+/// Burst-proof playout rate: sim-time span / wall span over an EXACT 2s
+/// window (left edge linearly interpolated between bracketing stamps).
+/// The naive stamp-to-stamp span/wall overshoots: trimming the front pops
+/// whole 140-400ms refresh gaps at once, so the window wall reads short
+/// with a full step count (+8% mean, 1.0-1.14x ripple measured). Exact
+/// windows read the true mean to ~1% (one interpolation step), so the
+/// cursor holds rate through gaps and bursts alike.
+pub struct RateWindow {
+    dq: std::collections::VecDeque<(std::time::Instant, f64)>,
+    window: std::time::Duration,
+}
+
+impl RateWindow {
+    pub fn new(window_secs: f64) -> Self {
+        Self {
+            dq: std::collections::VecDeque::new(),
+            window: std::time::Duration::from_secs_f64(window_secs.max(0.1)),
+        }
+    }
+
+    pub fn push(&mut self, at: std::time::Instant, sim: f64) {
+        self.dq.push_back((at, sim));
+        // Keep the newest stamp older than the cutoff as the interpolation
+        // bracket; drop anything strictly older.
+        while self.dq.len() > 2 {
+            let back = self.dq.back().map(|b| b.0).unwrap();
+            let second = self.dq.get(1).map(|s| s.0).unwrap();
+            if second + self.window <= back {
+                self.dq.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn sim_at(&self, cut: std::time::Instant) -> Option<f64> {
+        // Linear interpolation between bracketing stamps (dq[0] oldest).
+        let mut prev = self.dq.front()?;
+        if cut <= prev.0 {
+            return None;
+        }
+        for s in self.dq.iter().skip(1) {
+            if s.0 >= cut {
+                let span = (s.0 - prev.0).as_secs_f64();
+                if span <= 1e-12 {
+                    return Some(s.1);
+                }
+                let a = (cut - prev.0).as_secs_f64() / span;
+                return Some(prev.1 + (s.1 - prev.1) * a.clamp(0.0, 1.0));
+            }
+            prev = s;
+        }
+        None
+    }
+
+    /// Mean sim/wall rate over the exact window ending at the newest stamp;
+    /// 0.0 until the window fills past one full span.
+    pub fn rate(&self) -> f64 {
+        let b = match self.dq.back() {
+            Some(b) => b,
+            None => return 0.0,
+        };
+        let cut = match b.0.checked_sub(self.window) {
+            Some(c) => c,
+            None => return 0.0,
+        };
+        match self.sim_at(cut) {
+            Some(s0) => {
+                let wall = (b.0 - cut).as_secs_f64();
+                if wall <= 1e-9 {
+                    return 0.0;
+                }
+                ((b.1 - s0) / wall).max(0.0)
+            }
+            None => 0.0,
+        }
+    }
+
+    /// Worst inter-arrival gap visible at `now`: retained consecutive gaps
+    /// plus the still-open gap since the newest stamp. The open term lets
+    /// the playout target grow live through a refresh stall instead of
+    /// discovering it after the burst. Drives the adaptive target: the
+    /// buffer must cover one full refresh gap plus margin at every N.
+    pub fn max_gap(&self, now: std::time::Instant) -> f64 {
+        let mut mg: f64 = 0.0;
+        let (a, b) = self.dq.as_slices();
+        for w in a.windows(2).chain(b.windows(2)) {
+            mg = mg.max((w[1].0 - w[0].0).as_secs_f64());
+        }
+        if let Some(last) = self.dq.back() {
+            mg = mg.max((now - last.0).as_secs_f64().max(0.0));
+        }
+        mg.max(0.0)
+    }
+}
+
+/// Playout buffer target (wall seconds) from the worst recent arrival gap:
+/// cover the gap plus 0.25s margin, bounded 0.4..1.0s. Fixed 0.3s starved
+/// every 0.4s refresh gap at 300k (cursor hit back and crawled at 0.25x);
+/// fixed 1.0s would lag small-N runs needlessly.
+pub fn target_wall_for_gap(max_gap: f64) -> f64 {
+    (max_gap + 0.25).clamp(0.4, 1.0)
+}
 
 pub fn advance_cursor(
     cur: f64,
@@ -908,10 +1018,16 @@ pub fn advance_cursor(
     dt: f64,
     wall_dt: f64,
     target_wall: f64,
+    slow: &mut f64,
 ) -> f64 {
-    let target = (rate * target_wall).clamp(2.0 * dt, 8.0 * dt);
+    let target = (rate * target_wall).clamp(2.0 * dt, 12.0 * dt);
     let occ = (back - cur).max(0.0);
-    let factor = (occ / target).clamp(0.25, 1.5);
+    if *slow <= 0.0 {
+        *slow = occ;
+    }
+    *slow += (occ - *slow) * CURSOR_SLOW_ALPHA;
+    let spring = 1.0 + CURSOR_SPRING_K * (*slow - target) / target;
+    let factor = if occ <= 0.0 { 0.25 } else { spring.clamp(0.5, 1.5) };
     let allow = (2.0 * dt).max(rate * CURSOR_EXTRA_WALL);
     (cur + wall_dt * rate * factor).clamp(front, back + allow)
 }
@@ -989,9 +1105,15 @@ pub fn physics_loop(mut sim: Sim, tx: std::sync::mpsc::SyncSender<Msg>, ctl: std
         let speed = *ctl.speed.lock().unwrap();
         sim.dt = *ctl.dt.lock().unwrap() * speed.max(0.01) as f64;
         sim.step();
-        let done = tx.send(Msg::Snap(snap_of(&sim))).is_err();
-        if done {
-            break;
+        // Non-blocking send: if the render thread is behind (queue full),
+        // drop this snapshot instead of stalling the physics clock. A stall
+        // would echo into the arrival stream as an extra gap, and the cursor
+        // would answer with another slow/fast hunt cycle. Interpolation
+        // covers the coarser spans; the next step sends again.
+        match tx.try_send(Msg::Snap(snap_of(&sim))) {
+            Ok(()) => {}
+            Err(std::sync::mpsc::TrySendError::Full(_)) => {}
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => break,
         }
     }
 }
@@ -1254,9 +1376,84 @@ mod tests {
 
     #[test]
     fn extrapolation_stays_bounded() {
-        let got = advance_cursor(1.0, 0.0, 1.0, 0.2, 0.01, 5.0, 0.30);
+        let got = advance_cursor(1.0, 0.0, 1.0, 0.2, 0.01, 5.0, 0.30, &mut 0.0);
         // Allowance is max(2dt, rate*0.5 wall) = 0.1 here, not 2dt = 0.02.
         assert!((got - 1.1).abs() < 1e-12, "{got}");
+    }
+
+    #[test]
+    fn cursor_spring_holds_rate_without_hunting() {
+        // Refresh-burst regression: with live brackets and the filtered level
+        // at target, the cursor must advance at exactly 1.0x — no slow/fast
+        // hunting. target=rate*0.5=0.1, occ pinned at 0.1 (slow pre-seeded).
+        let mut cur = 0.0;
+        let mut slow = 0.1;
+        for _ in 0..60 {
+            let next = advance_cursor(cur, cur - 1.0, cur + 0.1, 0.2, 0.01, 1.0 / 60.0, 0.50, &mut slow);
+            let step = next - cur;
+            assert!((step - 0.2 / 60.0).abs() < 1e-12, "hunting: {step}");
+            cur = next;
+        }
+        // Far overfull clamps the spring (1.5x ceiling, not unbounded).
+        let over = advance_cursor(0.0, 0.0, 100.0, 0.2, 0.01, 1.0 / 60.0, 0.50, &mut 0.1);
+        assert!((over - 1.5 * 0.2 / 60.0).abs() < 1e-12, "{over}");
+        // Underfull eases via the spring: 1+0.3*(0.04-0.1)/0.1 = 0.82x
+        // (not the old 0.25x crawl while brackets are live).
+        let under = advance_cursor(9.96, 0.0, 10.0, 0.2, 0.01, 1.0 / 60.0, 0.50, &mut 0.0);
+        assert!((under - 9.96 - 0.82 * 0.2 / 60.0).abs() < 1e-9, "{under}");
+        // Past-the-back still crawls (glide path, unchanged).
+        let past = advance_cursor(1.0, 0.0, 1.0, 0.2, 0.01, 1.0 / 60.0, 0.50, &mut 0.0);
+        assert!((past - 1.0 - 0.25 * 0.2 / 60.0).abs() < 1e-12, "{past}");
+        // Single-frame spikes barely move the filter (1% mixing).
+        let mut slow2 = 0.1;
+        let s0 = slow2;
+        advance_cursor(0.0, -1.0, 50.0, 0.2, 0.01, 1.0 / 60.0, 0.50, &mut slow2);
+        assert!(((slow2 - s0) - (50.0 - s0) * 0.01).abs() < 1e-12, "{slow2}");
+    }
+
+    #[test]
+    fn rate_window_ignores_bursts() {
+        use std::time::Duration;
+        let t0 = std::time::Instant::now();
+        let mut w = RateWindow::new(4.0);
+        // 7 fast + 1 refresh burst, k=8 @100k pattern; true mean 8 steps/s.
+        let gaps = [0.013, 0.013, 0.013, 0.013, 0.013, 0.013, 0.013, 0.140];
+        let mut at = 0.0;
+        let mut sim = 0.0;
+        for i in 0..160 {
+            w.push(t0 + Duration::from_secs_f64(at), sim);
+            at += gaps[i % 8];
+            sim += 0.01;
+        }
+        let r = w.rate();
+        // True long-run mean: 0.08 sim / 0.231 wall = 0.346 sim/s.
+        // Stamp-anchored span/wall read 1.0-1.14x with +8% mean (gap-pop
+        // overshoot); the exact 4s window holds phase wobble to ~1%.
+        assert!((r - 0.346).abs() < 0.02, "burst-aliased rate: {r}");
+        // Worst retained gap is the 0.140 refresh step; the still-open gap
+        // (0.2s past the newest stamp) dominates live.
+        assert!(
+            (w.max_gap(t0 + Duration::from_secs_f64(at)) - 0.140).abs() < 1e-9,
+            "gap: {}",
+            w.max_gap(t0 + Duration::from_secs_f64(at))
+        );
+        // `at` already includes the trailing 0.140 gap past the newest
+        // stamp; 0.06 more wall makes the open gap exactly 0.2.
+        assert!(
+            (w.max_gap(t0 + Duration::from_secs_f64(at + 0.06)) - 0.2).abs() < 1e-9,
+            "open gap: {}",
+            w.max_gap(t0 + Duration::from_secs_f64(at + 0.06))
+        );
+        assert!(
+            (target_wall_for_gap(0.140) - 0.4).abs() < 1e-9,
+            "target: {}",
+            target_wall_for_gap(0.140)
+        );
+        assert!(
+            (target_wall_for_gap(0.393) - 0.643).abs() < 1e-9,
+            "target300k: {}",
+            target_wall_for_gap(0.393)
+        );
     }
 
     #[test]
@@ -1268,8 +1465,9 @@ mod tests {
         let mut cur = 1.0;
         let mut first = 0.0;
         let mut last = 0.0;
+        let mut slow = 0.0;
         for f in 0..60 {
-            let next = advance_cursor(cur, 0.0, 1.0, 0.2, 0.01, 1.0 / 60.0, 0.30);
+            let next = advance_cursor(cur, 0.0, 1.0, 0.2, 0.01, 1.0 / 60.0, 0.30, &mut slow);
             if f == 0 {
                 first = next - cur;
             }
@@ -1807,27 +2005,42 @@ mod tests {
         assert!(swept > 0.2, "swept={swept}");
     }
 
-    #[test]
-    fn cursor_rides_bursty_arrivals_uniformly() {
+    /// Shared playout rig: replays an arrival-gap pattern at a frame
+    /// cadence (with optional periodic frame hitches) through the same
+    /// RateWindow + deadband-cursor logic as the app. Returns steady-state
+    /// per-frame (cursor delta, wall dt): smoothness is delta/wall (playout
+    /// speed) — a hitch frame legitimately covers more sim time.
+    fn replay_bursts(
+        gaps: &[f64],
+        frames: usize,
+        frame: f64,
+        hitch_every: usize,
+    ) -> Vec<(f64, f64)> {
         use std::time::Duration;
         let dt = 0.01;
-        let frame = 1.0 / 144.0;
-        let gaps = [0.017, 0.017, 0.017, 0.140];
         let t0 = std::time::Instant::now();
         let mut hist = VecDeque::new();
+        let mut win = RateWindow::new(2.0);
         let mut sim_time = 0.0;
         let mut next_at = 0.0;
         let mut gi = 0;
         let mut now = 0.0;
         let mut rate = 0.0;
         let mut sdt = dt;
+        let mut slow = 0.0;
         let mut cur: Option<f64> = None;
         let mut deltas = Vec::new();
         let mut prev = 0.0;
-        for _ in 0..900 {
-            now += frame;
+        for f in 0..frames {
+            let wdt = if hitch_every > 0 && f % hitch_every == hitch_every - 1 {
+                0.05
+            } else {
+                frame
+            };
+            now += wdt;
             while next_at <= now {
                 sim_time += dt;
+                let at = t0 + Duration::from_secs_f64(next_at);
                 hist.push_back(HistSnap {
                     pos: vec![[sim_time, 0.0, 0.0]],
                     vel: vec![[1.0, 0.0, 0.0]],
@@ -1836,9 +2049,10 @@ mod tests {
                     gas_flash: vec![0.0],
                     time: sim_time,
                     steps: 0,
-                    arrival: t0 + Duration::from_secs_f64(next_at),
+                    arrival: at,
                 });
-                next_at += gaps[gi % 4];
+                win.push(at, sim_time);
+                next_at += gaps[gi % gaps.len()];
                 gi += 1;
                 while hist.len() > 24 {
                     hist.pop_front();
@@ -1848,36 +2062,58 @@ mod tests {
                 let (f, b) = (hist.front().unwrap(), hist.back().unwrap());
                 let span = (b.time - f.time).max(1e-12);
                 sdt = (span / (hist.len() as f64 - 1.0)).max(1e-9);
-                let wall = (b.arrival - f.arrival).as_secs_f64().max(1e-6);
-                let inst = span / wall;
-                rate = if rate <= 0.0 {
-                    inst
-                } else {
-                    rate * 0.85 + inst * 0.15
-                };
+                let r = win.rate();
+                if r > 0.0 {
+                    rate = r;
+                }
             }
             let (f, b) = (hist.front().unwrap(), hist.back().unwrap());
-            let mut rt = match cur {
-                Some(t) => t,
-                None => {
-                    let target = (rate * 0.30).clamp(2.0 * sdt, 8.0 * sdt);
-                    (b.time - target).max(f.time)
+            let now_at = t0 + Duration::from_secs_f64(now);
+            let tw = target_wall_for_gap(win.max_gap(now_at));
+            // Mirror the app guard: hold until the rate window fills.
+            if rate > 0.0 {
+                let mut rt = match cur {
+                    Some(t) => t,
+                    None => {
+                        let target = (rate * tw).clamp(2.0 * sdt, 12.0 * sdt);
+                        (b.time - target).max(f.time)
+                    }
+                };
+                rt = advance_cursor(rt, f.time, b.time, rate, sdt, wdt.min(0.25), tw, &mut slow);
+                rt = rt.max(hist.front().unwrap().time);
+                while hist.len() >= 3 && hist[1].time <= rt {
+                    hist.pop_front();
                 }
-            };
-            rt = advance_cursor(rt, f.time, b.time, rate, sdt, frame, 0.30);
-            rt = rt.max(hist.front().unwrap().time);
-            while hist.len() >= 3 && hist[1].time <= rt {
-                hist.pop_front();
+                deltas.push((rt - prev, wdt));
+                prev = rt;
+                cur = Some(rt);
             }
-            deltas.push(rt - prev);
-            prev = rt;
-            cur = Some(rt);
         }
-        let tail = &deltas[300..];
-        let (mn, mx) = tail
-            .iter()
-            .fold((f64::INFINITY, 0.0f64), |(a, b), &d| (a.min(d), b.max(d)));
+        deltas
+    }
+
+    fn assert_uniform(deltas: &[(f64, f64)]) {
+        let tail = &deltas[deltas.len() / 3..];
+        let (mn, mx) = tail.iter().fold((f64::INFINITY, 0.0f64), |(a, b), &(d, w)| {
+            let v = d / w.max(1e-9);
+            (a.min(v), b.max(v))
+        });
         assert!(mn > 0.0, "cursor stalls: min {mn}");
-        assert!(mx / mn < 3.0, "pulsing: min {mn} max {mx}");
+        assert!(mx / mn < 2.0, "pulsing: min {mn} max {mx}");
+    }
+
+    #[test]
+    fn cursor_rides_bursty_arrivals_uniformly() {
+        // k=4 era pattern at 144fps (original regression scenario).
+        assert_uniform(&replay_bursts(&[0.017, 0.017, 0.017, 0.140], 900, 1.0 / 144.0, 0));
+        // k=8 @100k pattern at 60fps with render hitches every ~0.6s (the
+        // reported 2-3Hz stutter regime): deadband + windowed rate must hold
+        // uniform playout through gaps, bursts, and hitches alike.
+        assert_uniform(&replay_bursts(
+            &[0.013, 0.013, 0.013, 0.013, 0.013, 0.013, 0.013, 0.140],
+            1200,
+            1.0 / 60.0,
+            37,
+        ));
     }
 }

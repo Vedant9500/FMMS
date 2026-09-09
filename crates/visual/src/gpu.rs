@@ -19,6 +19,10 @@ pub struct Uniform {
 }
 
 pub struct GpuState {
+    /// Stale by design: kept allocated+bound so the storage layout (and the
+    /// gas bind groups sharing it) never churns. Nothing stages, uploads,
+    /// or shades from it since the billboard went curr-only.
+    #[allow(dead_code)]
     pub prev_buf: wgpu::Buffer,
     pub curr_buf: wgpu::Buffer,
     pub uniform_buf: wgpu::Buffer,
@@ -181,17 +185,13 @@ impl GpuState {
         self.gas_dust_view = gas_dust_view;
     }
 
-    pub fn upload(
-        &mut self,
-        queue: &wgpu::Queue,
-        prev: &[GpuItem],
-        curr: &[GpuItem],
-        uniform: &Uniform,
-    ) {
-        queue.write_buffer(&self.prev_buf, 0, bytemuck::cast_slice(prev));
+    /// Per-frame upload: curr (CPU-interpolated) + uniform only. prev_buf
+    /// stays allocated+bound for layout stability but is never written or
+    /// read (billboard takes curr directly at alpha=1). Halves upload bytes.
+    pub fn upload(&mut self, queue: &wgpu::Queue, curr: &[GpuItem], uniform: &Uniform) {
         queue.write_buffer(&self.curr_buf, 0, bytemuck::cast_slice(curr));
         queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(uniform));
         self.bytes_per_frame =
-            prev.len() * std::mem::size_of::<GpuItem>() * 2 + std::mem::size_of::<Uniform>();
+            curr.len() * std::mem::size_of::<GpuItem>() + std::mem::size_of::<Uniform>();
     }
 }
