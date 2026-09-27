@@ -11,3 +11,7 @@ fmm = { path = "../../crates/fmm" }
 [[bin]]
 name = "dataset"
 path = "src/bin/dataset.rs"
+
+[[bin]]
+name = "graph"
+path = "src/bin/graph.rs"

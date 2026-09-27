@@ -494,6 +494,207 @@ impl SnapshotData {
     }
 }
 
+pub struct NodeFeatures {
+    pub level: u32,
+    pub center: [f64; 3],
+    pub rho: f64,
+    pub mass: f64,
+    pub count: usize,
+    pub is_leaf: bool,
+    pub children: Vec<usize>,
+    pub leaf: Option<LeafFeatures>,
+}
+
+pub fn extract_nodes(parts: &[Particle], tree: &Octree) -> Vec<NodeFeatures> {
+    let mut nodes = Vec::with_capacity(tree.cells.len());
+    for c in &tree.cells {
+        let mut children = Vec::new();
+        for &ch in &c.children {
+            if ch >= 0 {
+                children.push(ch as usize);
+            }
+        }
+        let mut ids = Vec::with_capacity(c.count);
+        for k in c.first..c.first + c.count {
+            ids.push(tree.order[k] as usize);
+        }
+        let leaf = if c.leaf {
+            Some(leaf_features(parts, &ids, c.cen))
+        } else {
+            None
+        };
+        nodes.push(NodeFeatures {
+            level: c.level,
+            center: c.cen,
+            rho: c.rho,
+            mass: c.mass,
+            count: c.count,
+            is_leaf: c.leaf,
+            children,
+            leaf,
+        });
+    }
+    nodes
+}
+
+pub struct InteractionGraph {
+    pub nodes: Vec<NodeFeatures>,
+    pub incoming: Vec<Vec<usize>>,
+    pub p: usize,
+    pub eps: f64,
+}
+
+struct Pipeline {
+    bodies: fmm::bodies::Bodies,
+    moments: Vec<fmm::harmonic::C>,
+    pows: Vec<f64>,
+    binom: Vec<f64>,
+    fmin: Vec<f64>,
+}
+
+fn pipeline(parts: &[Particle], tree: &Octree, p: usize) -> Pipeline {
+    use fmm::harmonic::{dim, C};
+    let ncells = tree.cells.len();
+    let bodies = fmm::bodies::Bodies::from_parts(parts, &tree.order);
+    let mut moments = vec![C::ZERO; ncells * dim(p)];
+    fmm::moments::compute_moments(&bodies, tree, p, &mut moments);
+    let pows = fmm::moments::multipole_power(&moments, ncells, p);
+    let binom = fmm::moments::binomials(p);
+    let (_, fmin) = fmm::mac::f_prepass(&bodies, tree);
+    Pipeline {
+        bodies,
+        moments,
+        pows,
+        binom,
+        fmin,
+    }
+}
+
+pub struct GraphStats {
+    pub ncells: usize,
+    pub nleaves: usize,
+    pub total_edges: usize,
+    pub max_incoming: usize,
+    pub mean_incoming: f64,
+    pub per_level: Vec<(u32, usize, usize)>,
+}
+
+pub fn build_graph(parts: &[Particle], tree: &Octree, p: usize, eps: f64) -> InteractionGraph {
+    let ncells = tree.cells.len();
+    let pipe = pipeline(parts, tree, p);
+    let (off, idx) = tree.levels_csr();
+    let mut incoming: Vec<Vec<usize>> = vec![Vec::new(); ncells];
+    for l in 0..off.len() - 1 {
+        let cells = &idx[off[l]..off[l + 1]];
+        for &b in cells {
+            for &a in cells {
+                if a != b
+                    && fmm::mac::accept(a, b, &tree.cells, &pipe.pows, &pipe.binom, p, eps, &pipe.fmin)
+                {
+                    incoming[b].push(a);
+                }
+            }
+        }
+    }
+    InteractionGraph {
+        nodes: extract_nodes(parts, tree),
+        incoming,
+        p,
+        eps,
+    }
+}
+
+pub struct WalkCoverage {
+    pub walk_pairs: usize,
+    pub walk_p2p: usize,
+    pub same_level: usize,
+    pub covered_both_dirs: usize,
+    pub cross_level: usize,
+    pub cross_mass_share: f64,
+}
+
+pub fn walk_coverage(
+    parts: &[Particle],
+    tree: &Octree,
+    p: usize,
+    eps: f64,
+) -> (InteractionGraph, WalkCoverage) {
+    let pipe = pipeline(parts, tree, p);
+    let rec = fmm::walk::record_pairs_par(
+        &pipe.bodies,
+        tree,
+        p,
+        eps,
+        &pipe.pows,
+        &pipe.binom,
+        &pipe.fmin,
+        &pipe.moments,
+        1,
+    );
+    let g = build_graph(parts, tree, p, eps);
+    let mut same_level = 0;
+    let mut covered = 0;
+    let mut cross = 0;
+    let mut cross_mass = 0.0;
+    let mut total_mass = 0.0;
+    for &(a, b) in &rec.pairs {
+        let (a, b) = (a as usize, b as usize);
+        let m = tree.cells[a].mass + tree.cells[b].mass;
+        total_mass += m;
+        if tree.cells[a].level == tree.cells[b].level {
+            same_level += 1;
+            if g.incoming[b].contains(&a) && g.incoming[a].contains(&b) {
+                covered += 1;
+            }
+        } else {
+            cross += 1;
+            cross_mass += m;
+        }
+    }
+    (
+        g,
+        WalkCoverage {
+            walk_pairs: rec.pairs.len(),
+            walk_p2p: rec.p2p.len(),
+            same_level,
+            covered_both_dirs: covered,
+            cross_level: cross,
+            cross_mass_share: if total_mass > 0.0 {
+                cross_mass / total_mass
+            } else {
+                0.0
+            },
+        },
+    )
+}
+
+pub fn graph_stats(g: &InteractionGraph) -> GraphStats {
+    let ncells = g.nodes.len();
+    let nleaves = g.nodes.iter().filter(|n| n.is_leaf).count();
+    let total_edges: usize = g.incoming.iter().map(|v| v.len()).sum();
+    let max_incoming = g.incoming.iter().map(|v| v.len()).max().unwrap_or(0);
+    let mut per_level: Vec<(u32, usize, usize)> = Vec::new();
+    for (i, inc) in g.incoming.iter().enumerate() {
+        let l = g.nodes[i].level;
+        match per_level.iter_mut().find(|(x, _, _)| *x == l) {
+            Some(e) => {
+                e.1 += 1;
+                e.2 += inc.len();
+            }
+            None => per_level.push((l, 1, inc.len())),
+        }
+    }
+    per_level.sort_by_key(|(l, _, _)| *l);
+    GraphStats {
+        ncells,
+        nleaves,
+        total_edges,
+        max_incoming,
+        mean_incoming: total_edges as f64 / ncells.max(1) as f64,
+        per_level,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -599,5 +800,109 @@ mod tests {
         assert_eq!(back.a_near, snap.a_near);
         assert_eq!(back.a_far, snap.a_far);
         std::fs::remove_file(&path).ok();
+    }
+
+    fn two_body() -> Vec<Particle> {
+        vec![
+            Particle {
+                mass: 0.5,
+                pos: [-10.0, 0.0, 0.0],
+            },
+            Particle {
+                mass: 0.5,
+                pos: [10.0, 0.0, 0.0],
+            },
+        ]
+    }
+
+    #[test]
+    fn nodes_cover_particles() {
+        let mut parts = generate(ConfigTag::Cube, 256, 13);
+        normalize_to_unit_box(&mut parts);
+        let tree = Octree::build(&parts, 16);
+        let nodes = extract_nodes(&parts, &tree);
+        assert_eq!(nodes.len(), tree.cells.len());
+        let leaf_count: usize = nodes.iter().filter(|n| n.is_leaf).map(|n| n.count).sum();
+        assert_eq!(leaf_count, parts.len());
+        for (i, n) in nodes.iter().enumerate() {
+            assert_eq!(n.is_leaf, tree.is_leaf(i));
+            assert_eq!(n.level, tree.cells[i].level);
+            assert!((n.mass - tree.cells[i].mass).abs() < 1e-12);
+            assert_eq!(n.leaf.is_some(), n.is_leaf);
+        }
+    }
+
+    #[test]
+    fn well_separated_pair_lists_each_other() {
+        let parts = two_body();
+        let tree = Octree::build(&parts, 1);
+        let g = build_graph(&parts, &tree, 2, 1e-5);
+        let leaves: Vec<usize> = (0..g.nodes.len()).filter(|&i| g.nodes[i].is_leaf).collect();
+        assert_eq!(leaves.len(), 2);
+        for &dst in &leaves {
+            for &src in &leaves {
+                if src != dst {
+                    assert!(g.incoming[dst].contains(&src), "dst={dst} src={src}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn edges_are_same_level_theta_separated() {
+        let mut parts = generate(ConfigTag::Cube, 256, 17);
+        normalize_to_unit_box(&mut parts);
+        let tree = Octree::build(&parts, 16);
+        let g = build_graph(&parts, &tree, 4, 1e-3);
+        assert!(!g.incoming.iter().all(|v| v.is_empty()));
+        for (dst, srcs) in g.incoming.iter().enumerate() {
+            for &src in srcs {
+                assert_ne!(src, dst);
+                assert_eq!(g.nodes[src].level, g.nodes[dst].level);
+                let r = fmm::mac::theta(&tree.cells[src], &tree.cells[dst], {
+                    let dx = tree.cells[dst].cen[0] - tree.cells[src].cen[0];
+                    let dy = tree.cells[dst].cen[1] - tree.cells[src].cen[1];
+                    let dz = tree.cells[dst].cen[2] - tree.cells[src].cen[2];
+                    (dx * dx + dy * dy + dz * dz).sqrt()
+                });
+                assert!(r < 1.0, "theta={r}");
+            }
+        }
+        let mut found_close_unlisted = false;
+        for (dst, _) in g.incoming.iter().enumerate() {
+            for (src, _) in g.incoming.iter().enumerate() {
+                if src != dst
+                    && g.nodes[src].level == g.nodes[dst].level
+                    && !g.incoming[dst].contains(&src)
+                {
+                    found_close_unlisted = true;
+                }
+            }
+        }
+        assert!(found_close_unlisted, "every pair listed: split is vacuous");
+    }
+
+    #[test]
+    fn graph_deterministic() {
+        let build = || {
+            let mut parts = generate(ConfigTag::Clumps, 256, 23);
+            normalize_to_unit_box(&mut parts);
+            let tree = Octree::build(&parts, 16);
+            build_graph(&parts, &tree, 4, 1e-3)
+        };
+        let a = build();
+        let b = build();
+        assert_eq!(a.incoming, b.incoming);
+        assert_eq!(a.nodes.len(), b.nodes.len());
+    }
+
+    #[test]
+    fn walk_same_level_pairs_are_listed() {
+        let mut parts = generate(ConfigTag::Cube, 256, 29);
+        normalize_to_unit_box(&mut parts);
+        let tree = Octree::build(&parts, 16);
+        let (_, cov) = walk_coverage(&parts, &tree, 4, 1e-3);
+        assert!(cov.same_level > 0, "no same-level walk pairs");
+        assert_eq!(cov.covered_both_dirs, cov.same_level);
     }
 }

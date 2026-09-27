@@ -148,12 +148,47 @@ Measured data forced five revisions:
    against FMMS honest. Do not "fix" the dynamic range by softening the
    data; fix it in the loss (lesson 1).
 
+## Gap verdicts (measured against the walk's own pair decomposition)
+
+`graph --walk` runs FMMS's `record_pairs_par` — the walk's exact M2L/P2P
+sets — against our lists (p=8, grid: 4 configs × N 256/1024/4096 × eps
+1e-5/1e-3). `covered == same_level` in all 24 runs: our lists are an exact
+superset of the walk's same-level pairs.
+
+**G1 — same-level keeps the rule, loses ~half the walk's pairs.**
+Cross-level share by count: cube ~0–14% (uniform/shallow trees) vs
+plummer/clumps/mixed 40–82%; by source mass 0.36–0.87, worst in
+concentrated configs. The "≥80% same-level" guess was FALSE. Mitigating
+facts: our directed lists carry 2–3× the walk's pair volume (one-sided
+accepts the walk would split are valid learned paths), and every listed
+edge is a true accept. Decision: keep same-level for v1. Consequences:
+(a) cross-level edges are the prime v2 extension; (b) cross-scale flow must
+travel multi-hop (same-level + up/down passes), so v1 needs ≥2
+message-passing steps or it accepts the gap; (c) concentrated configs
+suffer most — watch them in eval.
+
+**G2 — sparsity is honest, not a blocker.** Thin lists (mean_in 1–9)
+coincide with small far_frac (0.07–0.32); dense lists (200–450) with large
+far_frac (0.46–0.88). Where there is little far field to route, lists are
+thin and the analytic near field dominates. Corollary: far_frac grows with
+N (plummer 0.20 → 0.58 → 0.87 at 256 → 1024 → 4096) — train mixed-N or
+underweight the far field. The eps knob works: 1e-5 → 1e-3 densifies our
+lists 1.7–2.7× monotonically, so list-eps stays a free hyperparameter
+(recorded per snapshot), defaulting to 1e-5 for solver fidelity.
+
+**G3 — no format change.** Phase 2 rebuilds graphs on the fly from manifest
+seeds: deterministic pipeline (`graph_deterministic` pins it), 26ms/snapshot
+≪ a training step. Storing lists would cost ~4MB/snapshot at N=4k (~84GB
+for 20k snapshots) — avoided entirely.
+
 ## Phases
 
 - Phase 0: `dataset` bin — config generator + `direct` labels + near/far
   split + dumps. No ML dependency.
 - Phase 1: tree/graph extractor reusing `Octree` — per-node features,
-  children, interaction lists via `mac::accept`. No new octree.
+  children, interaction lists via full `mac::accept` (`graph` bin). No new
+  octree. Lists are parameterized by (p, eps); edge volume matches analytic
+  M2L scale (~100 edges/particle at N=4k, eps=1e-5).
 - Phase 2: `burn` model implementing the operator traits in `src/lib.rs`.
 - Phase 3: eval bin — three-way plot + flat-MLP ablation + KDK energy drift.
 - Phase 4 (only if v1 works): head-to-head against FMMS (`Fmm::new`, p=3,5,8)
@@ -163,10 +198,12 @@ Measured data forced five revisions:
 
 ```
 experiments/learned-fmm/
-  README.md        this file (adapted proposal)
+  README.md        this file (adapted proposal + measured revisions)
+  LIMITATIONS.md   living list of known limits (multi-hop risk, manifest gap, open calls)
   Cargo.toml       detached crate ([workspace]), path-dep on fmm only in v0
-  src/lib.rs       configs + normalization + near/far split + snapshot I/O (+ operator traits for Phase 2)
-  src/bin/dataset.rs  Phase-0 generator (configs + labels + split stats + dumps)
+  src/lib.rs       configs + split + snapshot I/O + graph extractor (+ operator traits for Phase 2)
+  src/bin/dataset.rs  generator (configs + labels + split stats + dumps)
+  src/bin/graph.rs    graph stats (nodes, edges per level for one config/N)
 ```
 
 ## Phase-0 file format
@@ -181,6 +218,8 @@ min_r, filename. ~52KB/snapshot at N=1024; ~37ms/snapshot at N=4096
 
 ```sh
 cargo run --release --bin dataset -- --out /tmp/opencode/learned-fmm --snapshots 100 --n-min 1024 --n-max 4096 --config all
+cargo run --release --bin graph -- --config mixed --n 4096 --p 8 --eps 1e-5
+cargo run --release --bin graph -- --n 1024 --eps 1e-5 --walk   # topology vs walk + far_frac joint row
 cargo test --release
 ```
 
@@ -191,4 +230,12 @@ normalization, SO(3) augmentation), leaf-adjacency near/far split,
 versioned binary dumps + manifest. 7 lib tests green, incl.
 `split_sums_to_total` (proven non-vacuous by mutation). Idea revised per
 lessons above (loss, split scope, masses, no-softening decision).
-Phases 1–4 not started.
+
+Phase 1 done: `extract_nodes` (level, center, rho, mass, count, children,
+leaf features) + `build_graph` (directed same-level lists via full
+`mac::accept` with real moments/`f_prepass` pipeline) + `walk_coverage`
+(cross-check vs the walk's recorded pairs) + `graph` bin.
+12 lib tests green, incl. two-body positive control, non-vacuity guard, and
+walk-superset pin (all proven against mutants). Gap verdicts above:
+same-level kept for v1 with multi-hop consequence recorded, sparsity
+cleared as honest, graphs rebuilt from seeds (no format change).
