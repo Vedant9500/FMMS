@@ -36,12 +36,8 @@ NOT silently "fixed" — each needs a re-measure / ablation before changing.
   (~1e-7 quantization) to keep the corpus small. Presumed below the model
   error floor, but if training plateaus near 1e-6 relative, re-check this
   before blaming the architecture.
-- **Manifest cannot yet rebuild graphs:** `manifest.csv` carries
-  (seed, config, n) but graph rebuilds also need (p, eps, n_leaf), which
-  change tree structure and list density. Before the Phase-2 corpus run,
-  add those columns (or pin defaults here). Rebuild-from-seed is the
-  strategy (avoids ~84GB of stored lists); the manifest gap would silently
-  break it.
+- **Manifest gap CLOSED:** `manifest.csv` now carries (p, eps, n_leaf)
+  alongside (seed, config, n) — graph rebuilds are fully specified.
 - **Static equal-mass snapshots only:** no velocities, no mass spectra.
   Phase-3 energy-rollout eval needs a velocity sampler — the virialized
   Maxwellian currently lives inside `fmm`'s energy-gate test, not in a
@@ -53,10 +49,11 @@ NOT silently "fixed" — each needs a re-measure / ablation before changing.
 
 ## Training / eval (open calls)
 
-- **Backend undecided (`burn` vs `candle`):** `burn`+ndarray is the default
-  (pure Rust, CPU, matches the small-model profile); operator traits in
-  `src/lib.rs` are backend-agnostic precisely so this stays reversible.
-  Decide at Phase 2 start; `candle` is fallback for safetensors interop.
+- **Backend DECIDED (`burn` 0.21, spike green):** `ndarray` + `autodiff`
+  on CPU; 2000 full-batch steps on N=256 run in <1s. Memorization check:
+  64-wide flat MLP plateaus at rel_mse ~0.02, 256-wide reaches ~5e-4 —
+  plumbing validated, and the capacity floor hints the tree matters.
+  Watch late-training Adam spikes (lr 1e-3 runs hot).
 - **List-eps is a free hyperparameter:** 1e-5 → 1e-3 densifies lists
   1.7–2.7× monotonically. Default stays 1e-5 (solver fidelity); sweep it in
   Phase 2 and record per snapshot (see manifest gap above).

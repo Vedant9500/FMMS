@@ -6,6 +6,7 @@ edition = "2021"
 [workspace]
 
 [dependencies]
+burn = { version = "0.21.0", features = ["autodiff", "ndarray"] }
 fmm = { path = "../../crates/fmm" }
 
 [[bin]]
@@ -15,3 +16,7 @@ path = "src/bin/dataset.rs"
 [[bin]]
 name = "graph"
 path = "src/bin/graph.rs"
+
+[[bin]]
+name = "flat"
+path = "src/bin/flat.rs"

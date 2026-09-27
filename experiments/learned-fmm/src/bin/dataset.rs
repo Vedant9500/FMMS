@@ -25,12 +25,14 @@ fn main() {
     let config = arg_val(&args, "--config", "all");
     let seed_base: u64 = arg_val(&args, "--seed", "1000").parse().unwrap();
     let n_leaf: usize = arg_val(&args, "--n-leaf", "16").parse().unwrap();
+    let p: usize = arg_val(&args, "--p", "8").parse().unwrap();
+    let eps: f64 = arg_val(&args, "--eps", "1e-5").parse().unwrap();
     let rotate = !has_flag(&args, "--no-rotate");
     assert!(n_min > 0 && n_max >= n_min && snapshots > 0);
 
     let outdir = std::path::Path::new(&out);
     std::fs::create_dir_all(outdir).unwrap();
-    let mut manifest = String::from("id,config,n,seed,rms_total,rms_near,rms_far,far_frac,min_r,file\n");
+    let mut manifest = String::from("id,config,n,seed,p,eps,n_leaf,rms_total,rms_near,rms_far,far_frac,min_r,file\n");
     let mut sum_far = 0.0;
 
     for s in 0..snapshots {
@@ -58,7 +60,7 @@ fn main() {
         snap.write_to(&outdir.join(&fname)).unwrap();
         sum_far += stats.far_frac;
         manifest.push_str(&format!(
-            "{s},{},{n},{seed},{:.6},{:.6},{:.6},{:.4},{:.6},{fname}\n",
+            "{s},{},{n},{seed},{p},{eps},{n_leaf},{:.6},{:.6},{:.6},{:.4},{:.6},{fname}\n",
             tag.name(),
             stats.rms_total,
             stats.rms_near,

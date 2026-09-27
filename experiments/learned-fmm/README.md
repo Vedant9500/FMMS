@@ -210,9 +210,10 @@ experiments/learned-fmm/
 
 Per-snapshot little-endian binary, magic `LFMMD001`, u32 n, u8 config tag,
 then f32 arrays: pos(3n), mass(n), a_total(3n), a_near(3n), a_far(3n).
-`manifest.csv` carries id, config, n, seed, rms_total/near/far, far_frac,
-min_r, filename. ~52KB/snapshot at N=1024; ~37ms/snapshot at N=4096
-(release), so 20k snapshots ≈ 12 min.
+`manifest.csv` carries id, config, n, seed, p, eps, n_leaf,
+rms_total/near/far, far_frac, min_r, filename — the (p, eps, n_leaf) triple
+is what graph rebuilds need (LIMITATIONS gap, now closed). ~52KB/snapshot
+at N=1024; ~37ms/snapshot at N=4096 (release), so 20k snapshots ≈ 12 min.
 
 ## Commands
 
@@ -239,3 +240,10 @@ leaf features) + `build_graph` (directed same-level lists via full
 walk-superset pin (all proven against mutants). Gap verdicts above:
 same-level kept for v1 with multi-hop consequence recorded, sparsity
 cleared as honest, graphs rebuilt from seeds (no format change).
+
+Backend decided: `burn` 0.21 (`ndarray` + `autodiff`, CPU). Spike (`flat`
+bin, per-particle [pos, mass] → far field, one N=256 snapshot, standardized
+targets): 64-wide plateaus at rel_mse ~0.02 (capacity floor, not breakage —
+loss fell 50×), 256-wide memorizes to ~5e-4 in 5000 steps (~seconds on
+CPU). Training loop, autodiff, and Adam all work; an Adam loss spike at
+late training says lr 1e-3 runs hot — schedule or clip in real training.
