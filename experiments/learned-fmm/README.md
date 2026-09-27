@@ -202,8 +202,11 @@ experiments/learned-fmm/
   LIMITATIONS.md   living list of known limits (multi-hop risk, manifest gap, open calls)
   Cargo.toml       detached crate ([workspace]), path-dep on fmm only in v0
   src/lib.rs       configs + split + snapshot I/O + graph extractor (+ operator traits for Phase 2)
+  src/model.rs     TreeModel: 5 burn MLPs (leaf/up/msg/down/decode), batched forward
   src/bin/dataset.rs  generator (configs + labels + split stats + dumps)
   src/bin/graph.rs    graph stats (nodes, edges per level for one config/N)
+  src/bin/flat.rs     flat-MLP memorize spike (backend validation)
+  src/bin/train.rs    corpus trainer (seed-regenerated samples, relMSE + logcosh, --probe mode)
 ```
 
 ## Phase-0 file format
@@ -219,8 +222,8 @@ at N=1024; ~37ms/snapshot at N=4096 (release), so 20k snapshots ≈ 12 min.
 
 ```sh
 cargo run --release --bin dataset -- --out /tmp/opencode/learned-fmm --snapshots 100 --n-min 1024 --n-max 4096 --config all
-cargo run --release --bin graph -- --config mixed --n 4096 --p 8 --eps 1e-5
 cargo run --release --bin graph -- --n 1024 --eps 1e-5 --walk   # topology vs walk + far_frac joint row
+cargo run --release --bin train -- --data /tmp/opencode/learned-fmm --epochs 12 --emb 32 --hidden 64
 cargo test --release
 ```
 
@@ -247,3 +250,15 @@ targets): 64-wide plateaus at rel_mse ~0.02 (capacity floor, not breakage —
 loss fell 50×), 256-wide memorizes to ~5e-4 in 5000 steps (~seconds on
 CPU). Training loop, autodiff, and Adam all work; an Adam loss spike at
 late training says lr 1e-3 runs hot — schedule or clip in real training.
+
+Tree model trains: `TreeModel` (leaf/up/msg/down/decode MLPs, emb=32,
+hidden=64, Gelu) on a 64-snapshot pilot corpus (N 128–512, all configs,
+targets standardized by per-snapshot rms_far, loss = relMSE + logcosh).
+First run went NaN — root cause was unbounded geometry: message features
+divided by cell radii (tiny point cells ⇒ inputs ~1e12 ⇒ inf). Fixed with
+bounded encodings (box-unit displacements + log-separation) and
+1/√fan-in interaction scaling; probe showed finite preds (rms ~0.1).
+Level-batched + select/gather forward cut epoch time 60s → 0.8s (75×).
+Curve: 1.08 → 0.59 over 12 epochs, still descending. 14 lib tests green,
+incl. a learning test (one-sample loss 1.0 → ~0.3 in 400 steps, margin
+verified over repeated runs).

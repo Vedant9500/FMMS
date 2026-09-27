@@ -20,3 +20,7 @@ path = "src/bin/graph.rs"
 [[bin]]
 name = "flat"
 path = "src/bin/flat.rs"
+
+[[bin]]
+name = "train"
+path = "src/bin/train.rs"

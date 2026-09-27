@@ -13,7 +13,10 @@ NOT silently "fixed" — each needs a re-measure / ablation before changing.
   routing recovers that flow is unknown until Phase 2 ablates 1 vs 2 vs 3
   hops on plummer/mixed @ N≥1k, eps=1e-5, measuring far-field relative L2.
   If the gap persists, the fix is cross-level edges (prime v2 extension),
-  not more same-level capacity.
+  not more same-level capacity. Note the backward paths are as long as the
+  forward ones: the small-config learning test (emb=8) crawled (30% drop in
+  200 steps) while emb=32 learns steadily — depth attenuates gradients too,
+  so hop ablations must also watch trainability, not just final error.
 - **Same-level restriction is v1 scope, not fidelity:** our lists are an
   exact superset of the walk's same-level pairs (`covered == same_level` in
   all 24 grid runs) but structurally exclude cross-level pairs the Dehnen
@@ -60,3 +63,10 @@ NOT silently "fixed" — each needs a re-measure / ablation before changing.
 - **Full 5k–20k corpus not yet generated:** per-snapshot cost measured
   (~37ms split + ~26ms graph at N=4k ⇒ ~12 min for 20k), total ~4GB dumps.
   Pilot 1k snapshots before committing to the full run.
+- **Weight init is unseeded:** the data pipeline is deterministic
+  (rebuild-from-seed verified to 2.5e-8), but burn Linear init uses an
+  unseeded global RNG — training runs are not bitwise reproducible.
+  Pin a seed before publishing any comparison numbers.
+- **No train/test split yet:** `train` fits every manifest row. Held-out
+  evaluation (and the FMMS + flat-MLP comparison) belongs to the eval
+  harness — do not quote pilot losses as generalization numbers.

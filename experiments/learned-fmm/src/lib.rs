@@ -1,3 +1,5 @@
+pub mod model;
+
 use fmm::models::{self, Particle, Rng};
 use fmm::tree::Octree;
 use std::io::{Read, Write};
@@ -501,17 +503,18 @@ pub struct NodeFeatures {
     pub mass: f64,
     pub count: usize,
     pub is_leaf: bool,
-    pub children: Vec<usize>,
+    pub children: [Option<usize>; 8],
+    pub pids: Vec<usize>,
     pub leaf: Option<LeafFeatures>,
 }
 
 pub fn extract_nodes(parts: &[Particle], tree: &Octree) -> Vec<NodeFeatures> {
     let mut nodes = Vec::with_capacity(tree.cells.len());
     for c in &tree.cells {
-        let mut children = Vec::new();
-        for &ch in &c.children {
+        let mut children: [Option<usize>; 8] = [None; 8];
+        for (o, &ch) in c.children.iter().enumerate() {
             if ch >= 0 {
-                children.push(ch as usize);
+                children[o] = Some(ch as usize);
             }
         }
         let mut ids = Vec::with_capacity(c.count);
@@ -523,6 +526,7 @@ pub fn extract_nodes(parts: &[Particle], tree: &Octree) -> Vec<NodeFeatures> {
         } else {
             None
         };
+        let pids = if c.leaf { ids } else { Vec::new() };
         nodes.push(NodeFeatures {
             level: c.level,
             center: c.cen,
@@ -531,6 +535,7 @@ pub fn extract_nodes(parts: &[Particle], tree: &Octree) -> Vec<NodeFeatures> {
             count: c.count,
             is_leaf: c.leaf,
             children,
+            pids,
             leaf,
         });
     }

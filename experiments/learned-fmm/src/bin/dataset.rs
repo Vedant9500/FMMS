@@ -32,7 +32,7 @@ fn main() {
 
     let outdir = std::path::Path::new(&out);
     std::fs::create_dir_all(outdir).unwrap();
-    let mut manifest = String::from("id,config,n,seed,p,eps,n_leaf,rms_total,rms_near,rms_far,far_frac,min_r,file\n");
+    let mut manifest = String::from("id,config,n,seed,p,eps,n_leaf,rotate,rms_total,rms_near,rms_far,far_frac,min_r,file\n");
     let mut sum_far = 0.0;
 
     for s in 0..snapshots {
@@ -60,8 +60,9 @@ fn main() {
         snap.write_to(&outdir.join(&fname)).unwrap();
         sum_far += stats.far_frac;
         manifest.push_str(&format!(
-            "{s},{},{n},{seed},{p},{eps},{n_leaf},{:.6},{:.6},{:.6},{:.4},{:.6},{fname}\n",
+            "{s},{},{n},{seed},{p},{eps},{n_leaf},{},{:.6},{:.6},{:.6},{:.4},{:.6},{fname}\n",
             tag.name(),
+            if rotate { 1 } else { 0 },
             stats.rms_total,
             stats.rms_near,
             stats.rms_far,
