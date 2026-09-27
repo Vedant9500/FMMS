@@ -199,6 +199,7 @@ for 20k snapshots) — avoided entirely.
 ```
 experiments/learned-fmm/
   README.md        this file (adapted proposal + measured revisions)
+  HANDOFF.md       session handoff (state, commands, dead-ends — read first)
   LIMITATIONS.md   living list of known limits (multi-hop risk, manifest gap, open calls)
   Cargo.toml       detached crate ([workspace]), path-dep on fmm only in v0
   src/lib.rs       configs + split + snapshot I/O + graph extractor (+ operator traits for Phase 2)

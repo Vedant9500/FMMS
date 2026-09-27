@@ -77,6 +77,12 @@ NOT silently "fixed" — each needs a re-measure / ablation before changing.
   tiny-op overhead (~10k launches/sample at N=4k), not kernel compute.
   Next levers are fewer ops or bigger batches, not threads. (Also explains
   why GPU would underwhelm at N≤1k: launch-bound, not compute-bound.)
+- **Concurrent autodiff DEADLOCKS (measured):** minibatch data-parallel
+  across `std::thread::scope` (shared model, per-thread backward) hangs
+  before finishing one epoch — 7+ min frozen, all threads in futex_wait,
+  zero progress. burn 0.21 Autodiff is not safe for concurrent backward.
+  `--threads` defaults to 1 (serial minibatch: same update math, no wall
+  gain). Parallelism across *processes* (separate runs) is unaffected.
 - **Weight init is unseeded:** the data pipeline is deterministic
   (rebuild-from-seed verified to 2.5e-8), but burn Linear init uses an
   unseeded global RNG — training runs are not bitwise reproducible.

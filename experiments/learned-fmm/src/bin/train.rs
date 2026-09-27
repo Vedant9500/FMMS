@@ -1,6 +1,6 @@
 use burn::{
     backend::{Autodiff, NdArray},
-    optim::{AdamConfig, GradientsParams, Optimizer},
+    optim::{AdamConfig, GradientsAccumulator, GradientsParams, Optimizer},
     tensor::{Tensor, TensorData},
 };
 use learned_fmm::{
@@ -38,6 +38,10 @@ fn main() {
     let emb: usize = arg_val(&args, "--emb", "32").parse().unwrap();
     let hidden: usize = arg_val(&args, "--hidden", "64").parse().unwrap();
     let max_rows: usize = arg_val(&args, "--max-rows", "0").parse().unwrap();
+    let rounds: usize = arg_val(&args, "--rounds", "1").parse().unwrap();
+    let batch: usize = arg_val(&args, "--batch", "16").parse().unwrap();
+    // threads>1 deadlocks: burn Autodiff hangs on concurrent backward.
+    let threads: usize = arg_val(&args, "--threads", "1").parse().unwrap();
     let probe: usize = arg_val(&args, "--probe", "0").parse().unwrap();
     let test_frac: f64 = arg_val(&args, "--test-frac", "0.1").parse().unwrap();
     let device = Default::default();
@@ -108,12 +112,12 @@ fn main() {
         });
     }
     println!("loaded {nrows} samples");
-    let cfg = TreeConfig { emb, hidden };
+    let cfg = TreeConfig { emb, hidden, rounds };
     let mut model = TreeModel::<BT>::new(&cfg, &device);
     if probe > 0 {
         for (pi, s) in samples.iter().take(probe).enumerate() {
             let t0 = std::time::Instant::now();
-            let pred = model.forward(emb, &s.parts, &s.graph, &device);
+            let pred = model.forward(emb, rounds, &s.parts, &s.graph, &device);
             let dt = t0.elapsed().as_secs_f32();
             let v: Vec<f32> = pred.into_data().into_vec().unwrap();
             let mut rms = 0.0f64;
@@ -147,29 +151,55 @@ fn main() {
         }
         let mut sum = 0.0;
         let mut rsum = 0.0;
-        for &si in &order {
-            let s = &samples[si];
-            let n = s.parts.len();
-            let pred = model.forward(emb, &s.parts, &s.graph, &device);
-            let tgt: Tensor<BT, 2> =
-                Tensor::from_data(TensorData::new(s.target.clone(), [n, 3]), &device);
-            let diff = pred - tgt.clone();
-            let rel = diff.clone().powf_scalar(2.0).mean()
-                / tgt.powf_scalar(2.0).mean().clamp_min(1e-12);
-            let robust = diff.cosh().log().mean();
-            let loss = rel.clone() + robust.clone();
-            sum += loss.clone().into_scalar();
-            rsum += rel.into_scalar();
-            let grads = loss.backward();
-            let grads = GradientsParams::from_grads(grads, &model);
-            model = optim.step(lr, model, grads);
+        for chunk in order.chunks(batch.max(1)) {
+            let scale = 1.0 / chunk.len() as f32;
+            let t = threads.min(chunk.len()).max(1);
+            let mut master = GradientsAccumulator::<TreeModel<BT>>::new();
+            let (sr, mr, dr) = (&samples, &model, &device);
+            std::thread::scope(|s| {
+                let mut hs = Vec::new();
+                for sub in chunk.chunks(chunk.len().div_ceil(t)) {
+                    let owned: Vec<usize> = sub.to_vec();
+                    hs.push(s.spawn(move || {
+                        let mut acc = GradientsAccumulator::<TreeModel<BT>>::new();
+                        let mut ls = 0.0f32;
+                        let mut rs = 0.0f32;
+                        for si in owned {
+                            let smp = &sr[si];
+                            let n = smp.parts.len();
+                            let pred = mr.forward(emb, rounds, &smp.parts, &smp.graph, dr);
+                            let tgt: Tensor<BT, 2> = Tensor::from_data(
+                                TensorData::new(smp.target.clone(), [n, 3]),
+                                dr,
+                            );
+                            let diff = pred - tgt.clone();
+                            let rel = diff.clone().powf_scalar(2.0).mean()
+                                / tgt.powf_scalar(2.0).mean().clamp_min(1e-12);
+                            let robust = diff.cosh().log().mean();
+                            ls += (rel.clone() + robust.clone()).into_scalar();
+                            rs += rel.clone().into_scalar();
+                            let loss = (rel + robust).mul_scalar(scale);
+                            let grads = loss.backward();
+                            acc.accumulate(mr, GradientsParams::from_grads(grads, mr));
+                        }
+                        (acc.grads(), ls, rs)
+                    }));
+                }
+                for h in hs {
+                    let (g, ls, rs) = h.join().unwrap();
+                    master.accumulate(&model, g);
+                    sum += ls;
+                    rsum += rs;
+                }
+            });
+            model = optim.step(lr, model, master.grads());
         }
         let mut tsum = 0.0;
         let mut trsum = 0.0;
         for si in ntrain..nrows {
             let s = &samples[si];
             let n = s.parts.len();
-            let pred = model.forward(emb, &s.parts, &s.graph, &device);
+            let pred = model.forward(emb, rounds, &s.parts, &s.graph, &device);
             let tgt: Tensor<BT, 2> =
                 Tensor::from_data(TensorData::new(s.target.clone(), [n, 3]), &device);
             let diff = pred - tgt.clone();

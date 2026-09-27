@@ -10,6 +10,7 @@ use crate::InteractionGraph;
 pub struct TreeConfig {
     pub emb: usize,
     pub hidden: usize,
+    pub rounds: usize,
 }
 
 #[derive(Module, Debug)]
@@ -38,6 +39,8 @@ pub struct TreeModel<B: Backend> {
     up: Mlp<B>,
     msg: Mlp<B>,
     down: Mlp<B>,
+    msg2: Mlp<B>,
+    down2: Mlp<B>,
     dec: Mlp<B>,
 }
 
@@ -50,6 +53,8 @@ impl<B: Backend> TreeModel<B> {
             up: Mlp::new(8 * (d + 3), h, d, device),
             msg: Mlp::new(2 * d + 4, h, d, device),
             down: Mlp::new(3 * d, h, d, device),
+            msg2: Mlp::new(2 * d + 4, h, d, device),
+            down2: Mlp::new(3 * d, h, d, device),
             dec: Mlp::new(d + 4, h, 3, device),
         }
     }
@@ -61,6 +66,7 @@ impl<B: Backend> TreeModel<B> {
     pub fn forward(
         &self,
         emb: usize,
+        rounds: usize,
         parts: &[Particle],
         g: &InteractionGraph,
         device: &B::Device,
@@ -139,84 +145,14 @@ impl<B: Backend> TreeModel<B> {
                 up[i] = out.clone().narrow(0, r, 1);
             }
         }
-        let up_stack = Tensor::cat(up.clone(), 0);
-        let mut src_idx = Vec::new();
-        let mut dst_idx = Vec::new();
-        let mut bounds = Vec::with_capacity(nc + 1);
-        let mut ecount = 0;
-        for (b, srcs) in g.incoming.iter().enumerate() {
-            bounds.push(ecount);
-            for &a in srcs {
-                src_idx.push(a as i64);
-                dst_idx.push(b as i64);
-                ecount += 1;
-            }
-        }
-        bounds.push(ecount);
-        let mut inter: Vec<Tensor<B, 2>> = vec![zero.clone(); nc];
-        if ecount > 0 {
-            let si: Tensor<B, 1, Int> =
-                Tensor::from_data(TensorData::new(src_idx, [ecount]), device);
-            let di: Tensor<B, 1, Int> =
-                Tensor::from_data(TensorData::new(dst_idx, [ecount]), device);
-            let su = up_stack.clone().select(0, si);
-            let du = up_stack.clone().select(0, di);
-            let mut geom = Vec::with_capacity(ecount * 4);
-            for (b, srcs) in g.incoming.iter().enumerate() {
-                let cb = g.nodes[b].center;
-                let rhob = g.nodes[b].rho;
-                for &a in srcs {
-                    let ca = g.nodes[a].center;
-                    let rhoa = g.nodes[a].rho;
-                    let dx = [
-                        (cb[0] - ca[0]) * 0.5,
-                        (cb[1] - ca[1]) * 0.5,
-                        (cb[2] - ca[2]) * 0.5,
-                    ];
-                    let r = (dx[0] * dx[0] + dx[1] * dx[1] + dx[2] * dx[2]).sqrt();
-                    let sep = (r / (rhoa + rhob + 1e-12) + 1.0).log10();
-                    geom.extend_from_slice(&[
-                        dx[0] as f32,
-                        dx[1] as f32,
-                        dx[2] as f32,
-                        sep as f32,
-                    ]);
-                }
-            }
-            let gm: Tensor<B, 2> = Tensor::from_data(TensorData::new(geom, [ecount, 4]), device);
-            let msg = self.msg.forward(Tensor::cat(vec![su, du, gm], 1));
-            for b in 0..nc {
-                let (s, e) = (bounds[b], bounds[b + 1]);
-                if e > s {
-                    let k = (e - s) as f32;
-                    inter[b] = msg.clone().narrow(0, s, e - s).sum_dim(0).mul_scalar(1.0 / k.sqrt());
-                }
-            }
-        }
-        let mut local: Vec<Tensor<B, 2>> = vec![zero.clone(); nc];
-        local[0] = self
-            .down
-            .forward(Tensor::cat(vec![zero.clone(), up[0].clone(), inter[0].clone()], 1));
-        for l in 1..=max_level {
-            let cells: Vec<usize> = (0..nc)
-                .filter(|&i| g.nodes[i].level == l)
-                .collect();
-            if cells.is_empty() {
-                continue;
-            }
-            let mut inputs = Vec::with_capacity(cells.len());
-            for &i in &cells {
-                let q = parent_of[i];
-                inputs.push(Tensor::cat(
-                    vec![local[q].clone(), up[i].clone(), inter[i].clone()],
-                    1,
-                ));
-            }
-            let out = self.down.forward(Tensor::cat(inputs, 0));
-            for (r, &i) in cells.iter().enumerate() {
-                local[i] = out.clone().narrow(0, r, 1);
-            }
-        }
+        let inter = self.interact(emb, &up, &self.msg, g, device);
+        let local = self.propagate(emb, &up, &inter, &self.down, g, &parent_of, max_level, device);
+        let local = if rounds >= 2 {
+            let inter2 = self.interact(emb, &local, &self.msg2, g, device);
+            self.propagate(emb, &up, &inter2, &self.down2, g, &parent_of, max_level, device)
+        } else {
+            local
+        };
         let mut leaf_of = vec![0i64; n];
         for (i, nd) in g.nodes.iter().enumerate() {
             if nd.is_leaf {
@@ -244,6 +180,112 @@ impl<B: Backend> TreeModel<B> {
         let inp = Tensor::cat(vec![gathered, fm], 1);
         self.dec.forward(inp)
     }
+
+    fn interact(
+        &self,
+        emb: usize,
+        states: &[Tensor<B, 2>],
+        msg: &Mlp<B>,
+        g: &InteractionGraph,
+        device: &B::Device,
+    ) -> Vec<Tensor<B, 2>> {
+        let nc = g.nodes.len();
+        let zero = Self::row(vec![0.0; emb], emb, device);
+        let stack = Tensor::cat(states.to_vec(), 0);
+        let mut src_idx = Vec::new();
+        let mut dst_idx = Vec::new();
+        let mut bounds = Vec::with_capacity(nc + 1);
+        let mut ecount = 0;
+        for (b, srcs) in g.incoming.iter().enumerate() {
+            bounds.push(ecount);
+            for &a in srcs {
+                src_idx.push(a as i64);
+                dst_idx.push(b as i64);
+                ecount += 1;
+            }
+        }
+        bounds.push(ecount);
+        let mut inter: Vec<Tensor<B, 2>> = vec![zero.clone(); nc];
+        if ecount > 0 {
+            let si: Tensor<B, 1, Int> =
+                Tensor::from_data(TensorData::new(src_idx, [ecount]), device);
+            let di: Tensor<B, 1, Int> =
+                Tensor::from_data(TensorData::new(dst_idx, [ecount]), device);
+            let su = stack.clone().select(0, si);
+            let du = stack.clone().select(0, di);
+            let mut geom = Vec::with_capacity(ecount * 4);
+            for (b, srcs) in g.incoming.iter().enumerate() {
+                let cb = g.nodes[b].center;
+                let rhob = g.nodes[b].rho;
+                for &a in srcs {
+                    let ca = g.nodes[a].center;
+                    let rhoa = g.nodes[a].rho;
+                    let dx = [
+                        (cb[0] - ca[0]) * 0.5,
+                        (cb[1] - ca[1]) * 0.5,
+                        (cb[2] - ca[2]) * 0.5,
+                    ];
+                    let r = (dx[0] * dx[0] + dx[1] * dx[1] + dx[2] * dx[2]).sqrt();
+                    let sep = (r / (rhoa + rhob + 1e-12) + 1.0).log10();
+                    geom.extend_from_slice(&[
+                        dx[0] as f32,
+                        dx[1] as f32,
+                        dx[2] as f32,
+                        sep as f32,
+                    ]);
+                }
+            }
+            let gm: Tensor<B, 2> = Tensor::from_data(TensorData::new(geom, [ecount, 4]), device);
+            let out = msg.forward(Tensor::cat(vec![su, du, gm], 1));
+            for b in 0..nc {
+                let (s, e) = (bounds[b], bounds[b + 1]);
+                if e > s {
+                    let k = (e - s) as f32;
+                    inter[b] = out.clone().narrow(0, s, e - s).sum_dim(0).mul_scalar(1.0 / k.sqrt());
+                }
+            }
+        }
+        inter
+    }
+
+    fn propagate(
+        &self,
+        emb: usize,
+        up: &[Tensor<B, 2>],
+        inter: &[Tensor<B, 2>],
+        down_mlp: &Mlp<B>,
+        g: &InteractionGraph,
+        parent_of: &[usize],
+        max_level: u32,
+        device: &B::Device,
+    ) -> Vec<Tensor<B, 2>> {
+        let nc = g.nodes.len();
+        let zero = Self::row(vec![0.0; emb], emb, device);
+        let mut local: Vec<Tensor<B, 2>> = vec![zero.clone(); nc];
+        local[0] = down_mlp
+            .forward(Tensor::cat(vec![zero.clone(), up[0].clone(), inter[0].clone()], 1));
+        for l in 1..=max_level {
+            let cells: Vec<usize> = (0..nc)
+                .filter(|&i| g.nodes[i].level == l)
+                .collect();
+            if cells.is_empty() {
+                continue;
+            }
+            let mut inputs = Vec::with_capacity(cells.len());
+            for &i in &cells {
+                let q = parent_of[i];
+                inputs.push(Tensor::cat(
+                    vec![local[q].clone(), up[i].clone(), inter[i].clone()],
+                    1,
+                ));
+            }
+            let out = down_mlp.forward(Tensor::cat(inputs, 0));
+            for (r, &i) in cells.iter().enumerate() {
+                local[i] = out.clone().narrow(0, r, 1);
+            }
+        }
+        local
+    }
 }
 
 #[cfg(test)]
@@ -257,14 +299,14 @@ mod tests {
 
     #[test]
     fn forward_finite_and_deterministic() {        let device = Default::default();
-        let cfg = TreeConfig { emb: 8, hidden: 16 };
+        let cfg = TreeConfig { emb: 8, hidden: 16, rounds: 2 };
         let mut parts = generate(ConfigTag::Cube, 64, 31);
         normalize_to_unit_box(&mut parts);
         let tree = Octree::build(&parts, 16);
         let g = build_graph(&parts, &tree, 2, 1e-3);
         let model = TreeModel::<TB>::new(&cfg, &device);
-        let a = model.forward(cfg.emb, &parts, &g, &device);
-        let b = model.forward(cfg.emb, &parts, &g, &device);
+        let a = model.forward(cfg.emb, cfg.rounds, &parts, &g, &device);
+        let b = model.forward(cfg.emb, cfg.rounds, &parts, &g, &device);
         let da: Vec<f32> = a.into_data().into_vec().unwrap();
         let db: Vec<f32> = b.into_data().into_vec().unwrap();
         assert_eq!(da.len(), 64 * 3);
@@ -279,7 +321,7 @@ mod tests {
         use burn::optim::{AdamConfig, GradientsParams, Optimizer};
         use burn::tensor::{Tensor, TensorData};
         let device = Default::default();
-        let cfg = TreeConfig { emb: 16, hidden: 32 };
+        let cfg = TreeConfig { emb: 16, hidden: 32, rounds: 1 };
         let mut parts = generate(ConfigTag::Cube, 32, 33);
         normalize_to_unit_box(&mut parts);
         let tree = Octree::build(&parts, 16);
@@ -300,7 +342,7 @@ mod tests {
         let mut first = 0.0;
         let mut last = 0.0;
         for s in 0..400 {
-            let pred = model.forward(cfg.emb, &parts, &g, &device);
+            let pred = model.forward(cfg.emb, cfg.rounds, &parts, &g, &device);
             let diff = pred - tgt.clone();
             let loss = diff.clone().powf_scalar(2.0).mean()
                 / tgt.clone().powf_scalar(2.0).mean().clamp_min(1e-12);
