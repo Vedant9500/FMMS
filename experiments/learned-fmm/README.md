@@ -252,7 +252,7 @@ CPU). Training loop, autodiff, and Adam all work; an Adam loss spike at
 late training says lr 1e-3 runs hot — schedule or clip in real training.
 
 Tree model trains: `TreeModel` (leaf/up/msg/down/decode MLPs, emb=32,
-hidden=64, Gelu) on a 64-snapshot pilot corpus (N 128–512, all configs,
+hidden=64, Gelu, ≈40k params) on a 64-snapshot pilot corpus (N 128–512, all configs,
 targets standardized by per-snapshot rms_far, loss = relMSE + logcosh).
 First run went NaN — root cause was unbounded geometry: message features
 divided by cell radii (tiny point cells ⇒ inputs ~1e12 ⇒ inf). Fixed with
@@ -262,3 +262,18 @@ Level-batched + select/gather forward cut epoch time 60s → 0.8s (75×).
 Curve: 1.08 → 0.59 over 12 epochs, still descending. 14 lib tests green,
 incl. a learning test (one-sample loss 1.0 → ~0.3 in 400 steps, margin
 verified over repeated runs).
+
+Data ablation (same model, 30 epochs, tail 10% held out, blended loss):
+250 → test 0.38, 500 → test 0.29, 1000 → test 0.30. The 250→500 jump is
+real; 500→1000 is noise (±0.03 test oscillation on ≤100 held-out rows).
+Verdict: data saturates around ~500 snapshots for the 40k-param model —
+the binding constraint is now CAPACITY, not data. The 20k corpus stays on
+hold until a bigger model (emb=64/hidden=128 next) proves it can use more.
+`train` gained `--test-frac` and per-component (rel vs logcosh) logging.
+
+Capacity leg (emb=64/hidden=128, ≈160k params, same 1k corpus, 30 epochs,
+~85s/epoch): test 0.30 → 0.28 blended (rel 0.248), train 0.322 → 0.308.
+A 4× model for ~5% — capacity responds only weakly. Data *and* size both
+look exhausted; the constraint is now most likely ARCHITECTURAL
+(single message-passing round — the recorded multi-hop suspect).
+Next: ablate 1 vs 2 interaction rounds before any other scaling.

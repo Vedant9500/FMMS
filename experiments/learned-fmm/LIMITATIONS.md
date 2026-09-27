@@ -17,6 +17,9 @@ NOT silently "fixed" — each needs a re-measure / ablation before changing.
   forward ones: the small-config learning test (emb=8) crawled (30% drop in
   200 steps) while emb=32 learns steadily — depth attenuates gradients too,
   so hop ablations must also watch trainability, not just final error.
+  Update: the 4×-capacity leg moved test only 0.30 → 0.28 while both data
+  (500≈1000) and size respond weakly — single-round message passing is now
+  the prime architectural suspect. Ablate 1 vs 2 rounds next.
 - **Same-level restriction is v1 scope, not fidelity:** our lists are an
   exact superset of the walk's same-level pairs (`covered == same_level` in
   all 24 grid runs) but structurally exclude cross-level pairs the Dehnen
@@ -60,9 +63,20 @@ NOT silently "fixed" — each needs a re-measure / ablation before changing.
 - **List-eps is a free hyperparameter:** 1e-5 → 1e-3 densifies lists
   1.7–2.7× monotonically. Default stays 1e-5 (solver fidelity); sweep it in
   Phase 2 and record per snapshot (see manifest gap above).
-- **Full 5k–20k corpus not yet generated:** per-snapshot cost measured
-  (~37ms split + ~26ms graph at N=4k ⇒ ~12 min for 20k), total ~4GB dumps.
-  Pilot 1k snapshots before committing to the full run.
+- **Full 5k–20k corpus ON HOLD (ablation verdict):** 250→500 snapshots
+  improved held-out loss 0.38→0.29, but 500→1000 gave nothing (0.29→0.30,
+  within test noise) for the 40k-param model. Generating 20k now would buy
+  hours of compute for no measurable gain. Next: capacity leg
+  (emb=64/hidden=128 on the 1k corpus). Scale data and model together only
+  if the bigger model re-opens the data gap.
+- **Threading cannot help this workload (measured, both levers reverted):**
+  `burn-ndarray/multi-threads` only parallelizes batched (3D+) matmuls —
+  all our Linears are 2D (single batch ⇒ serial by construction). OpenBLAS
+  burned 2.7× CPU for zero wall-clock gain (and serial-OpenBLAS was flat
+  too), plus an `LD_LIBRARY_PATH` wart on every run. Bottleneck is serial
+  tiny-op overhead (~10k launches/sample at N=4k), not kernel compute.
+  Next levers are fewer ops or bigger batches, not threads. (Also explains
+  why GPU would underwhelm at N≤1k: launch-bound, not compute-bound.)
 - **Weight init is unseeded:** the data pipeline is deterministic
   (rebuild-from-seed verified to 2.5e-8), but burn Linear init uses an
   unseeded global RNG — training runs are not bitwise reproducible.
