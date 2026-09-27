@@ -1,0 +1,13 @@
+[package]
+name = "learned-fmm"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+fmm = { path = "../../crates/fmm" }
+
+[[bin]]
+name = "dataset"
+path = "src/bin/dataset.rs"
