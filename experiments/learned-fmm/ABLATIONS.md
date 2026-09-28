@@ -47,3 +47,21 @@ verdict uses epochs 0–28, plenty). r3 ≈ r2 (best 0.256 vs 0.238, mean-last-5
 **Verdict: routing saturates at 2 rounds. Do NOT scale to r4; pivot to
 H1 (attention) / H2 (decoder) / H5 (monopole) — the missing gain is in
 message content and readout, not more hops.**
+
+## H1 — 1/r²-weighted pooling (rounds 2, emb32/hidden64, batch-16, lr 1e-2)
+
+Command: `./target/release/train --data /tmp/opencode/learned-fmm-1k --epochs 30 --emb 32 --hidden 64 --rounds 2 --pool 1 --batch 16 --lr 1e-2`
+(zero new params: fixed `w=(M/r²)/mean(M/r²)` per dst replaces uniform `1/√k`)
+
+| Leg | Final train (rel) | Final test (rel) | Mean-last-5 test | Best test |
+|---|---|---|---|---|
+| r2 uniform | 0.27662 (0.2404) | 0.23796 (0.2074) | 0.27314 | 0.23796 |
+| H1 weighted | 0.27519 (0.2393) | 0.22294 (0.1942) | 0.24542 | 0.22294 (ep29) |
+
+Δ best = 0.015, Δ mean-last-5 = 0.028 (kill threshold <0.01).
+Train endpoints match (0.275 vs 0.277 — same fit, better generalization).
+
+**Verdict: H1 HOLDS (no washout — dense fan-in was lossy). Effect is modest
+on best (+6%) but consistent on smoothed (+10%) at zero param cost.
+Needs a repeat run (unseeded init) before claiming; keep pool=1 as default
+for all downstream legs (H2/H5/H4/H7/H6 run weighted).**
