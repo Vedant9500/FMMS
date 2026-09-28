@@ -585,6 +585,16 @@ pub struct GraphStats {
 }
 
 pub fn build_graph(parts: &[Particle], tree: &Octree, p: usize, eps: f64) -> InteractionGraph {
+    build_graph_x(parts, tree, p, eps, 0)
+}
+
+pub fn build_graph_x(
+    parts: &[Particle],
+    tree: &Octree,
+    p: usize,
+    eps: f64,
+    xlevel: u8,
+) -> InteractionGraph {
     let ncells = tree.cells.len();
     let pipe = pipeline(parts, tree, p);
     let (off, idx) = tree.levels_csr();
@@ -597,6 +607,38 @@ pub fn build_graph(parts: &[Particle], tree: &Octree, p: usize, eps: f64) -> Int
                     && fmm::mac::accept(a, b, &tree.cells, &pipe.pows, &pipe.binom, p, eps, &pipe.fmin)
                 {
                     incoming[b].push(a);
+                }
+            }
+        }
+    }
+    if xlevel == 1 {
+        let levels: Vec<&[usize]> = (0..off.len() - 1).map(|l| &idx[off[l]..off[l + 1]]).collect();
+        for (li, cells) in levels.iter().enumerate() {
+            for &b in *cells {
+                let mut cand: Vec<(f64, usize)> = Vec::new();
+                for dl in [-1i32, 1] {
+                    let nl = li as i32 + dl;
+                    if nl < 0 || nl >= levels.len() as i32 {
+                        continue;
+                    }
+                    for &a in levels[nl as usize] {
+                        if fmm::mac::accept(
+                            a, b, &tree.cells, &pipe.pows, &pipe.binom, p, eps, &pipe.fmin,
+                        ) {
+                            let cb = tree.cells[b].cen;
+                            let ca = tree.cells[a].cen;
+                            let r2 = (cb[0] - ca[0]).powi(2)
+                                + (cb[1] - ca[1]).powi(2)
+                                + (cb[2] - ca[2]).powi(2);
+                            cand.push((tree.cells[a].mass / (r2 + 1e-30), a));
+                        }
+                    }
+                }
+                if !cand.is_empty() {
+                    cand.sort_by(|x, y| y.0.partial_cmp(&x.0).unwrap());
+                    for (_, a) in cand.into_iter().take(32) {
+                        incoming[b].push(a);
+                    }
                 }
             }
         }
@@ -909,5 +951,38 @@ mod tests {
         let (_, cov) = walk_coverage(&parts, &tree, 4, 1e-3);
         assert!(cov.same_level > 0, "no same-level walk pairs");
         assert_eq!(cov.covered_both_dirs, cov.same_level);
+    }
+
+    #[test]
+    fn cross_level_extends_same_level_with_cap() {
+        let mut parts = generate(ConfigTag::Plummer, 512, 5);
+        normalize_to_unit_box(&mut parts);
+        let tree = Octree::build(&parts, 16);
+        let g0 = build_graph(&parts, &tree, 8, 1e-5);
+        let gx = build_graph_x(&parts, &tree, 8, 1e-5, 1);
+        let pipe = pipeline(&parts, &tree, 8);
+        assert_eq!(g0.incoming.len(), gx.incoming.len());
+        let mut n_cross = 0;
+        for (i, inc) in gx.incoming.iter().enumerate() {
+            assert!(inc.len() <= g0.incoming[i].len() + 64, "cap violated at {i}");
+            for &a in &g0.incoming[i] {
+                assert!(inc.contains(&a), "same-level edge lost at {i}");
+            }
+            for &a in inc {
+                if g0.incoming[i].contains(&a) {
+                    continue;
+                }
+                n_cross += 1;
+                let dl = (g0.nodes[a].level as i32 - g0.nodes[i].level as i32).abs();
+                assert_eq!(dl, 1, "non-adjacent cross edge at {i}");
+                assert!(
+                    fmm::mac::accept(
+                        a, i, &tree.cells, &pipe.pows, &pipe.binom, 8, 1e-5, &pipe.fmin,
+                    ),
+                    "cross edge not a true accept at {i}"
+                );
+            }
+        }
+        assert!(n_cross > 0, "no cross-level edges on concentrated config");
     }
 }

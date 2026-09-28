@@ -4,7 +4,7 @@ use burn::{
     tensor::{Tensor, TensorData},
 };
 use learned_fmm::{
-    build_graph, generate, normalize_to_unit_box, random_rotate, split_near_far, ConfigTag,
+    build_graph_x, generate, normalize_to_unit_box, random_rotate, split_near_far, ConfigTag,
     InteractionGraph, SnapshotData,
 };
 use learned_fmm::model::{TreeConfig, TreeModel};
@@ -39,10 +39,19 @@ fn main() {
     let hidden: usize = arg_val(&args, "--hidden", "64").parse().unwrap();
     let max_rows: usize = arg_val(&args, "--max-rows", "0").parse().unwrap();
     let rounds: usize = arg_val(&args, "--rounds", "1").parse().unwrap();
+    let pool: u8 = arg_val(&args, "--pool", "0").parse().unwrap();
+    let h_trunk: usize = arg_val(&args, "--h-trunk", "0").parse().unwrap();
+    let h_head: usize = arg_val(&args, "--h-head", "0").parse().unwrap();
+    let mono: u8 = arg_val(&args, "--mono", "0").parse().unwrap();
+    let geom: u8 = arg_val(&args, "--geom", "0").parse().unwrap();
+    let equiv: u8 = arg_val(&args, "--equiv", "0").parse().unwrap();
+    let up_mode: u8 = arg_val(&args, "--up-mode", "0").parse().unwrap();
+    let xlevel: u8 = arg_val(&args, "--xlevel", "0").parse().unwrap();
     let batch: usize = arg_val(&args, "--batch", "16").parse().unwrap();
     // threads>1 deadlocks: burn Autodiff hangs on concurrent backward.
     let threads: usize = arg_val(&args, "--threads", "1").parse().unwrap();
     let probe: usize = arg_val(&args, "--probe", "0").parse().unwrap();
+    let probe_rot: usize = arg_val(&args, "--probe-rot", "0").parse().unwrap();
     let test_frac: f64 = arg_val(&args, "--test-frac", "0.1").parse().unwrap();
     let device = Default::default();
     let text = std::fs::read_to_string(format!("{data}/manifest.csv")).unwrap();
@@ -57,6 +66,7 @@ fn main() {
         rows.len()
     };
     let mut samples = Vec::with_capacity(nrows);
+    let mut row0: Option<(String, usize, u64, usize, f64, usize)> = None;
     for (ri, line) in rows.iter().take(nrows).enumerate() {
         let f: Vec<String> = line.split(',').map(str::to_string).collect();
         let tag = ConfigTag::parse(&f[c("config", 1)]).unwrap();
@@ -66,6 +76,9 @@ fn main() {
         let eps: f64 = ci("eps").map(|i| f[i].parse().unwrap()).unwrap_or(1e-5);
         let n_leaf: usize = ci("n_leaf").map(|i| f[i].parse().unwrap()).unwrap_or(16);
         let rotate = ci("rotate").map(|i| f[i] == "1").unwrap_or(true);
+        if ri == 0 {
+            row0 = Some((f[c("config", 1)].clone(), n, seed, p, eps, n_leaf));
+        }
         let mut parts = generate(tag, n, seed);
         normalize_to_unit_box(&mut parts);
         if rotate {
@@ -104,7 +117,7 @@ fn main() {
                 Err(e) => println!("row-0 dump check skipped: {e}"),
             }
         }
-        let graph = build_graph(&parts, &tree, p, eps);
+        let graph = build_graph_x(&parts, &tree, p, eps, xlevel);
         samples.push(Sample {
             parts,
             target,
@@ -112,12 +125,12 @@ fn main() {
         });
     }
     println!("loaded {nrows} samples");
-    let cfg = TreeConfig { emb, hidden, rounds };
+    let cfg = TreeConfig { emb, hidden, rounds, pool, h_trunk, h_head, mono, geom, equiv, up_mode };
     let mut model = TreeModel::<BT>::new(&cfg, &device);
     if probe > 0 {
         for (pi, s) in samples.iter().take(probe).enumerate() {
             let t0 = std::time::Instant::now();
-            let pred = model.forward(emb, rounds, &s.parts, &s.graph, &device);
+            let pred = model.forward(&cfg, &s.parts, &s.graph, &device);
             let dt = t0.elapsed().as_secs_f32();
             let v: Vec<f32> = pred.into_data().into_vec().unwrap();
             let mut rms = 0.0f64;
@@ -135,6 +148,41 @@ fn main() {
                 edges
             );
         }
+        return;
+    }
+    if probe_rot > 0 {
+        let (cfgstr, rn, rseed, rp, reps, rn_leaf) = row0.clone().unwrap();
+        let rtag = ConfigTag::parse(&cfgstr).unwrap();
+        let mut rels = Vec::new();
+        for k in 0..probe_rot.max(8) {
+            let mut parts = generate(rtag, rn, rseed);
+            normalize_to_unit_box(&mut parts);
+            random_rotate(&mut parts, rseed ^ (0x51ED270B + k as u64 * 0x9E3779B9));
+            let tree = Octree::build(&parts, rn_leaf);
+            let (_, far, stats) = split_near_far(&parts, &tree);
+            let scale = stats.rms_far.max(1e-12);
+            let mut target = Vec::with_capacity(rn * 3);
+            for i in 0..rn {
+                target.extend_from_slice(&[
+                    (far[i][0] / scale) as f32,
+                    (far[i][1] / scale) as f32,
+                    (far[i][2] / scale) as f32,
+                ]);
+            }
+            let graph = build_graph_x(&parts, &tree, rp, reps, xlevel);
+            let pred = model.forward(&cfg, &parts, &graph, &device);
+            let tgt: Tensor<BT, 2> =
+                Tensor::from_data(TensorData::new(target, [rn, 3]), &device);
+            let diff = pred - tgt.clone();
+            let rel = diff.clone().powf_scalar(2.0).mean()
+                / tgt.powf_scalar(2.0).mean().clamp_min(1e-12);
+            let v: f32 = rel.into_scalar();
+            rels.push(v);
+            println!("rot-probe {k}: rel={v:.6}");
+        }
+        let m = rels.iter().sum::<f32>() / rels.len() as f32;
+        let sd = (rels.iter().map(|x| (x - m) * (x - m)).sum::<f32>() / rels.len() as f32).sqrt();
+        println!("rot-probe: mean={m:.6} std={sd:.6} (low std = rotation-robust)");
         return;
     }
     let mut optim = AdamConfig::new().init();
@@ -167,7 +215,7 @@ fn main() {
                         for si in owned {
                             let smp = &sr[si];
                             let n = smp.parts.len();
-                            let pred = mr.forward(emb, rounds, &smp.parts, &smp.graph, dr);
+                            let pred = mr.forward(&cfg, &smp.parts, &smp.graph, dr);
                             let tgt: Tensor<BT, 2> = Tensor::from_data(
                                 TensorData::new(smp.target.clone(), [n, 3]),
                                 dr,
@@ -199,7 +247,7 @@ fn main() {
         for si in ntrain..nrows {
             let s = &samples[si];
             let n = s.parts.len();
-            let pred = model.forward(emb, rounds, &s.parts, &s.graph, &device);
+            let pred = model.forward(&cfg, &s.parts, &s.graph, &device);
             let tgt: Tensor<BT, 2> =
                 Tensor::from_data(TensorData::new(s.target.clone(), [n, 3]), &device);
             let diff = pred - tgt.clone();
