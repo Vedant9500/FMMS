@@ -141,3 +141,76 @@ invariance to up/decode — the premise (equivariance is binding) is
 falsified; rotation augmentation already covers what the model needs.
 Values learned: direction encoding (H1 weights, H5 mono) matters, but it
 wants to stay in Cartesian.**
+
+## H7 — DeepSets upward vs 8-slot concat (rounds 2, pool 1, mono 1, up-mode 1)
+
+Command: `... --rounds 2 --pool 1 --mono 1 --up-mode 1 ...`
+(shared child encoder + sum-over-present; no zero slots)
+
+| Leg | Final train (rel) | Final test (rel) | Mean-last-5 test | Best test |
+|---|---|---|---|---|
+| H5 concat | 0.26602 (0.2311) | 0.20797 (0.1813) | 0.21506 | 0.20797 |
+| H7 deepsets | 0.32536 (0.2833) | 0.24025 (0.2096) | 0.24869 | 0.24025 (ep29) |
+
+Worse on best (−0.032), smoothed (−0.034), train (−0.059).
+Train underfits: discarding slot identity loses signal, not discontinuity.
+
+**Verdict: H7 KILLED. Octant-ordered concat carries useful positional
+structure (which octant holds mass); symmetric sum-over-present is the
+wrong symmetry — child position matters. Keep concat; the zero-slot
+discontinuity was never the problem.**
+
+## H6 — cross-level edges (rounds 2, pool 1, mono 1, xlevel 1)
+
+Adjacent-level true accepts, top-32/dst by M/r². First attempt at lr 1e-2
+went NaN at epoch 9 (healthy 0.23 → NaN in one step; xlevel forward-finite
+test added — features fine, pure gradient explosion from denser graph).
+Stable at lr 3e-3, all 30 epochs, ~77s/epoch.
+
+| Leg | Final train (rel) | Final test (rel) | Mean-last-5 test | Best test |
+|---|---|---|---|---|
+| H5 same-level, 1e-2 | 0.26602 (0.2311) | 0.20797 (0.1813) | 0.21506 | 0.20797 |
+| H6 xlevel, 3e-3 | 0.20977 (0.1820) | 0.16606 (0.1452) | 0.16959 | 0.16606 (ep29) |
+
+Δ best = 0.042 (~20% relative), Δ smoothed = 0.045. Still descending.
+CONFOUND: lr differs (3e-3 vs 1e-2) — attribution to edges needs the
+H5@3e-3 control below before claiming.
+
+## H5@3e-3 control — same-level at the lower lr (rounds 2, pool 1, mono 1)
+
+| Leg | Final test (rel) | Mean-last-5 test | Best test |
+|---|---|---|---|
+| H5 same-level, 1e-2 | 0.20797 (0.1813) | 0.21506 | 0.20797 |
+| H5 same-level, 3e-3 | 0.18583 (0.1621) | 0.19254 | 0.18583 (ep29) |
+| H6 xlevel, 3e-3 | 0.16606 (0.1452) | 0.16959 | 0.16606 (ep29) |
+
+Decomposition: lr 1e-2→3e-3 alone = 0.208→0.186 (Δ0.022); edges on top
+at matched lr = 0.186→0.166 (Δ0.020 best / 0.023 smoothed, 2× the 0.01
+kill threshold). Both effects real, roughly equal halves.
+
+**Verdict: H6 HOLDS on merits. Cross-level edges carry learnable signal
+the 2-hop routing was not recovering (~0.36–0.87 mass share was real).
+New best config: rounds2/pool1/mono1/xlevel1 @3e-3 = 0.166 blended
+(rel 0.145). Side finding: 3e-3 dominates 1e-2 for this workload —
+downstream runs at 3e-3. (All still single-run, unseeded — repeats owed
+before publishing.)**
+
+## Sweep summary (1k corpus, emb32/hidden64 unless noted, test blended)
+
+| Leg | Test best | Δ vs prev best | Verdict |
+|---|---|---|---|
+| r1 | 0.288 | — | baseline |
+| r2 | 0.238 | 0.050 | multi-hop confirmed |
+| r3 | 0.256 | −0.018 | routing saturates at 2 |
+| H1 weighted pool | 0.223 | 0.015 | holds, zero params |
+| H2 fat decoder | 0.221 | 0.002 | killed |
+| H5 monopole | 0.208 | 0.015 | holds |
+| H4-s1 invariant | 0.464 | −0.256 | control fails as designed |
+| H4-s2 gated head | 0.240 | −0.032 | killed |
+| H7 deepsets up | 0.240 | −0.032 | killed |
+| H5 @3e-3 | 0.186 | 0.022 | lr effect real |
+| H6 xlevel @3e-3 | 0.166 | 0.020 | HOLDS — new best |
+
+0.288 → 0.166 in one sweep (−42%). Open next: repeat runs (unseeded),
+capacity re-test at 0.166 (does 160k now respond?), data-gap re-check
+(does 1000 beat 500 with the better model?), eval harness (HANDOFF §6.3).
