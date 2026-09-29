@@ -1,7 +1,7 @@
 use burn::{
     module::Module,
     nn::{Gelu, Linear, LinearConfig},
-    tensor::{backend::Backend, Int, Tensor, TensorData},
+    tensor::{backend::Backend, IndexingUpdateOp, Int, Tensor, TensorData},
 };
 use fmm::models::Particle;
 
@@ -119,8 +119,8 @@ impl<B: Backend> TreeModel<B> {
             let out: Tensor<B, 2> =
                 Tensor::from_data(TensorData::new(flat, [leaves.len(), 6]), device);
             let out = self.leaf.forward(out);
-            for (r, &i) in leaves.iter().enumerate() {
-                up[i] = out.clone().narrow(0, r, 1);
+            for (&i, row) in leaves.iter().zip(out.split(1, 0)) {
+                up[i] = row;
             }
         }
         let max_level = g.nodes.iter().map(|nd| nd.level).max().unwrap_or(0);
@@ -169,8 +169,8 @@ impl<B: Backend> TreeModel<B> {
                     }
                 }
                 let agg = self.up_agg.forward(Tensor::cat(sums, 0));
-                for (r, &i) in cells.iter().enumerate() {
-                    up[i] = agg.clone().narrow(0, r, 1);
+                for (&i, row) in cells.iter().zip(agg.split(1, 0)) {
+                    up[i] = row;
                 }
             } else {
                 let mut inputs = Vec::with_capacity(cells.len());
@@ -195,8 +195,8 @@ impl<B: Backend> TreeModel<B> {
                     inputs.push(Tensor::cat(slot_rows, 1));
                 }
                 let out = self.up.forward(Tensor::cat(inputs, 0));
-                for (r, &i) in cells.iter().enumerate() {
-                    up[i] = out.clone().narrow(0, r, 1);
+                for (&i, row) in cells.iter().zip(out.split(1, 0)) {
+                    up[i] = row;
                 }
             }
         }
@@ -339,12 +339,12 @@ impl<B: Backend> TreeModel<B> {
             }
         }
         bounds.push(ecount);
-        let mut inter: Vec<Tensor<B, 2>> = vec![zero.clone(); nc];
+        let mut inter: Vec<Tensor<B, 2>> = vec![zero; nc];
         if ecount > 0 {
             let si: Tensor<B, 1, Int> =
                 Tensor::from_data(TensorData::new(src_idx, [ecount]), device);
             let di: Tensor<B, 1, Int> =
-                Tensor::from_data(TensorData::new(dst_idx, [ecount]), device);
+                Tensor::from_data(TensorData::new(dst_idx.clone(), [ecount]), device);
             let su = stack.clone().select(0, si);
             let du = stack.clone().select(0, di);
             let mut geom = Vec::with_capacity(ecount * 4);
@@ -401,13 +401,25 @@ impl<B: Backend> TreeModel<B> {
             } else {
                 out
             };
+            let didx: Tensor<B, 2, Int> =
+                Tensor::from_data(TensorData::new(dst_idx, [ecount, 1]), device)
+                    .repeat(&[1, emb]);
+            let mut scl = Vec::with_capacity(nc);
             for b in 0..nc {
                 let (s, e) = (bounds[b], bounds[b + 1]);
-                if e > s {
-                    let k = (e - s) as f32;
-                    inter[b] = out.clone().narrow(0, s, e - s).sum_dim(0).mul_scalar(1.0 / k.sqrt());
-                }
+                scl.push(if e > s {
+                    1.0 / ((e - s) as f32).sqrt()
+                } else {
+                    0.0
+                });
             }
+            let sc: Tensor<B, 2> = Tensor::from_data(TensorData::new(scl, [nc, 1]), device);
+            let base: Tensor<B, 2> =
+                Tensor::from_data(TensorData::new(vec![0.0f32; nc * emb], [nc, emb]), device);
+            let summed = base
+                .scatter(0, didx, out, IndexingUpdateOp::Add)
+                .mul(sc);
+            inter = summed.split(1, 0);
         }
         inter
     }
@@ -444,8 +456,8 @@ impl<B: Backend> TreeModel<B> {
                 ));
             }
             let out = down_mlp.forward(Tensor::cat(inputs, 0));
-            for (r, &i) in cells.iter().enumerate() {
-                local[i] = out.clone().narrow(0, r, 1);
+            for (&i, row) in cells.iter().zip(out.split(1, 0)) {
+                local[i] = row;
             }
         }
         local
@@ -529,6 +541,23 @@ mod tests {
         for &x in &da {
             assert!(x.is_finite());
         }
+    }
+
+    #[test]
+    fn scatter_add_matches_manual_sum() {
+        use burn::tensor::TensorData;
+        let device = Default::default();
+        let vals: Tensor<TB, 2> = Tensor::from_data(
+            TensorData::new(vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], [3, 2]),
+            &device,
+        );
+        let idx: Tensor<TB, 2, Int> =
+            Tensor::from_data(TensorData::new(vec![0i64, 1, 0, 1, 0, 1], [3, 2]), &device);
+        let base: Tensor<TB, 2> =
+            Tensor::from_data(TensorData::new(vec![0.0f32; 4], [2, 2]), &device);
+        let out = base.scatter(0, idx, vals, IndexingUpdateOp::Add);
+        let v: Vec<f32> = out.into_data().into_vec().unwrap();
+        assert_eq!(v, vec![9.0, 0.0, 0.0, 12.0]);
     }
 
     #[test]

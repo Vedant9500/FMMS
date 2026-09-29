@@ -52,6 +52,8 @@ fn main() {
     let threads: usize = arg_val(&args, "--threads", "1").parse().unwrap();
     let probe: usize = arg_val(&args, "--probe", "0").parse().unwrap();
     let probe_rot: usize = arg_val(&args, "--probe-rot", "0").parse().unwrap();
+    let eval_every: usize = arg_val(&args, "--eval-every", "1").parse().unwrap();
+    let eval_every = eval_every.max(1);
     let test_frac: f64 = arg_val(&args, "--test-frac", "0.1").parse().unwrap();
     let device = Default::default();
     let text = std::fs::read_to_string(format!("{data}/manifest.csv")).unwrap();
@@ -190,8 +192,9 @@ fn main() {
     let ntest = ((nrows as f64 * test_frac) as usize).min(nrows.saturating_sub(1));
     let ntrain = nrows - ntest;
     println!("train={ntrain} test={ntest}");
-    for e in 0..epochs {
-        let t0 = std::time::Instant::now();
+    let mut last_tsum = 0.0f32;
+    let mut last_trsum = 0.0f32;
+    for e in 0..epochs {        let t0 = std::time::Instant::now();
         let mut order: Vec<usize> = (0..ntrain).collect();
         for i in (1..ntrain).rev() {
             let j = (rng.unit() * (i + 1) as f64) as usize;
@@ -242,21 +245,27 @@ fn main() {
             });
             model = optim.step(lr, model, master.grads());
         }
-        let mut tsum = 0.0;
-        let mut trsum = 0.0;
-        for si in ntrain..nrows {
-            let s = &samples[si];
-            let n = s.parts.len();
-            let pred = model.forward(&cfg, &s.parts, &s.graph, &device);
-            let tgt: Tensor<BT, 2> =
-                Tensor::from_data(TensorData::new(s.target.clone(), [n, 3]), &device);
-            let diff = pred - tgt.clone();
-            let rel = diff.clone().powf_scalar(2.0).mean()
-                / tgt.powf_scalar(2.0).mean().clamp_min(1e-12);
-            let robust = diff.cosh().log().mean();
-            let tot = rel.clone() + robust;
-            tsum += tot.into_scalar();
-            trsum += rel.into_scalar();
+        let mut tsum = last_tsum;
+        let mut trsum = last_trsum;
+        if e % eval_every == 0 || e + 1 == epochs {
+            tsum = 0.0;
+            trsum = 0.0;
+            for si in ntrain..nrows {
+                let s = &samples[si];
+                let n = s.parts.len();
+                let pred = model.forward(&cfg, &s.parts, &s.graph, &device);
+                let tgt: Tensor<BT, 2> =
+                    Tensor::from_data(TensorData::new(s.target.clone(), [n, 3]), &device);
+                let diff = pred - tgt.clone();
+                let rel = diff.clone().powf_scalar(2.0).mean()
+                    / tgt.powf_scalar(2.0).mean().clamp_min(1e-12);
+                let robust = diff.cosh().log().mean();
+                let tot = rel.clone() + robust;
+                tsum += tot.into_scalar();
+                trsum += rel.into_scalar();
+            }
+            last_tsum = tsum;
+            last_trsum = trsum;
         }
         println!(
             "epoch {e}: train={:.6} (rel={:.6}) test={:.6} (rel={:.6}) ({:.1}s)",
