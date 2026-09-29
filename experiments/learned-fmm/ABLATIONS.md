@@ -214,3 +214,19 @@ before publishing.)**
 0.288 → 0.166 in one sweep (−42%). Open next: repeat runs (unseeded),
 capacity re-test at 0.166 (does 160k now respond?), data-gap re-check
 (does 1000 beat 500 with the better model?), eval harness (HANDOFF §6.3).
+
+## Confirmation repeats — best config ×2 (rounds2/pool1/mono1/xlevel1 @3e-3)
+
+| Run | Final train (rel) | Final test (rel) | Mean-last-5 | Best |
+|---|---|---|---|---|
+| original | 0.20977 (0.1820) | 0.16606 (0.1452) | 0.16959 | 0.16606 |
+| confirm1 | 0.20839 (0.1809) | 0.16610 (0.1455) | 0.17417 | 0.16610 |
+| confirm2 | 0.19973 (0.1733) | 0.15259 (0.1334) | 0.16457 | 0.15259 |
+
+Three inits: 0.166 / 0.166 / 0.153. Band 0.15–0.17, spread 0.013 —
+inside test-noise scale, far below any ablation delta that mattered
+(H6 Δ0.020+, kills at 0.03+).
+
+**Verdict: headline CONFIRMED. The 0.166 result reproduces across inits;
+init variance (~0.01) cannot explain the sweep's load-bearing deltas.
+Screening verdicts stand as decided; no further repeats needed.**
