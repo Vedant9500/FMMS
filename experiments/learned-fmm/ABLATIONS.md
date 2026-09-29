@@ -65,3 +65,56 @@ Train endpoints match (0.275 vs 0.277 — same fit, better generalization).
 on best (+6%) but consistent on smoothed (+10%) at zero param cost.
 Needs a repeat run (unseeded init) before claiming; keep pool=1 as default
 for all downstream legs (H2/H5/H4/H7/H6 run weighted).**
+
+## H2 — fat decoder at fixed budget (rounds 2, pool 1, trunk-32/head-128)
+
+Command: `... --rounds 2 --pool 1 --h-trunk 32 --h-head 128 ...`
+(56.1k params, +2.5% vs H1 baseline — placement test, not size)
+
+| Leg | Final train (rel) | Final test (rel) | Mean-last-5 test | Best test |
+|---|---|---|---|---|
+| H1 uniform-h64 | 0.27519 (0.2393) | 0.22294 (0.1942) | 0.24542 | 0.22294 |
+| H2 fat-head | 0.28098 (0.2442) | 0.24250 (0.2112) | 0.24804 | 0.22078 (ep23) |
+
+Δ best = 0.002, Δ smoothed = −0.003 (kill threshold <0.01).
+
+**Verdict: H2 KILLED. Capacity placement is irrelevant at fixed budget —
+the decoder is not the load-bearing stage. The bottleneck is message
+content / geometry encoding, not where the params sit. Revert to uniform
+hidden (flags stay available); do not buy a bigger decoder.**
+
+## H5 — analytic monopole features (rounds 2, pool 1, mono 1)
+
+Command: `... --rounds 2 --pool 1 --mono 1 ...`
+(per-leaf monopole ΣM·R/R³, self-standardized, +3 decoder inputs;
++192 params, +0.35% — negligible vs effect)
+
+| Leg | Final train (rel) | Final test (rel) | Mean-last-5 test | Best test |
+|---|---|---|---|---|
+| H1 no-mono | 0.27519 (0.2393) | 0.22294 (0.1942) | 0.24542 | 0.22294 |
+| H5 mono | 0.26602 (0.2311) | 0.20797 (0.1813) | 0.21506 | 0.20797 (ep29) |
+
+Δ best = 0.015, Δ smoothed = 0.030 (kill threshold <0.01).
+Train fits better too (0.266 vs 0.275) — more signal, not just
+generalization. Still descending at ep29.
+
+**Verdict: H5 HOLDS. The free embedding was wasting capacity re-learning
+Newton's leading order; handing it the monopole frees the trunk for
+dipole+ corrections. Keep mono=1 as default for H4/H7/H6.**
+
+## H4-stage-1 — invariant-only messages, negative control (rounds 2, pool 1, geom 1)
+
+Command: `... --rounds 2 --pool 1 --geom 1 ...`
+(msg geometry `[r, sep, ρa/ρb, ρb/ρa]`, direction dropped; direct vector head)
+
+| Leg | Final train | Final test | Best test |
+|---|---|---|---|
+| H1 raw-Cartesian | 0.275 | 0.223 | 0.223 |
+| H4-s1 invariant | 0.532 | 0.464 | 0.464 |
+
+2× worse, plateaus ~0.46–0.53 from epoch 13 on (never learns).
+
+**Verdict: control behaves as predicted — direction is load-bearing, a
+scalar trunk cannot emit the vector field. Non-vacuity proven: the
+equivariant head (stage 2) is worth testing, since raw direction carries
+real signal the model currently memorizes per-rotation.**
