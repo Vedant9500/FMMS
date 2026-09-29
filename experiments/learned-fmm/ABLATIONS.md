@@ -118,3 +118,26 @@ Command: `... --rounds 2 --pool 1 --geom 1 ...`
 scalar trunk cannot emit the vector field. Non-vacuity proven: the
 equivariant head (stage 2) is worth testing, since raw direction carries
 real signal the model currently memorizes per-rotation.**
+
+## H4-stage-2 — invariant trunk + equivariant gated head (rounds 2, pool 1, mono 1, geom 1, equiv 1)
+
+Command: `... --rounds 2 --pool 1 --mono 1 --geom 1 --equiv 1 ...`
+(decoder emits 3 gates over û_particle, m̂_mono, û×m̂; ~60s/epoch)
+
+| Leg | Final train (rel) | Final test (rel) | Mean-last-5 test | Best test |
+|---|---|---|---|---|
+| H5 raw head | 0.26602 (0.2311) | 0.20797 (0.1813) | 0.21506 | 0.20797 |
+| H4-s2 gated | 0.33341 (0.2905) | 0.25439 (0.2218) | 0.25536 | 0.24026 (ep28) |
+
+Worse on best (−0.032), smoothed (−0.040), train (−0.067), AND rotation
+probe (std 0.021 vs 0.013 — both kill criteria fail).
+Train underfits too: the 3-gate head is too restrictive, and the gates
+themselves rotate (up path + decode offsets still raw Cartesian — trunk
+was never fully invariant, as the probe showed at init).
+
+**Verdict: H4 KILLED. Equivariance-by-head without an invariant trunk
+loses to raw Cartesian + augmentation at this data scale. Do not extend
+invariance to up/decode — the premise (equivariance is binding) is
+falsified; rotation augmentation already covers what the model needs.
+Values learned: direction encoding (H1 weights, H5 mono) matters, but it
+wants to stay in Cartesian.**
